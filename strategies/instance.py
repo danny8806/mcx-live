@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections import OrderedDict
 from typing import Optional
 
 from events.types import CandleEvent
@@ -72,6 +73,14 @@ class StrategyInstance:
         self.pending_exit_trigger: Optional[PendingEntry] = None
         self._trigger_generation = 0
         self._last_fired_trigger_signal_id: Optional[str] = None
+        # Every signal_id whose trigger has fired and not yet been consumed by
+        # an accepted order.  A single "last fired" slot is not enough: one
+        # strategy can legitimately have several in-flight exits at once (e.g.
+        # two positions stop out on the same tick), and each must survive until
+        # its own order is submitted.  Real staleness protection comes from
+        # _trigger_generation; this set only bounds which fired ids are live.
+        self._fired_trigger_signal_ids: "OrderedDict[str, None]" = OrderedDict()
+        self._max_fired_trigger_ids = 16
         # Track the signal_id of the last LIVE armed pending order so the
         # engine can terminalize it on cancel_inflight (opposite crossover).
         self._last_armed_pending_id: Optional[str] = None
@@ -666,7 +675,7 @@ class StrategyInstance:
         metadata.update(pending=False, triggered=True, trigger_state="FIRED",
                         trigger_ltp=float(ltp), trigger_source="market_websocket_ltp")
         pen.signal.metadata = metadata
-        self._last_fired_trigger_signal_id = pen.signal.signal_id
+        self._register_fired_trigger(pen.signal.signal_id)
         self.pending_exit_trigger = None
         self.state = StrategyState.EXIT_ORDER_SUBMITTED
         self.stop_exit_submitted = True
@@ -675,6 +684,32 @@ class StrategyInstance:
     # ═══════════════════════════════════════════════════════════════════════
     # PENDING ENTRY + STOP LOSS
     # ═══════════════════════════════════════════════════════════════════════
+
+    def _register_fired_trigger(self, signal_id: Optional[str]) -> None:
+        """Record a fired trigger signal so its order stays submittable.
+
+        Bounded LRU: the oldest id is evicted once more than
+        ``_max_fired_trigger_ids`` are outstanding, so an abandoned signal can
+        never be submitted arbitrarily far in the future.
+        """
+        self._last_fired_trigger_signal_id = signal_id
+        if not signal_id:
+            return
+        self._fired_trigger_signal_ids[signal_id] = None
+        self._fired_trigger_signal_ids.move_to_end(signal_id)
+        while len(self._fired_trigger_signal_ids) > self._max_fired_trigger_ids:
+            self._fired_trigger_signal_ids.popitem(last=False)
+
+    def is_fired_trigger_signal(self, signal_id: Optional[str]) -> bool:
+        """True when ``signal_id`` is a currently-outstanding fired trigger.
+
+        The single ``_last_fired_trigger_signal_id`` slot is also accepted for
+        backward compatibility with restored snapshots and tests.
+        """
+        if not signal_id:
+            return False
+        return (signal_id in self._fired_trigger_signal_ids
+                or signal_id == self._last_fired_trigger_signal_id)
 
     def _close_position(self, reason: str) -> None:
         """Mark exit as pending; engine clears state after fill."""
@@ -686,7 +721,12 @@ class StrategyInstance:
     # ═══════════════════════════════════════════════════════════════════════
 
     def on_tick(self, ltp: float, timestamp: float) -> Optional[Signal]:
-        """Process LTP tick. Only checks pending triggers and stop loss.
+        """Process LTP tick. Only checks pending triggers.
+
+        Stop-loss is deliberately NOT decided here: the stop belongs to the
+        OPEN POSITION (``position.stop_price``), not to this strategy object.
+        ``application.sl_flow`` evaluates the position-owned SL monitor on every
+        tick and mints the single exit signal when the price crosses it.
 
         Must NOT recalculate indicators or run full strategy logic.
         """
@@ -698,16 +738,6 @@ class StrategyInstance:
 
         if ltp <= 0:
             return None
-
-        # Check stop loss on tick
-        if (self.position_side is not None
-                and self.stop_price is not None
-                and not self.just_entered
-                and not self.stop_exit_submitted):
-            if self.position_side == "LONG" and ltp <= self.stop_price:
-                return self._tick_stop_loss(ltp, timestamp)
-            elif self.position_side == "SHORT" and ltp >= self.stop_price:
-                return self._tick_stop_loss(ltp, timestamp)
 
         if (self.pending_exit_trigger is not None
                 and self.pending_exit_trigger.status == "pending"):
@@ -733,42 +763,19 @@ class StrategyInstance:
 
         return None
 
-    def _tick_stop_loss(self, ltp: float, timestamp: float) -> Optional[Signal]:
-        """Execute stop loss from tick."""
-        exit_signal = Signal(
-            signal_type=SignalType.SHORT if self.position_side == "LONG" else SignalType.LONG,
-            instrument=self.instrument,
-            strategy_id=self.strategy_id,
-            timestamp=timestamp,
-            trigger_price=ltp,
-            stop_price=self.stop_price,
-            quantity=self.position_quantity or self.quantity,
-        )
-        exit_signal.metadata = {
-            "exit": True,
-            "exit_reason": "stop_loss_hit",
-            "exit_price": ltp,
-            "source": "tick",
-            "triggered": True,
-            "trigger_state": "FIRED",
-            "trigger_generation": self._trigger_generation,
-            "trigger_source": "market_websocket_ltp",
-        }
+    def notify_local_sl_exit(self, reason: str = "stop_loss_hit") -> None:
+        """React to the POSITION-OWNED SL monitor having fired.
+
+        The strategy does not decide the stop; it only records that its local
+        position state is now exiting so a strategy signal arriving on the same
+        tick cannot mint a second exit (§10).
+        """
         self._cancel_trigger(self.pending_exit_trigger)
         self.pending_exit_trigger = None
         self._cancel_trigger(self.pending_entry)
         self.pending_entry = None
-        self._last_fired_trigger_signal_id = exit_signal.signal_id
-        # Phase 4 — tick exits freeze the LTP snapshot (no candle bar).
-        freeze_signal_context(
-            exit_signal, close=ltp, high=ltp, low=ltp, timestamp=timestamp,
-            dema=self.fast_indicator.value, atr=self.fast_indicator.atr_value,
-            position_side=self.position_side, position_stop=self.stop_price,
-        )
-        self._close_position("stop_loss_hit")
+        self._close_position(reason)
         self.stop_exit_submitted = True
-        self._signals.append(exit_signal)
-        return exit_signal
 
     def _tick_entry_trigger(self, pen: PendingEntry, ltp: float, timestamp: float) -> Optional[Signal]:
         """Execute pending entry from tick."""
@@ -794,7 +801,7 @@ class StrategyInstance:
             pending=False, triggered=True, trigger_state="FIRED",
             trigger_ltp=float(ltp), trigger_source="market_websocket_ltp")
         pen.signal.metadata = metadata
-        self._last_fired_trigger_signal_id = pen.signal.signal_id
+        self._register_fired_trigger(pen.signal.signal_id)
         return pen.signal
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -831,6 +838,7 @@ class StrategyInstance:
         self.pending_entry = None
         self.pending_exit_trigger = None
         self._last_fired_trigger_signal_id = None
+        self._fired_trigger_signal_ids.clear()
         self._prev_fast_close = None
         self._prev_htf_value = None
         self._prev_mid_value = None
@@ -1024,6 +1032,11 @@ class StrategyInstance:
         self.enabled = bool(snapshot.get("enabled", True))
         self._trigger_generation = int(snapshot.get("trigger_generation", 0) or 0)
         self._last_fired_trigger_signal_id = snapshot.get("last_fired_trigger_signal_id")
+        # Outstanding fired trigger ids are NOT restored: after a restart the
+        # in-memory fired set is empty, so a restored pending order must be
+        # re-armed from the broker/local state rather than trusted blindly.
+        # The single last-fired id is retained only as a legacy fallback.
+        self._fired_trigger_signal_ids.clear()
 
         def restore_trigger(pending_entry):
             if not pending_entry:

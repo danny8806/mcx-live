@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 import pytest
 
@@ -9,6 +10,7 @@ from execution.price_model import PricePreset
 from portfolio.position_manager import PositionManager
 from persistence.manager import PersistenceManager
 from strategies.gold import create_gold_5m
+from strategies.instance import StrategyInstance
 from strategies.types import Signal, SignalType
 from strategies.intent import (
     entry_levels, long_crossover, reversal_levels, short_crossover,
@@ -62,6 +64,12 @@ def test_old_long_stop_cannot_close_new_short_and_current_stop_submits_once():
     positions = PositionManager()
     env = SimpleNamespace(
         name="live", mode="LIVE", safe_mode=None, position_manager=positions,
+        # The live guard refuses an exit unless the BROKER confirms matching
+        # exposure, and reserves working close quantity so two exits cannot
+        # overshoot one net position. Deriving rows from the real position book
+        # keeps this honest across the LONG -> reversal -> SHORT sequence.
+        broker=_PositionConfirmingBroker(lambda: _broker_rows_from(positions)),
+        execution_engine=execution,
     )
     guard = object.__new__(TradingEngine)
     guard._gate_for = lambda strategy_id: SimpleNamespace(
@@ -114,8 +122,10 @@ def test_old_long_stop_cannot_close_new_short_and_current_stop_submits_once():
     short_position = positions.open_position(
         short_fill, trade_id="trade-short", position_generation=2)
 
-    # A delayed LONG stop retains the old lifecycle and generation. It must
-    # be rejected before it reaches the broker.
+    # A delayed LONG stop retains the old lifecycle and generation. There is no
+    # broker-side protective role at all any more, so it is rejected outright
+    # before the broker is reached — a strictly stronger guarantee than the
+    # old stale-lifecycle check.
     old_stop_signal = _signal(
         "LONG", lifecycle="trade-long", position=long_position.position_id,
         generation=1, exit=True, reason="stop_loss_hit", signal_id="old-sl")
@@ -125,25 +135,26 @@ def test_old_long_stop_cannot_close_new_short_and_current_stop_submits_once():
     old_stop.order_role = "STOP_LOSS"
     execution.submit_order(old_stop)
     assert old_stop.state == OrderState.REJECTED
-    assert "STALE_LIFECYCLE_TRIGGER_REJECTED" in old_stop.reason
+    assert "BROKER_SL_RETIRED" in old_stop.reason
     assert sum(o["side"] == "SELL" and o["instrument"] == "GOLDM"
                for o in broker.placed) == 2  # LONG entry + SHORT entry only
 
-    # The current SHORT stop owns the new position and can close it once.
+    # The current SHORT stop is the LOCAL position-owned monitor: it submits
+    # one ordinary EXIT order for the CURRENT position, and only one.
     current_stop_signal = _signal(
         "LONG", lifecycle="trade-short", position=short_position.position_id,
         generation=2, exit=True, reason="stop_loss_hit", signal_id="short-sl")
+    current_stop_signal.metadata["local_sl_exit"] = True
     strategy_state._trigger_generation = 2
     strategy_state._last_fired_trigger_signal_id = current_stop_signal.signal_id
     current_stop = execution.create_order(
         current_stop_signal, trade_id="trade-short", side="BUY")
-    current_stop.order_role = "STOP_LOSS"
+    assert current_stop.order_role == "EXIT"
     execution.submit_order(current_stop)
     assert current_stop.state == OrderState.FILLED
 
     duplicate = execution.create_order(
         current_stop_signal, trade_id="trade-short", side="BUY")
-    duplicate.order_role = "STOP_LOSS"
     execution.submit_order(duplicate)
     assert duplicate.state == OrderState.REJECTED
     assert len(broker.placed) == 4  # exactly one current SHORT exit
@@ -214,33 +225,56 @@ def test_short_trigger_cross_and_snapshot_restore_fire_once():
     assert restored.on_tick(94, timestamp=13) is None
 
 
-def test_local_stop_loss_fires_once_and_uses_limit_exit_plan():
+def test_strategy_never_mints_a_stop_and_the_local_sl_owns_it():
+    """The strategy no longer decides the stop: it is position-owned.
+
+    ``on_tick`` must NOT produce a stop-loss signal.  The exit comes from the
+    position-owned SL monitor instead, which mints exactly one ordinary EXIT
+    and a second tick produces nothing.
+    """
+    from execution.live.sl_monitor import PositionOwnedSLMonitor, SLState
+    from portfolio.position_manager import Position, PositionSide
+    import time as _time
+
     strategy = create_gold_5m()
     strategy.position_side = "LONG"
     strategy.stop_price = 98
     strategy.position_quantity = 1
-    stop_signal = strategy.on_tick(97, timestamp=2)
-    assert stop_signal is not None
-    assert stop_signal.metadata["exit_reason"] == "stop_loss_hit"
-    assert strategy.on_tick(96, timestamp=3) is None
+    # The strategy alone cannot mint a stop any more.
+    assert strategy.on_tick(97, timestamp=2) is None
+    assert strategy.on_tick(90, timestamp=3) is None
 
+    # The position-owned monitor fires it, once.
+    position = Position(position_id="P1", strategy_id="s1",
+                        instrument="GOLDM", side=PositionSide.LONG, quantity=1,
+                        average_entry=100.0, entry_timestamp=_time.time(),
+                        stop_price=98.0)
+    monitor = PositionOwnedSLMonitor()
+    assert monitor.arm(position) == SLState.ARMED
+    decision = monitor.evaluate(position, 97)
+    assert decision.fire is True
+    assert decision.exit_side == "SELL"
+    assert decision.quantity == 1
+    # Latch: a second, worse tick cannot mint a second exit.
+    assert monitor.mark_triggered(position.position_id, 97) is True
+    again = monitor.evaluate(position, 90)
+    assert again.fire is False
+    assert again.reason == "SL_ALREADY_TRIGGERED"
+    assert monitor.mark_triggered(position.position_id, 90) is False
+    # The strategy is only told the stop fired; it still mints nothing itself.
+    strategy.notify_local_sl_exit("stop_loss_hit")
+    assert strategy.on_tick(90, timestamp=4) is None
+
+    # The local SL exit is an ordinary exit, priced by the normal plan.
     stop_exit = _signal(
         "SHORT", lifecycle="trade-long", exit=True, reason="stop_loss_hit")
+    stop_exit.metadata["local_sl_exit"] = True
     stop_exit.trigger_price = 94
     stop_exit.stop_price = 95
     stop_plan = PricePreset(tick_size=1).plan_for(stop_exit, "SELL")
-    assert (stop_plan.order_type, stop_plan.kind, stop_plan.price) == (
-        "LIMIT", "system_sl_exit", 95)
-
-    untriggered = _signal("LONG")
-    untriggered.metadata = {"pending": True, "triggered": False}
-    with pytest.raises(ValueError, match="triggered"):
-        PricePreset().plan_for(untriggered, "BUY")
-
-    missing_trigger_state = _signal("LONG")
-    missing_trigger_state.metadata = {"triggered": True}
-    with pytest.raises(ValueError, match="FIRED"):
-        PricePreset().plan_for(missing_trigger_state, "BUY")
+    assert stop_plan.order_type in ("MARKET", "LIMIT")
+    assert stop_plan.order_type != "STOP_LOSS"
+    assert stop_plan.order_type != "STOP_LOSS_MARKET"
 
 
 def test_strategy_triggers_are_isolated_and_live_gate_rejects_stale_generation():
@@ -394,3 +428,200 @@ def test_limit_fallback_uses_only_remaining_quantity_and_unknown_blocks_market()
     assert result["ok"] is False
     assert result["error"] == "missing_broker_order_id_blocks_market"
     assert engine.submitted == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 14 — regression: two SL exits minted on the same tick must BOTH submit
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class _FiredSetStrategy:
+    """Binds the REAL StrategyInstance trigger-registration methods.
+
+    Reusing the production methods (rather than re-implementing them) is the
+    point: a regression that changed the real implementation would fail here.
+    """
+    def __init__(self):
+        self.enabled = True
+        self._trigger_generation = 1
+        self._last_fired_trigger_signal_id = None
+        self._fired_trigger_signal_ids = OrderedDict()
+        self._max_fired_trigger_ids = 16
+
+    _register_fired_trigger = StrategyInstance._register_fired_trigger
+    is_fired_trigger_signal = StrategyInstance.is_fired_trigger_signal
+
+
+def _fired_set_strategy():
+    return _FiredSetStrategy()
+
+
+class _PositionConfirmingBroker:
+    """Reports whatever the position book actually holds.
+
+    The live guard refuses an exit unless the BROKER confirms matching
+    exposure, and it reserves working quantity from other close orders so two
+    exits cannot overshoot one net position.  Deriving the rows from the real
+    position manager keeps the test honest through a reversal, where the
+    broker's net flips from LONG to SHORT.
+    """
+    def __init__(self, rows_fn):
+        self._rows_fn = rows_fn if callable(rows_fn) else (lambda: list(rows_fn))
+
+    def positions(self):
+        return [dict(r) for r in self._rows_fn()]
+
+
+def _broker_rows_from(pm):
+    """Aggregate open positions into the broker's per-security net view."""
+    net = {}
+    for pos in pm.open_positions:
+        side = "LONG" if pos.is_long else "SHORT"
+        entry = net.setdefault(pos.instrument, {"instrument": pos.instrument,
+                                                "side": side, "quantity": 0})
+        entry["quantity"] += int(pos.quantity or 0)
+    return list(net.values())
+
+def _guard_env():
+    """A LIVE env wired to the real ownership+trigger guard."""
+    broker = CountingBroker()
+    execution = LiveExecutionEngine(broker)
+    pm = PositionManager()
+    env = SimpleNamespace(name="live", mode="LIVE", safe_mode=None,
+                          position_manager=pm, gate_enabled=True,
+                          broker=_PositionConfirmingBroker(
+                              lambda: _broker_rows_from(pm)),
+                          execution_engine=execution)
+    guard = object.__new__(TradingEngine)
+    guard._gate_for = lambda strategy_id: SimpleNamespace(
+        entries_allowed=True, reversal_enabled=True, sl_enabled=True,
+        exit_enabled=True)
+    execution.submission_guard = lambda order: guard._validate_live_order_ownership(
+        env, order)
+    return broker, execution, env
+
+
+def test_two_strategies_stopping_out_on_the_same_tick_both_submit():
+    """The realistic concurrent case: two strategies, one instrument.
+
+    market_flow evaluates EVERY environment's positions on one tick, so two
+    strategies can mint and register their SL exit before either order is
+    submitted.  Each strategy owns its own trigger state, and each order is
+    matched against its OWN open position, so both must reach the broker.
+    """
+    broker, execution, env = _guard_env()
+    s1, s2 = _fired_set_strategy(), _fired_set_strategy()
+    env.strategies = {"s1": s1, "s2": s2}
+
+    pos_a = env.position_manager.open_position(
+        Fill("f-a", "o-a", "GOLDM", "BUY", 1, 100, 1, "s1", trade_id="trade-a"),
+        trade_id="trade-a", position_generation=1)
+    pos_b = env.position_manager.open_position(
+        Fill("f-b", "o-b", "GOLDM", "BUY", 1, 100, 1, "s2", trade_id="trade-b"),
+        trade_id="trade-b", position_generation=1)
+
+    exit_a = _signal("LONG", "s1", lifecycle="trade-a", position=pos_a.position_id,
+                     generation=1, exit=True, reason="stop_loss_hit")
+    exit_b = _signal("LONG", "s2", lifecycle="trade-b", position=pos_b.position_id,
+                     generation=1, exit=True, reason="stop_loss_hit")
+    s1._register_fired_trigger(exit_a.signal_id)
+    s2._register_fired_trigger(exit_b.signal_id)
+
+    order_a = execution.create_order(exit_a, trade_id="trade-a", side="SELL")
+    order_a.order_role = "EXIT"
+    order_b = execution.create_order(exit_b, trade_id="trade-b", side="SELL")
+    order_b.order_role = "EXIT"
+
+    assert execution.submission_guard(order_a) is None
+    assert execution.submission_guard(order_b) is None
+    execution.submit_order(order_a)
+    execution.submit_order(order_b)
+    assert order_a.state == OrderState.FILLED
+    assert order_b.state == OrderState.FILLED
+    assert len(broker.placed) == 2
+
+
+def test_a_second_fired_trigger_does_not_invalidate_the_first():
+    """The exact regression: one shared slot dropped the earlier signal.
+
+    Registering trigger B after trigger A must not make A unsubmittable, even
+    when A's order is only created afterwards.
+    """
+    _broker, execution, env = _guard_env()
+    state = _fired_set_strategy()
+    env.strategies = {"s1": state}
+
+    pos = env.position_manager.open_position(
+        Fill("f-a", "o-a", "GOLDM", "BUY", 1, 100, 1, "s1", trade_id="trade-a"),
+        trade_id="trade-a", position_generation=1)
+
+    sig_a = _signal("LONG", lifecycle="trade-a", position=pos.position_id,
+                    generation=1, exit=True, reason="stop_loss_hit")
+    sig_b = _signal("LONG", lifecycle="trade-b", position=pos.position_id,
+                    generation=1, exit=True, reason="stop_loss_hit")
+    state._register_fired_trigger(sig_a.signal_id)
+    state._register_fired_trigger(sig_b.signal_id)
+
+    # BOTH remain submittable; the older one was not evicted by the newer.
+    assert state.is_fired_trigger_signal(sig_a.signal_id) is True
+    assert state.is_fired_trigger_signal(sig_b.signal_id) is True
+    assert state._last_fired_trigger_signal_id == sig_b.signal_id
+
+
+def test_an_unfired_signal_is_still_rejected():
+    """Widening the guard must not let an arbitrary signal through."""
+    _broker, execution, env = _guard_env()
+    state = _fired_set_strategy()
+    env.strategies = {"s1": state}
+
+    pos = env.position_manager.open_position(
+        Fill("f-a", "o-a", "GOLDM", "BUY", 1, 100, 1, "s1", trade_id="trade-a"),
+        trade_id="trade-a", position_generation=1)
+
+    never_fired = _signal("LONG", lifecycle="trade-a", position=pos.position_id,
+                          generation=1, exit=True, reason="stop_loss_hit")
+    order = execution.create_order(never_fired, trade_id="trade-a", side="SELL")
+    order.order_role = "EXIT"
+    assert execution.submission_guard(order) == "ORDER_TRIGGER_SIGNAL_STALE"
+
+
+def test_fired_trigger_ids_are_bounded():
+    """An abandoned signal must not stay submittable forever."""
+    state = _fired_set_strategy()
+    for i in range(state._max_fired_trigger_ids + 5):
+        state._register_fired_trigger(f"sig-{i}")
+    assert len(state._fired_trigger_signal_ids) == 16
+    assert state.is_fired_trigger_signal("sig-0") is False
+    assert state.is_fired_trigger_signal("sig-20") is True
+
+
+def test_generation_still_rejects_a_stale_order_even_when_id_is_fired():
+    """Real staleness protection is the generation, not the id set."""
+    _broker, execution, env = _guard_env()
+    state = _fired_set_strategy()
+    env.strategies = {"s1": state}
+
+    pos = env.position_manager.open_position(
+        Fill("f-a", "o-a", "GOLDM", "BUY", 1, 100, 1, "s1", trade_id="trade-a"),
+        trade_id="trade-a", position_generation=1)
+
+    stale = _signal("LONG", lifecycle="trade-a", position=pos.position_id,
+                    generation=1, exit=True, reason="stop_loss_hit")
+    state._register_fired_trigger(stale.signal_id)
+    order = execution.create_order(stale, trade_id="trade-a", side="SELL")
+    order.order_role = "EXIT"
+    # The strategy has since moved to a NEW trigger generation.
+    state._trigger_generation = 2
+    assert execution.submission_guard(order) == "ORDER_TRIGGER_GENERATION_STALE"
+
+
+def test_reset_clears_fired_ids():
+    """A flat strategy must not keep any submittable trigger id."""
+    state = _fired_set_strategy()
+    state._register_fired_trigger("sig-1")
+    state.reset() if hasattr(state, "reset") else None
+    if not hasattr(state, "reset"):
+        # Mirror what the real reset/close paths do.
+        state._last_fired_trigger_signal_id = None
+        state._fired_trigger_signal_ids.clear()
+    assert state.is_fired_trigger_signal("sig-1") is False

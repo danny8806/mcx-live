@@ -97,20 +97,26 @@ def _watch_failure_states(env):
                         "detail": "entry locked behind a higher-priority leg"})
         except Exception as exc:
             states.append({"state": "WATCHER_UNAVAILABLE", "detail": str(exc)})
-    # UNPROTECTED POSITION from the position book (broker SL absent).
+    # SL coverage from the position book.  There is no broker-side protective
+    # stop: "armed" means THIS PROCESS is watching position.stop_price, and it
+    # is only ever shown for an open position.
     try:
         pm = getattr(env, "position_manager", None)
         if pm is not None:
             snap = pm.snapshot() or {}
             for pos in (snap.get("open_positions") or {}).values():
-                sl_state = (pos or {}).get("sl_state") or ""
-                if sl_state not in ("placed", "verified"):
+                if not (pos or {}).get("is_open", False):
+                    continue
+                sl_state = (pos or {}).get("sl_state") or "NONE"
+                if sl_state != "ARMED":
                     states.append({
-                        "state": "UNPROTECTED POSITION",
+                        "state": "POSITION WITHOUT ACTIVE LOCAL SL",
                         "position_id": pos.get("position_id"),
                         "strategy_id": pos.get("strategy_id"),
                         "instrument": pos.get("instrument"),
-                        "detail": f"sl_state={sl_state or 'none'} (local stop armed)"})
+                        "stop_price": pos.get("stop_price"),
+                        "detail": (f"sl_state={sl_state} "
+                                   f"(local position-owned stop monitor)")})
     except Exception:
         pass
     return states

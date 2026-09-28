@@ -42,7 +42,9 @@ class Order:
     planned_sl: Optional[float] = None
     planned_order_type: Optional[str] = None
     order_role: Optional[str] = None  # ENTRY/EXIT/STOP_LOSS/REVERSAL_EXIT/REVERSAL_ENTRY/EMERGENCY_EXIT
-    protected_order_id: Optional[str] = None  # entry order a broker-side SL protects
+    # LEGACY, always None: the broker-side protective SL was retired.  Kept so
+    # historical order rows remain readable; nothing populates it any more.
+    protected_order_id: Optional[str] = None
     state: OrderState = OrderState.CREATED
     filled_quantity: int = 0
     average_fill_price: float = 0.0

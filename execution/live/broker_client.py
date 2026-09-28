@@ -224,18 +224,14 @@ class StubLiveBroker(LiveBrokerClient):
                 "correlation_id": correlation_id,
             }
             ot = str(order_type or "").upper()
+            # INVARIANT 10 — the stub must refuse a broker-side protective stop
+            # for the SAME reason the real transport does.  A stub that quietly
+            # rests one would let a retired code path pass every local test and
+            # then place a real resting stop in production.
             if ot in ("STOP_LOSS", "STOP_LOSS_MARKET"):
-                # Spec §22-24 — a protective/trigger stop is a RESTING order:
-                # it is accepted by the broker, never filled at placement.  Its
-                # fill materializes only when the trigger is crossed (ack_order
-                # with a price past the trigger, or a broker status poll
-                # reporting the fill).  trigger_price is recorded on the book.
-                rec = dict(common, status="submitted", price=None,
-                           filled_quantity=0, average_fill_price=0.0,
-                           order_type=ot,
-                           trigger_price=float(trigger_price or 0.0))
-                self._orders[broker_order_id] = dict(rec)
-                return dict(rec)
+                raise ValueError(
+                    "BROKER_SL_RETIRED: broker-side protective stop orders are "
+                    "disabled; the stop is the local position-owned SL monitor")
             if self.defer_fills:
                 # Async broker simulation: the order is accepted; the fill is
                 # materialized later by ack_order() / stale-status polling.
@@ -259,11 +255,9 @@ class StubLiveBroker(LiveBrokerClient):
     def ack_order(self, broker_order_id: str, price: Optional[float] = None) -> bool:
         """Async-only: complete a previously SUBMITTED order into a FILLED one.
 
-        For resting STOP_LOSS_MARKET orders the fill is produced only when the
-        given price has crossed the order's trigger (LONG-protection SELL SLM:
-        price <= trigger; SHORT-protection BUY SLM: price >= trigger).  Returns
-        False for unknown orders / triggers not crossed; idempotent for orders
-        already filled (a repeated ack never double-fills).
+        Returns False for unknown orders; idempotent for orders already filled
+        (a repeated ack never double-fills).  There is no broker-side trigger
+        to cross any more — the only stop is the local position-owned monitor.
         """
         with self._lock:
             rec = self._orders.get(broker_order_id)
@@ -276,14 +270,6 @@ class StubLiveBroker(LiveBrokerClient):
             ref = price if price is not None else self._prices.get(rec.get("instrument"))
             if ref is None or ref <= 0:
                 return False
-            if (rec.get("order_type") or "").upper() in ("STOP_LOSS",
-                                                          "STOP_LOSS_MARKET"):
-                trig = float(rec.get("trigger_price") or 0.0)
-                if trig > 0:
-                    crossed = (ref <= trig) if str(rec.get("side") or "").upper() == "SELL" \
-                        else (ref >= trig)
-                    if not crossed:
-                        return False
             broker_fill_id = f"BROKER-FILL-LIVE-{uuid.uuid4()}"
             rec["status"] = "filled"
             rec["filled_quantity"] = rec.get("quantity", 0)

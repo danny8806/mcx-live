@@ -1075,9 +1075,10 @@ class PersistenceManager:
                     position_id, trade_id, strategy_id, instrument, side,
                     quantity, average_entry_price, status, entry_time,
                     realized_pnl, updated_at, execution_mode,
-                    sl_state, sl_order_id, sl_trigger_price, sl_protected_at,
-                    stop_price, position_generation, exit_started, lifecycle_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sl_state, sl_trigger_price, sl_protected_at,
+                    stop_price, position_generation, exit_started, lifecycle_id,
+                    entry_order_id, exit_order_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(position_id) DO UPDATE SET
                     strategy_id=excluded.strategy_id, instrument=excluded.instrument,
                     side=excluded.side, quantity=excluded.quantity,
@@ -1085,13 +1086,14 @@ class PersistenceManager:
                     status=excluded.status, realized_pnl=excluded.realized_pnl,
                     updated_at=excluded.updated_at,
                     sl_state=excluded.sl_state,
-                    sl_order_id=COALESCE(excluded.sl_order_id, positions.sl_order_id),
                     sl_trigger_price=excluded.sl_trigger_price,
                     sl_protected_at=COALESCE(excluded.sl_protected_at, positions.sl_protected_at),
                     stop_price=COALESCE(excluded.stop_price, positions.stop_price)
                     ,position_generation=excluded.position_generation
                     ,exit_started=excluded.exit_started
                     ,lifecycle_id=COALESCE(excluded.lifecycle_id, positions.lifecycle_id)
+                    ,entry_order_id=COALESCE(excluded.entry_order_id, positions.entry_order_id)
+                    ,exit_order_id=COALESCE(excluded.exit_order_id, positions.exit_order_id)
             """, (
                 position.position_id,
                 position.trade_id,
@@ -1106,13 +1108,14 @@ class PersistenceManager:
                 datetime.now(timezone.utc).isoformat(),
                 self.execution_mode,
                 getattr(position, "sl_state", None),
-                getattr(position, "sl_order_id", None),
                 getattr(position, "sl_trigger_price", None),
                 getattr(position, "sl_protected_at", None),
                 getattr(position, "stop_price", None),
                 getattr(position, "position_generation", 0),
                 int(bool(getattr(position, "exit_started", False))),
                 getattr(position, "lifecycle_id", None) or getattr(position, "trade_id", None),
+                getattr(position, "entry_order_id", None),
+                getattr(position, "exit_order_id", None),
             ))
 
     def close_position_record(self, position) -> None:

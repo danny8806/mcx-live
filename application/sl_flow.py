@@ -1,0 +1,556 @@
+"""Position-owned local SL lifecycle.
+
+ONE mechanism, one direction:
+
+    OPEN POSITION -> position.stop_price -> SL monitor -> tick crosses
+    -> TRIGGERED -> one direct exit order -> broker-confirmed fill
+    -> CLOSED -> SL state cleared
+
+There is NO broker-side protective stop in this module or anywhere else.
+The exit reuses the existing direct execution path (``_process_signal``), so
+no second order type and no second framework is introduced.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from typing import Optional
+
+from execution.live.sl_monitor import (
+    PositionOwnedSLMonitor,
+    SLReject,
+    SLState,
+)
+from strategies.types import Signal, SignalType
+
+log = logging.getLogger("trading_engine")
+
+# SL states that mean "this process is actively watching a price".
+_ARMING_STATES = (SLState.ARMED, SLState.TRIGGERED, SLState.EXITING)
+
+
+class SLFlowMixin:
+    """SL arming / firing / clearing, driven entirely by the open position."""
+
+    # ── monitor plumbing ────────────────────────────────────────────────
+
+    def _sl_monitor(self, env):
+        """Return (creating once) the position-owned SL monitor for ``env``."""
+        monitor = getattr(env, "sl_monitor", None)
+        if monitor is None:
+            monitor = PositionOwnedSLMonitor()
+            env.sl_monitor = monitor
+        return monitor
+
+    # ── arming ──────────────────────────────────────────────────────────
+
+    def _arm_position_sl(self, env, position, *,
+                         source: str = "entry_fill") -> str:
+        """Bind ``position.stop_price`` to the local monitor.
+
+        Never invents a stop: a position without one is reported as
+        ``SL_UNAVAILABLE`` and left unmonitored (existing risk policy applies).
+        """
+        if position is None:
+            return SLState.NONE.value
+        monitor = self._sl_monitor(env)
+        state = monitor.arm(position)
+        if state == SLState.UNAVAILABLE:
+            position.sl_state = SLState.UNAVAILABLE.value
+            self._persist_position(position, getattr(env, "name", None))
+            self.publish_event("sl_unavailable", {
+                "position_id": getattr(position, "position_id", None),
+                "strategy_id": getattr(position, "strategy_id", None),
+                "instrument": getattr(position, "instrument", None),
+                "reason": SLReject.STOP_MISSING,
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+            log.error("[SL] %s/%s has NO stop_price — SL_UNAVAILABLE, "
+                      "position is UNPROTECTED", position.strategy_id,
+                      position.instrument)
+            return state.value
+        if state == SLState.ARMED:
+            position.sl_state = SLState.ARMED.value
+            position.sl_protected_at = time.time()
+            self._persist_position(position, getattr(env, "name", None))
+            self.publish_event("sl_armed", {
+                "position_id": position.position_id,
+                "trade_id": getattr(position, "trade_id", None),
+                "strategy_id": position.strategy_id,
+                "instrument": position.instrument,
+                "side": "LONG" if position.is_long else "SHORT",
+                "quantity": int(getattr(position, "quantity", 0) or 0),
+                "stop_price": float(position.stop_price),
+                "source": source,
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+        return state.value
+
+    # ── firing ───────────────────────────────────────────────────────────
+
+    def _evaluate_position_sl(self, env, position, ltp: float,
+                              env_name: Optional[str] = None):
+        """Evaluate the position's SL against a live tick.
+
+        Returns the minted exit ``Signal`` when the SL fires, else ``None``.
+        Every rejection is a silent no-op — no order, no signal, no state
+        change beyond the publish of ``sl_evaluation_blocked``.
+        """
+        env_name = env_name or getattr(env, "name", None)
+        if position is None:
+            return None
+        monitor = self._sl_monitor(env)
+        decision = monitor.evaluate(position, ltp)
+        if not decision.fire:
+            if decision.reason in (SLReject.STOP_MISSING,):
+                self._mark_sl_unavailable(env, position)
+            return None
+
+        # §9 duplicate protection: latch BEFORE minting the signal.
+        if not monitor.mark_triggered(decision.position_id, ltp):
+            return None
+        position.sl_state = SLState.TRIGGERED.value
+        position.sl_trigger_price = float(ltp)
+        self._persist_position(position, env_name)
+
+        signal = self._build_sl_exit_signal(env, position, decision, ltp)
+        if signal is None:
+            monitor.release_exit(decision.position_id)
+            return None
+
+        # The exit reuses the existing direct execution path — one order, the
+        # ordinary EXIT role, no broker-side protective order.
+        self.publish_event("sl_triggered", {
+            "position_id": decision.position_id,
+            "trade_id": getattr(position, "trade_id", None),
+            "strategy_id": decision.strategy_id,
+            "instrument": decision.instrument,
+            "side": decision.side,
+            "quantity": decision.quantity,
+            "stop_price": decision.stop_price,
+            "market_price": float(ltp),
+            "signal_id": signal.signal_id,
+            "execution_mode": getattr(env, "mode", None),
+        }, env_name=env_name)
+        self._process_signal(signal, env_name)
+        return signal
+
+    def _build_sl_exit_signal(self, env, position, decision, ltp: float):
+        """Mint the single SL exit signal, fully bound to THIS position."""
+        strategies = getattr(env, "strategies", {}) or {}
+        strategy = strategies.get(position.strategy_id)
+        if strategy is None:
+            log.error("[SL] %s/%s fired but strategy object is gone — "
+                      "no exit minted", position.strategy_id, position.instrument)
+            self._mark_sl_unavailable(env, position, SLReject.STRATEGY_MISMATCH)
+            return None
+
+        signal = Signal(
+            signal_type=(SignalType.SHORT if position.is_long else SignalType.LONG),
+            instrument=position.instrument,
+            strategy_id=position.strategy_id,
+            timestamp=time.time(),
+            trigger_price=float(ltp),
+            stop_price=decision.stop_price,
+            quantity=int(decision.quantity),
+        )
+        signal.metadata = {
+            "exit": True,
+            "exit_reason": "stop_loss_hit",
+            # Marks this as the LOCAL position-owned stop exit, so it is
+            # classified as an ordinary EXIT order, never a broker STOP_LOSS.
+            "local_sl_exit": True,
+            "exit_price": float(ltp),
+            "source": "position_sl_monitor",
+            "triggered": True,
+            "trigger_state": "FIRED",
+            "trigger_source": "market_websocket_ltp",
+            "trigger_generation": getattr(strategy, "_trigger_generation", None),
+            "position_id": decision.position_id,
+            "stop_price": decision.stop_price,
+        }
+        signal.lifecycle_id = position.trade_id
+        signal.parent_position_id = position.position_id
+        signal.position_generation = position.position_generation
+
+        # The live ownership validator requires the fired trigger to be the
+        # strategy's latest one; register it as such before routing.
+        try:
+            strategy._last_fired_trigger_signal_id = signal.signal_id
+            strategy.notify_local_sl_exit("stop_loss_hit")
+        except Exception as e:
+            log.error("[SL] strategy notification failed for %s/%s: %s",
+                      position.strategy_id, position.instrument, e)
+        return signal
+
+    # ── clearing / latches ───────────────────────────────────────────────
+
+    def _clear_position_sl(self, env, position, *,
+                           final_state: str = SLState.CLOSED.value,
+                           reason: str = "position_closed") -> None:
+        """Terminal SL teardown — INVARIANT 5 (old SL can never fire)."""
+        if position is None:
+            return
+        env_name = getattr(env, "name", None)
+        monitor = self._sl_monitor(env)
+        position_id = getattr(position, "position_id", None)
+        monitor.close(position_id)
+        position.sl_state = final_state
+        position.sl_trigger_price = None
+        try:
+            self._persist_position(position, env_name)
+        except Exception as e:
+            log.debug("[SL] close persist skipped: %s", e)
+        self.publish_event("sl_cleared", {
+            "position_id": position_id,
+            "trade_id": getattr(position, "trade_id", None),
+            "strategy_id": getattr(position, "strategy_id", None),
+            "instrument": getattr(position, "instrument", None),
+            "sl_state": final_state,
+            "reason": reason,
+            "execution_mode": getattr(env, "mode", None),
+        }, env_name=env_name)
+
+    def _mark_sl_exiting(self, env, position, order_id: Optional[str] = None,
+                         broker_order_id: Optional[str] = None) -> None:
+        """An exit order exists for this position (INVARIANT 4)."""
+        if position is None:
+            return
+        env_name = getattr(env, "name", None)
+        monitor = self._sl_monitor(env)
+        monitor.mark_exiting(getattr(position, "position_id", None), order_id)
+        position.sl_state = SLState.EXITING.value
+        if order_id:
+            position.exit_order_id = order_id
+        try:
+            self._persist_position(position, env_name)
+        except Exception as e:
+            log.debug("[SL] exiting persist skipped: %s", e)
+        self.publish_event("sl_exit_submitted", {
+            "position_id": getattr(position, "position_id", None),
+            "strategy_id": getattr(position, "strategy_id", None),
+            "instrument": getattr(position, "instrument", None),
+            "order_id": order_id,
+            "broker_order_id": broker_order_id,
+            "execution_mode": getattr(env, "mode", None),
+        }, env_name=env_name)
+
+    def _release_sl_after_failed_exit(self, env, position,
+                                      reason: str = "exit_rejected") -> None:
+        """The exit attempt was rejected — re-arm so a later tick may retry."""
+        if position is None:
+            return
+        monitor = self._sl_monitor(env)
+        monitor.release_exit(getattr(position, "position_id", None))
+        position.sl_state = SLState.ARMED.value
+        position.exit_order_id = None
+        try:
+            position.exit_started = False
+        except Exception:
+            pass
+        try:
+            self._persist_position(position, getattr(env, "name", None))
+        except Exception as e:
+            log.debug("[SL] release persist skipped: %s", e)
+        self.publish_event("sl_exit_failed", {
+            "position_id": getattr(position, "position_id", None),
+            "strategy_id": getattr(position, "strategy_id", None),
+            "instrument": getattr(position, "instrument", None),
+            "reason": reason,
+            "execution_mode": getattr(env, "mode", None),
+        }, env_name=getattr(env, "name", None))
+
+    def _rearm_sl_after_partial_exit(self, env, position, *,
+                                     exit_still_working: bool) -> str:
+        """§12 — a partial exit leaves the position OPEN.
+
+        If the exit order still has working quantity, the SL stays EXITING
+        (one authoritative exit state).  Once it is done the SL re-arms on the
+        position's REMAINING quantity; the position is never marked closed.
+        """
+        if position is None:
+            return SLState.NONE.value
+        env_name = getattr(env, "name", None)
+        monitor = self._sl_monitor(env)
+        pid = getattr(position, "position_id", None)
+        if exit_still_working:
+            position.sl_state = SLState.EXITING.value
+        else:
+            monitor.release_exit(pid)
+            state = monitor.arm(position)
+            position.sl_state = (state.value if state != SLState.UNAVAILABLE
+                                 else SLState.UNAVAILABLE.value)
+            self.publish_event("sl_rearmed_after_partial", {
+                "position_id": pid,
+                "strategy_id": getattr(position, "strategy_id", None),
+                "instrument": getattr(position, "instrument", None),
+                "remaining_quantity": int(getattr(position, "quantity", 0) or 0),
+                "stop_price": getattr(position, "stop_price", None),
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=env_name)
+        try:
+            self._persist_position(position, env_name)
+        except Exception as e:
+            log.debug("[SL] partial rearm persist skipped: %s", e)
+        return position.sl_state
+
+    def _mark_sl_unavailable(self, env, position,
+                             reason: str = SLReject.STOP_MISSING) -> None:
+        """No usable stop on an open position: emit, never invent one (§2)."""
+        if position is None:
+            return
+        env_name = getattr(env, "name", None)
+        self._sl_monitor(env).disarm(getattr(position, "position_id", None))
+        position.sl_state = SLState.UNAVAILABLE.value
+        try:
+            self._persist_position(position, env_name)
+        except Exception as e:
+            log.debug("[SL] unavailable persist skipped: %s", e)
+        self.publish_event("sl_unavailable", {
+            "position_id": getattr(position, "position_id", None),
+            "strategy_id": getattr(position, "strategy_id", None),
+            "instrument": getattr(position, "instrument", None),
+            "reason": reason,
+            "execution_mode": getattr(env, "mode", None),
+        }, env_name=env_name)
+
+    def _evaluate_positions_from_candle(self, env, bar) -> int:
+        """Evaluate every open position's SL against a COMPLETED candle.
+
+        The tick feed is the primary stop evaluator, but it is not a reliable
+        safety net: Dhan's MCX tick feed is explicitly allowed to go silent
+        while REST candles keep arriving, and ``has_live_market_data`` is
+        satisfied by REST alone.  Without this path a dead tick feed would
+        leave every open position UNPROTECTED with nothing in the order book
+        to show for it.
+
+        A completed candle is authoritative about the range it covered, so the
+        stop is tested against the candle's ADVERSE extreme:
+
+          LONG  (stop below) -> the candle LOW
+          SHORT (stop above) -> the candle HIGH
+
+        That is the worst price actually reached, so a stop breached intrabar
+        is detected even if no tick ever arrived.  The monitor's own latch and
+        ``exit_started`` flag keep this idempotent: a stop already fired by a
+        tick is never fired twice by the candle that contained it.
+        """
+        instrument = getattr(bar, "instrument", None)
+        if not instrument:
+            return 0
+        low = getattr(bar, "low", None)
+        high = getattr(bar, "high", None)
+        if low is None or high is None:
+            return 0
+        try:
+            low = float(low)
+            high = float(high)
+        except (TypeError, ValueError):
+            return 0
+        if low <= 0 or high <= 0 or high < low:
+            return 0
+
+        fired = 0
+        for env_iter in self._envs.values():
+            try:
+                positions = env_iter.position_manager.get_positions_by_instrument(
+                    instrument)
+            except Exception:
+                continue
+            for pos in positions:
+                if not getattr(pos, "is_open", False):
+                    continue
+                if getattr(pos, "exit_started", False):
+                    continue
+                reference = low if getattr(pos, "is_long", False) else high
+                try:
+                    signal = self._evaluate_position_sl(
+                        env_iter, pos, reference,
+                        env_name=getattr(env_iter, "name", None))
+                except Exception as e:
+                    log.error("[SL] candle evaluation failed for %s/%s: %s",
+                              getattr(pos, "strategy_id", "?"),
+                              getattr(pos, "position_id", "?"), e)
+                    continue
+                if signal is not None:
+                    fired += 1
+        return fired
+
+    # ── startup / crash recovery ────────────────────────────────────────
+
+    def sync_sl_from_broker(self, env_name: Optional[str] = None) -> dict:
+        """INVARIANT 9 — arm the SL only from broker-confirmed positions.
+
+        Never arms from the database alone: a local row the broker does not
+        confirm is CLOSED in the position book (not just dropped from the
+        monitor) so a stale DB row can never arm an SL, hold an entry
+        blocker, or be traded against.
+        """
+        env = self._env_for(env_name)
+        if env is None:
+            return {"status": "failed", "error": "unknown_environment",
+                    "env": env_name, "armed": [], "unavailable": [],
+                    "dropped_local": [], "broker_only": []}
+        broker = getattr(env, "broker", None)
+        pm = getattr(env, "position_manager", None)
+        if broker is None or pm is None or not hasattr(broker, "positions"):
+            return {"status": "failed", "error": "broker_unavailable",
+                    "env": env_name, "armed": [], "unavailable": [],
+                    "dropped_local": [], "broker_only": []}
+        try:
+            broker_positions = broker.positions() or []
+        except Exception as e:
+            # §35 — an UNKNOWN broker state is not "flat".  Returning {} here
+            # used to let startup continue into trading with no reconciliation
+            # at all, so a transient API failure silently skipped the whole
+            # broker-authoritative check.
+            log.error("[SL] broker position query failed: %s", e)
+            return {"status": "failed", "error": f"broker_query_failed: {e}",
+                    "env": env_name, "armed": [], "unavailable": [],
+                    "dropped_local": [], "broker_only": []}
+
+        # Local open positions across every strategy.
+        local_positions = []
+        for sid in list((getattr(env, "strategies", {}) or {}).keys()):
+            for lp in (pm.get_positions_by_strategy(sid) or []):
+                if getattr(lp, "is_open", False):
+                    local_positions.append(lp)
+
+        # Dhan reports positions PER SECURITY, as a single signed netQty, with
+        # no strategy attribution.  The transport fans that one row out to every
+        # strategy configured on the instrument, so the rows are duplicates:
+        # collapse them to one authoritative net position per instrument.
+        # This is the level the broker can actually speak to, and it is the only
+        # level at which "the broker says flat" is a real answer.
+        broker_net: dict[str, dict] = {}
+        for row in broker_positions or []:
+            inst = str(row.get("instrument") or "")
+            if not inst:
+                continue
+            try:
+                qty = int(row.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+            side = str(row.get("side") or "").upper()
+            if side not in ("BUY", "SELL", "LONG", "SHORT"):
+                continue
+            signed = qty if side in ("BUY", "LONG") else -qty
+            cur = broker_net.get(inst)
+            if cur is None:
+                broker_net[inst] = {"instrument": inst, "signed": signed,
+                                    "quantity": abs(signed),
+                                    "side": "LONG" if signed > 0 else "SHORT"}
+            elif cur["signed"] != signed:
+                # Two different nets for one instrument cannot both be right;
+                # the conservative reading is FLAT, so nothing is armed on it.
+                log.error("[SL] conflicting broker nets for %s (%s vs %s) — "
+                          "treating as FLAT", inst, cur["signed"], signed)
+                broker_net[inst] = {"instrument": inst, "signed": 0,
+                                    "quantity": 0, "side": "FLAT"}
+
+        # Hand the monitor one clean row per instrument per local position.
+        resolved = []
+        for lp in local_positions:
+            inst = str(lp.instrument)
+            net = broker_net.get(inst)
+            is_long = bool(getattr(lp, "is_long", False))
+            # Confirmed means BOTH: the broker holds a net position here AND
+            # its direction agrees with the local book.  A direction conflict
+            # means the local row cannot be trusted to exist, and an SL on it
+            # could send a real exit for a position the broker does not hold.
+            confirmed = bool(net and net["signed"] != 0
+                             and ((net["signed"] > 0) == is_long))
+            resolved.append({
+                "instrument": inst,
+                "strategy_id": str(lp.strategy_id),
+                "quantity": int(getattr(lp, "quantity", 0) or 0),
+                "side": "LONG" if is_long else "SHORT",
+                "broker_confirmed": confirmed,
+            })
+        # A broker position with no local book at all: surfaced, never opened.
+        local_instruments = {str(lp.instrument) for lp in local_positions}
+        for inst, net in broker_net.items():
+            if inst in local_instruments or net["quantity"] <= 0:
+                continue
+            resolved.append({
+                "instrument": inst, "strategy_id": "", "side": net["side"],
+                "quantity": net["quantity"], "broker_confirmed": True,
+            })
+
+        summary = self._sl_monitor(env).resync_from_broker(
+            resolved, local_positions,
+            stop_resolver=self._sl_stop_resolver(env))
+
+        # Reflect the recovered state on the position rows and persist them.
+        by_pid = {str(getattr(p, "position_id", "")): p for p in local_positions}
+        for entry in summary.get("armed", []):
+            pos = by_pid.get(str(entry.get("position_id")))
+            if pos is None:
+                continue
+            pos.sl_state = SLState.ARMED.value
+            if not pos.sl_protected_at:
+                pos.sl_protected_at = time.time()
+            try:
+                self._persist_position(pos, getattr(env, "name", None))
+            except Exception as e:
+                log.debug("[SL] arm persist skipped: %s", e)
+            self.publish_event("sl_recovered_from_broker", dict(
+                entry, execution_mode=getattr(env, "mode", None)),
+                env_name=getattr(env, "name", None))
+        for entry in summary.get("unavailable", []):
+            pos = by_pid.get(str(entry.get("position_id")))
+            if pos is None:
+                continue
+            self._mark_sl_unavailable(env, pos, entry.get("reason")
+                                      or SLReject.STOP_MISSING)
+
+        # A local row the broker does not confirm cannot exist: close it.
+        for entry in summary.get("dropped_local", []):
+            pid = entry.get("position_id")
+            if not pid:
+                continue
+            try:
+                pm.abandon_stale_position(str(pid))
+            except Exception as e2:
+                log.error("[SL] could not close stale position %s: %s", pid, e2)
+            self.publish_event("sl_stale_local_position_closed", dict(
+                entry, execution_mode=getattr(env, "mode", None)),
+                env_name=getattr(env, "name", None))
+
+        log.info("[SL] broker-authoritative SL sync: armed=%s unavailable=%s "
+                 "dropped_local=%s broker_only=%s",
+                 len(summary.get("armed", [])), len(summary.get("unavailable", [])),
+                 len(summary.get("dropped_local", [])),
+                 len(summary.get("broker_only", [])))
+        summary["status"] = "reconciled"
+        summary["env"] = getattr(env, "name", None)
+        return summary
+
+    def _sl_stop_resolver(self, env):
+        """Recover a position's OWN stop only — never invent one (§2).
+
+        Sources, in order: the position row, its entry order's executed
+        ``planned_sl``.  An old strategy-wide stop or an old signal's stop is
+        deliberately NOT used: it may belong to a previous position.
+        """
+        engine = getattr(env, "execution_engine", None)
+
+        def _resolve(position):
+            stop = getattr(position, "stop_price", None)
+            try:
+                if stop is not None and float(stop) > 0:
+                    return float(stop)
+            except (TypeError, ValueError):
+                pass
+            oid = getattr(position, "entry_order_id", None)
+            if oid and engine is not None:
+                order = engine.get_order(oid)
+                planned = getattr(order, "planned_sl", None) if order else None
+                try:
+                    if planned is not None and float(planned) > 0:
+                        return float(planned)
+                except (TypeError, ValueError):
+                    pass
+            return None
+
+        return _resolve

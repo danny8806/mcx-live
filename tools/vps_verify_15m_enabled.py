@@ -64,11 +64,10 @@ for sid, s in enabled.items():
     ok = (sub.quantity == 100 and sub.state.value == 'rejected' and 'GATE' in (sub.reason or '').upper())
     print(f'[{sid}] ENTRY qty={sub.quantity} state={sub.state.value} -> 100&cancelled={ok}')
     all_ok = all_ok and ok
-    sl = engine.create_protective_sl(strategy_id=sid, instrument=inst, side='SELL',
-        quantity=sub.quantity, trigger_price=72400.0, trade_id=f'T-{sid}', entry_order_id=order.order_id)
-    sls = engine.submit_order(sl)
-    sok = (sl.quantity == 100 and sls.state.value == 'rejected')
-    print(f'[{sid}] SL    qty={sl.quantity} state={sls.state.value} -> 100&cancelled={sok}')
+    # Protective SL is RETIRED: the only stop is the local position-owned
+    # monitor.  Assert the broker-side path no longer exists at all.
+    sok = not hasattr(engine, 'create_protective_sl')
+    print(f'[{sid}] SL    create_protective_sl present={not sok} -> retired')
     all_ok = all_ok and sok
     ex = Signal(SignalType.FLAT, inst, strategy_id=sid, quantity=qty,
                 timestamp=time.time(), trigger_price=72600.0, stop_price=0.0,

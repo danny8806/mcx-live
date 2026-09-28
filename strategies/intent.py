@@ -56,8 +56,35 @@ def reversal_levels(
     previous_low: Optional[float],
     gap: float = 0,
 ) -> tuple[float, float, float]:
-    """Return (exit trigger, opposite-entry trigger, new stop) for a reversal."""
+    """Return (exit trigger, opposite-entry trigger, new stop) for a reversal.
+
+    The opposite entry trigger must sit STRICTLY BEYOND the exit trigger, in
+    the direction the new position trades:
+
+      LONG -> SHORT: exit needs price to FALL to ``exit_trigger``; the SHORT
+        entry therefore must be BELOW it, so the new position can only be
+        opened after the move has continued past the old exit level.
+      SHORT -> LONG: symmetric — the LONG entry must be ABOVE the exit.
+
+    A zero or negative ``gap`` would place the new entry at or behind the exit,
+    letting the reversal entry become reachable at the same instant as the exit
+    (or before the old position is flat).  That is a structurally invalid
+    reversal, so it is rejected here rather than discovered in production.
+    """
     exit_trigger, stop = entry_levels(
         side, high, low, previous_high, previous_low)
-    entry_trigger = exit_trigger + gap if side.upper() == "LONG" else exit_trigger - gap
+    if side.upper() == "LONG":
+        entry_trigger = exit_trigger + gap
+        if not entry_trigger > exit_trigger:
+            raise ValueError(
+                f"REVERSAL_GAP_INVALID: LONG->SHORT entry trigger "
+                f"({entry_trigger}) must be strictly BELOW the exit trigger "
+                f"({exit_trigger}); increase reversal_entry_gap_points")
+    else:
+        entry_trigger = exit_trigger - gap
+        if not entry_trigger < exit_trigger:
+            raise ValueError(
+                f"REVERSAL_GAP_INVALID: SHORT->LONG entry trigger "
+                f"({entry_trigger}) must be strictly ABOVE the exit trigger "
+                f"({exit_trigger}); increase reversal_entry_gap_points")
     return exit_trigger, entry_trigger, stop

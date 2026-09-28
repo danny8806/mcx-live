@@ -69,12 +69,11 @@ class LiveExecutionEngine:
         # §9.5 — price plans are IMMUTABLE PER SIGNAL: the plan computed for a
         # signal_id is stored once and every recompute must equal it exactly.
         self._plan_by_signal: dict[str, ExecutionPricePlan] = {}
-        # Tick grid used to derive the mandatory minimum separation between the
-        # LIMIT and TRIGGER legs of STOP_LOSS orders (Dhan DH-906); defaults to
-        # 1.0 and is refined by the PricePreset when one is configured.
+        # Tick grid used to round planned LIMIT prices; defaults to 1.0 and is
+        # refined by the PricePreset when one is configured.
         self._tick_size = float(self._price_preset.tick_size)
         # Installed by TradingEngine. This is the single LIVE submission
-        # boundary used by normal orders, recovery orders, and protection.
+        # boundary used by normal orders and recovery orders.
         self.submission_guard = None
 
     def _now(self) -> float:
@@ -157,9 +156,7 @@ class LiveExecutionEngine:
             order.requested_price = plan.price
             order.planned_order_type = plan.order_type
             order.planned_entry_price = plan.price
-            if plan.order_type == "STOP_LOSS_MARKET":
-                order.planned_sl = plan.trigger_price
-            elif plan.kind == "long_entry":
+            if plan.kind == "long_entry":
                 order.planned_sl = calculate_long_sl_price(
                     signal.stop_price, self._price_preset.sl_offset)
             elif plan.kind == "short_entry":
@@ -175,64 +172,20 @@ class LiveExecutionEngine:
         """The execution plan resolved for a created order (Phase 3 forensics)."""
         return self._plans.get(order_id)
 
-    def create_protective_sl(self, *, strategy_id: str, instrument: str,
-                             side: str, quantity: int, trigger_price: float,
-                             trade_id: str, entry_order_id: str,
-                             limit_price: Optional[float] = None,
-                             position_id: Optional[str] = None,
-                             position_generation: Optional[int] = None,
-                             signal_id: Optional[str] = None) -> Order:
-        """Create (not submit) a broker-side protective STOP_LOSS order.
-
-        Spec §22-24: a resting stop-limit protects an OPEN live position and is
-        placed as soon as the entry fill opens the position, carrying the
-        explicit protected_order_id lineage and order_role=STOP_LOSS.  The
-        order is NOT filled on placement — it rests at the broker until the
-        trigger fires (verified live on Dhan MCX 2026-09-16: STOP_LOSS carries
-        BOTH a limit price and a trigger; a BUY requires limit > trigger and a
-        SELL requires limit < trigger).
-        """
-        tick = self._tick_size
-        if limit_price is None:
-            limit_price, trigger_price = _stop_limit_legs(
-                trigger=float(trigger_price), side=str(side).upper(),
-                tick_size=tick, direction="same")
-        # SAFETY: enforce Dhan DH-906 invariant regardless of how the caller
-        # computed limit/trigger.  BUY STOP_LOSS requires limit > trigger;
-        # SELL STOP_LOSS requires limit < trigger.  If violated, nudge the
-        # limit by one tick in the correct direction.
-        side_u = str(side).upper()
-        if side_u == "BUY" and float(limit_price) <= float(trigger_price):
-            limit_price = float(trigger_price) + tick
-        elif side_u == "SELL" and float(limit_price) >= float(trigger_price):
-            limit_price = float(trigger_price) - tick
-        order = Order(
-            order_id=f"LIVE-{uuid.uuid4()}",
-            strategy_id=strategy_id,
-            instrument=instrument,
-            side=side,
-            quantity=quantity,
-            order_type="STOP_LOSS",
-            price=float(limit_price),
-            trigger_price=float(trigger_price),
-            correlation_id=f"MCX-{uuid.uuid4().hex[:12]}",
-            order_role="STOP_LOSS",
-            lifecycle_id=trade_id,
-            parent_signal_id=signal_id or entry_order_id,
-            parent_position_id=position_id,
-            position_generation=position_generation,
-            protected_order_id=entry_order_id,
-            trade_id=trade_id,
-            state=OrderState.CREATED,
-            created_at=self._now(),
-            updated_at=self._now(),
-        )
-        self._orders[order.order_id] = order
-        if self.broker_router is not None:
-            self.broker_router.register_from_order(order)
-        return order
-
     def submit_order(self, order: Order) -> Order:
+        # INVARIANT 10 — a broker-side protective SL no longer exists.  The
+        # only stop-loss is the local position-owned monitor, which mints an
+        # ordinary EXIT order when the tick crosses position.stop_price.  This
+        # check is FIRST and unconditional: no caller, state or plan can get a
+        # protective STOP_LOSS to the broker.
+        role = str(order.order_role or "").upper()
+        if role == "STOP_LOSS" or str(
+                getattr(order, "order_type", "") or "").upper() in (
+                    "STOP_LOSS", "STOP_LOSS_MARKET"):
+            order.state = OrderState.REJECTED
+            order.reason = "BROKER_SL_RETIRED_POSITION_OWNED_SL_ONLY"
+            order.updated_at = self._now()
+            return order
         if order.state != OrderState.CREATED:
             raise ValueError(f"Cannot submit order in state {order.state}")
 
@@ -242,7 +195,7 @@ class LiveExecutionEngine:
                                     getattr(order, "position_id", None))
         order.position_id = order.position_id or order.parent_position_id
         role = str(order.order_role or "").upper()
-        if role not in {"ENTRY", "EXIT", "STOP_LOSS", "REVERSAL_EXIT",
+        if role not in {"ENTRY", "EXIT", "REVERSAL_EXIT",
                         "REVERSAL_ENTRY", "FALLBACK_MARKET", "EMERGENCY_EXIT"}:
             order.state = OrderState.REJECTED
             order.reason = "ORDER_ROLE_INVALID"
@@ -263,7 +216,7 @@ class LiveExecutionEngine:
             order.reason = "LIVE_ENTRY_MUST_BE_LIMIT"
             order.updated_at = self._now()
             return order
-        if (role in {"ENTRY", "REVERSAL_ENTRY", "EXIT", "STOP_LOSS",
+        if (role in {"ENTRY", "REVERSAL_ENTRY", "EXIT",
                      "REVERSAL_EXIT", "FALLBACK_MARKET"}
                 and str(getattr(order, "trigger_state", "") or "").upper() != "FIRED"):
             order.state = OrderState.REJECTED

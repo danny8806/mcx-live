@@ -36,6 +36,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from config import as_dict
+
 log = logging.getLogger(__name__)
 
 # ── priority model (P0 = highest; an entry must never block higher) ──────
@@ -155,7 +157,7 @@ class OrderWatcher:
     ):
         self._engine = engine
         self._broker = broker
-        live_cfg = config.get("live", {}) if isinstance(config, dict) else {}
+        live_cfg = as_dict(config).get("live", {}) or {}
         self._cfg = live_cfg.get("order_watcher", {}) if isinstance(live_cfg, dict) else {}
         self._clock = clock or time.time
         self._quote_fn = quote_fn or self._default_quote
@@ -1089,7 +1091,20 @@ class OrderWatcher:
             new_order = engine.create_order(
                 signal=order, multiplier=1.0, trade_id=rec.trade_id or "")
             new_order.order_type = "MARKET"
-            new_order.order_role = "FALLBACK_MARKET"
+            # A fallback that REDUCES exposure keeps the exit role: the engine
+            # only admits a MARKET for an exit-family order, and an entry-side
+            # FALLBACK_MARKET is still rejected there.  Using the entry role for
+            # an exit would (a) be rejected and (b) route the completion through
+            # the entry gate, which an emergency close must never depend on.
+            is_exit_rec = str(rec.order_role or "").upper() in (
+                "EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT")
+            new_order.order_role = ("EXIT" if is_exit_rec else "FALLBACK_MARKET")
+            if is_exit_rec:
+                # The plan built by create_order priced a protective LIMIT at
+                # the stop; a MARKET carries no price, so clear it rather than
+                # let a stale stop level travel with the order record.
+                new_order.price = None
+                new_order.requested_price = None
             new_order.lifecycle_id = rec.lifecycle_id or rec.trade_id
             new_order.parent_signal_id = rec.signal_id
             new_order.parent_position_id = rec.position_id
@@ -1123,13 +1138,43 @@ class OrderWatcher:
                 "market_order_id": new_order.order_id, "quantity": remaining}
 
     def _fresh_market_entry(self, rec: OrderWatchRecord, quantity: Optional[int] = None):
-        """Signal clone carrying the exact strategy intent for a fresh entry.
+        """Signal clone carrying the exact strategy intent for a fresh order.
         I11 — the fallback always uses the REMAINING quantity
-        (requested - already-filled), never the original requested amount."""
+        (requested - already-filled), never the original requested amount.
+
+        The clone preserves the record's SIDE, so a LONG position's exit
+        fallback stays a SELL — the fallback can never cross the position.
+        For an exit-family record it is additionally marked ``exit`` so the
+        engine plans it as an exit (and the entry gate cannot gate it), and it
+        inherits the already-validated FIRED trigger state of the exit order
+        this fallback is completing.
+        """
         from strategies.types import Signal, SignalType
+        is_exit_rec = str(rec.order_role or "").upper() in (
+            "EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT")
         s_type = SignalType.LONG if rec.side == "BUY" else SignalType.SHORT
         qty = quantity if quantity is not None else max(
             0, rec.requested_quantity - rec.filled_quantity)
+        metadata = {
+            "market_fallback": True,
+            "prev_order_id": rec.internal_order_id,
+            "prev_correlation_id": rec.correlation_id,
+            "original_order_id": rec.internal_order_id,
+            "trigger_state": rec.extra.get("trigger_state"),
+            "trigger_generation": rec.extra.get("trigger_generation"),
+            "trigger_source": rec.extra.get("trigger_source"),
+        }
+        if is_exit_rec:
+            # Completing an exit that the engine already accepted: that order
+            # passed the FIRED-trigger gate, so the fallback inherits it.  The
+            # trigger is not being invented, it is carried from the very order
+            # being completed.
+            metadata.update({
+                "exit": True,
+                "exit_reason": str(rec.extra.get("exit_reason")
+                                   or "local_sl_exit_market_fallback"),
+                "trigger_state": "FIRED",
+            })
         signal = Signal(
             signal_type=s_type,
             instrument=rec.instrument,
@@ -1138,15 +1183,7 @@ class OrderWatcher:
             trigger_price=rec.trigger_price,
             stop_price=rec.extra.get("stop_price", 0.0) or 0.0,
             quantity=qty,
-            metadata={
-                "market_fallback": True,
-                "prev_order_id": rec.internal_order_id,
-                "prev_correlation_id": rec.correlation_id,
-                "original_order_id": rec.internal_order_id,
-                "trigger_state": rec.extra.get("trigger_state"),
-                "trigger_generation": rec.extra.get("trigger_generation"),
-                "trigger_source": rec.extra.get("trigger_source"),
-            },
+            metadata=metadata,
         )
         signal.signal_id = rec.signal_id or signal.signal_id
         signal.lifecycle_id = rec.lifecycle_id or rec.trade_id

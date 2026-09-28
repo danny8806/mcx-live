@@ -51,6 +51,7 @@ from indicators.shared import SharedNativeIndicatorEngine
 from execution.models import Fill
 from execution.broker_router import BrokerEventRouter
 from execution.fee_model import MCXFeeModel
+from execution.live.market_health import MarketDataHealthMonitor
 from execution.order_manager import OrderManager, OrderManagerFacade
 from portfolio.position_manager import PositionManager, PositionManagerFacade, Position
 from portfolio.pnl import PNLEngine
@@ -67,6 +68,7 @@ from core.rollover import RolloverService
 from application.signal_flow import SignalFlowMixin
 from application.fill_flow import FillFlowMixin
 from application.live_position_flow import LivePositionFlowMixin
+from application.sl_flow import SLFlowMixin
 from application.persistence_flow import PersistenceFlowMixin
 from application.environment_factory import EnvironmentFactoryMixin, STRATEGY_FACTORIES
 from application.market_flow import MarketEventFlowMixin
@@ -148,7 +150,7 @@ STRATEGY_GATE_ACTION_ERRORS = {
 
 
 
-class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, PersistenceFlowMixin, EnvironmentFactoryMixin, MarketEventFlowMixin):
+class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlowMixin, PersistenceFlowMixin, EnvironmentFactoryMixin, MarketEventFlowMixin):
     """Event-driven trading engine with per-strategy isolation.
 
     Event flow:
@@ -212,6 +214,17 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Persi
             atr_period=indicator_cfg.get("atr_period", 6),
             atr_factor=indicator_cfg.get("atr_factor", 1.0),
         )
+        # §38 — market-data health.  The stop is local, so a silent feed is an
+        # UNPROTECTED position, not a cosmetic dashboard warning.  Fresh ticks
+        # or a completed candle both refresh this; losing both is an outage.
+        _live_cfg = self.config.get("live") or {}
+        self.market_data_health = MarketDataHealthMonitor(
+            stale_after=float((_live_cfg.get("market_data") or {})
+                              .get("stale_after_seconds", 90.0)),
+        )
+        # §35 — environments whose broker position state is KNOWN at startup.
+        # A LIVE env absent from this set must not open new exposure.
+        self._reconciled_envs: set[str] = set()
 
         # ── Initialize (shared market-data infrastructure) ──
         self._init_market_status()
@@ -290,11 +303,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Persi
         self._running = False
         self._lock = threading.RLock()
         self._persistence = None
-        # §22-25 — protective-SL that could not be cancelled at exit: entries
-        # for (env, strategy, instrument) stay BLOCKED until the resting order
-        # is confirmed cancelled, so an orphan SLM can never fire against a
-        # new opposite position.
-        self._uncancelled_sl: dict[tuple[str, str, str], str] = {}
+        # The orphan-protective-SL entry block is gone: there is no broker-side
+        # protective stop any more, so no resting order can outlive a position.
 
         # ── Warmup forensics + latest-completed watermark (mission: direct
         # Dhan REST source + latest-available backfill) ──
@@ -839,9 +849,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Persi
         A reversal signal jumps straight into the exit branch of
         ``_process_signal``, so the entry-side gates (safe mode, market
         tradable, risk kill-switch / daily loss) never ran for its entry leg.
-        The decisive additional gate is the orphan-SL block: when the old
-        protective SL could not be cancelled above, a NEW opposite position
-        must not be placed while that resting STOP_LOSS could still fire.
+        The old orphan-protective-SL block is gone: no broker-side stop can
+        outlive its position, so there is nothing left to block on.
 
         Returns a reason string to block the entry, or None when clear.
         """
@@ -867,8 +876,6 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Persi
                     return "daily_loss_limit_reached"
             except Exception:
                 pass
-        if (env.name, strategy_id, instrument) in self._uncancelled_sl:
-            return "orphan_sl_unreleased"
         return None
 
         # Reversal entries remain armed on the strategy and are submitted only
@@ -1189,32 +1196,30 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Persi
                     event_callback=self._event_callback,
                     trade_ledger=env.trade_ledger,
                 )
-        # §108 restart-safe startup reconcile: re-arm the orphan-SL entry gate
-        # from durable cancel-failure records BEFORE any signal can fire.
+        # ── Position-owned SL recovery (INVARIANT 9) ──────────────────────
+        # The BROKER is the only authority for "is there an open position".
+        # Never arm the local SL from the database alone: a local row the
+        # broker does not confirm is closed and its SL discarded; a
+        # broker-confirmed position is armed from its OWN stop.
         for name, env in self._envs.items():
             if not env.is_live:
                 continue
             try:
-                self._restore_uncancelled_sl(env)
+                summary = self.sync_sl_from_broker(env_name=name)
             except Exception as e:
-                log.warning("[Engine] startup SL reconcile failed for %s: %s",
-                            name, e)
-
-        # ── SL RECOVERY: detect and protect unprotected positions ──
-        # After restoring orphan-SL gates, check for open positions that
-        # lack protective SL (e.g. from a crash/restart after entry but
-        # before SL was placed, or when SL was rejected).
-        for name, env in self._envs.items():
-            if not env.is_live:
-                continue
-            try:
-                recovered = self.recover_missing_sl(env_name=name)
-                if recovered:
-                    log.info("[Engine] startup SL recovery: protected %d "
-                             "position(s) in env %s", recovered, name)
-            except Exception as e:
-                log.warning("[Engine] startup SL recovery failed for %s: %s",
-                            name, e)
+                log.error("[Engine] startup SL sync failed for %s: %s", name, e)
+                summary = {"status": "failed", "error": str(e)}
+            # §35 — trading must not begin on an unreconciled book.  An unknown
+            # broker state is not "flat": if the position query failed we do not
+            # know what is open, so entries stay closed until it succeeds.
+            if summary.get("status") == "reconciled":
+                self._reconciled_envs.add(name)
+                log.info("[Engine] startup SL sync for env %s: %s", name, summary)
+            else:
+                self._reconciled_envs.discard(name)
+                log.error("[Engine] startup reconciliation FAILED for %s (%s) — "
+                          "entries stay blocked until the broker position state "
+                          "is known", name, summary.get("error"))
 
         self.market_status.set_engine_status(EngineStatus.WARMING_UP)
         for env in self._envs.values():
@@ -1454,7 +1459,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Persi
                 pass
             for env_name, sids in self._restore_failures.items():
                 log.error("[Engine] %s TRADE-RESTORE FAILED for strategies %s — "
-                          "startup reconcile + recover_missing_sl are the "
+                          "the broker-authoritative position/SL sync is the "
                           "only protection", env_name, sids)
 
     def _warmup_from_rest(self, now_epoch: Optional[int] = None) -> None:
@@ -1971,6 +1976,22 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Persi
         for env in targets:
             if env.position_manager is None:
                 continue
+            # §35 — the periodic reconcile is also a chance to RE-ESTABLISH a
+            # known broker position state.  A startup query that failed must not
+            # block entries forever: the first successful broker-authoritative
+            # sync re-opens the gate, and any later failure closes it again.
+            if getattr(env, "is_live", False):
+                try:
+                    sl_summary = self.sync_sl_from_broker(env_name=env.name)
+                except Exception as e:
+                    sl_summary = {"status": "failed", "error": str(e)}
+                if sl_summary.get("status") == "reconciled":
+                    if env.name not in self._reconciled_envs:
+                        log.info("[Engine] broker position state re-established "
+                                 "for %s — entries re-enabled", env.name)
+                    self._reconciled_envs.add(env.name)
+                else:
+                    self._reconciled_envs.discard(env.name)
             with self._lock:
                 for sid, strategy in list(env.strategies.items()):
                     open_pos = next((

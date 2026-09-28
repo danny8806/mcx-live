@@ -866,24 +866,29 @@ _ALTER_MIGRATIONS: list[tuple[str, str, str]] = [
     ("orders", "execution_mode", "TEXT NOT NULL DEFAULT 'PAPER'"),
     ("fills", "execution_mode", "TEXT NOT NULL DEFAULT 'PAPER'"),
     # ── Schema v4 — order identity model (spec §12-14): explicit order_role
-    #    (ENTRY/EXIT/STOP_LOSS/REVERSAL_EXIT/REVERSAL_ENTRY/EMERGENCY_EXIT),
-    #    trigger_price persistence (broker-authoritative SLM trigger), and the
-    #    protected_order_id lineage (which entry order a broker-side SL protects).
+    #    (ENTRY/EXIT/REVERSAL_EXIT/REVERSAL_ENTRY/EMERGENCY_EXIT), plus the
+    #    trigger_price / correlation_id lineage columns.
+    #    NOTE: the broker-side protective SL was retired.  ``protected_order_id``
+    #    and ``positions.sl_order_id`` are LEGACY columns kept read-only so old
+    #    audit rows stay intelligible; nothing writes them any more.
     ("orders", "order_role", "TEXT"),
     ("orders", "trigger_price", "REAL"),
     ("orders", "protected_order_id", "TEXT"),
     ("orders", "correlation_id", "TEXT"),
-    # ── Schema v4 — broker-side SL protection state (spec §22-24): SLM placed
-    #    AFTER entry fill and verified; positions carry the SL lifecycle state
-    #    (none/pending/submitted/verified/failed/cancelled/filled).
+    # ── Position-owned SL state (local monitor lifecycle only:
+    #    NONE/ARMED/TRIGGERED/EXITING/CLOSED/SL_UNAVAILABLE).  NEVER means
+    #    "a broker order is resting".
     ("positions", "sl_state", "TEXT"),
     ("positions", "sl_order_id", "TEXT"),
     ("positions", "sl_trigger_price", "REAL"),
     ("positions", "sl_protected_at", "TEXT"),
-    # ── Schema v5 — strategy stop_price persistence: the intended stop level
-    #    for the position (from signal/strategy), separate from the SL order's
-    #    trigger price.  Enables SL recovery on restart when position.stop_price
-    #    was previously lost.
+    # ── Broker entry/exit order ids for the position (audit lineage + the
+    #    startup SL stop resolver).
+    ("positions", "entry_order_id", "TEXT"),
+    ("positions", "exit_order_id", "TEXT"),
+    # ── Schema v5 — the position's OWN stop level.  This is the single
+    #    authority for the stop; it is never derived from an old signal, an old
+    #    position, or a previous reversal.
     ("positions", "stop_price", "REAL"),
     ("trades", "stop_price", "REAL"),
     # ── Phase 9.7 — fill reconciliation ledger columns: the broker-native

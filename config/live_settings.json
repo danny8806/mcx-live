@@ -84,22 +84,21 @@
       "fast_timeframe": "5m",
       "mid_timeframe": "15m",
       "htf_timeframe": "1h",
-      
       "capital": 300000,
-      "enabled": false,
+      "enabled": true,
       "lots": 1,
-      "live_gate": "OFF",
-      "entry_enabled": false,
-      "exit_enabled": false,
-      "reversal_enabled": false,
-      "sl_enabled": false
+      "live_gate": "ON",
+      "entry_enabled": true,
+      "exit_enabled": true,
+      "reversal_enabled": true,
+      "sl_enabled": true,
+      "quantity": 100
     },
     "gold_02": {
       "instrument": "GOLDM",
       "fast_timeframe": "15m",
       "mid_timeframe": "15m",
       "htf_timeframe": "1h",
-      
       "capital": 300000,
       "enabled": true,
       "lots": 1,
@@ -107,14 +106,14 @@
       "entry_enabled": true,
       "exit_enabled": true,
       "reversal_enabled": true,
-      "sl_enabled": true
+      "sl_enabled": true,
+      "quantity": 100
     },
     "silver_01": {
       "instrument": "SILVERM",
       "fast_timeframe": "15m",
       "mid_timeframe": "15m",
       "htf_timeframe": "1h",
-      
       "capital": 300000,
       "enabled": true,
       "lots": 1,
@@ -122,22 +121,23 @@
       "entry_enabled": true,
       "exit_enabled": true,
       "reversal_enabled": true,
-      "sl_enabled": true
+      "sl_enabled": true,
+      "quantity": 100
     },
     "silver_02": {
       "instrument": "SILVERM",
       "fast_timeframe": "5m",
       "mid_timeframe": "15m",
       "htf_timeframe": "1h",
-      
       "capital": 300000,
-      "enabled": false,
+      "enabled": true,
       "lots": 1,
-      "live_gate": "OFF",
-      "entry_enabled": false,
-      "exit_enabled": false,
-      "reversal_enabled": false,
-      "sl_enabled": false
+      "live_gate": "ON",
+      "entry_enabled": true,
+      "exit_enabled": true,
+      "reversal_enabled": true,
+      "sl_enabled": true,
+      "quantity": 100
     }
   },
   "charges": {
@@ -163,7 +163,7 @@
     "gate": "ON",
     "broker": "dhan",
     "reconcile_interval_seconds": 5,
-    "order_poll_interval_seconds": 2,
+    "order_poll_interval_seconds": 0.5,
     "position_poll_interval_seconds": 5,
     "pnl_poll_interval_seconds": 5,
     "max_retries": 3,

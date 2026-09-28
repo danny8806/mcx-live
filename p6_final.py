@@ -151,7 +151,7 @@ checklist = [
     ("MARKET fallback", "CODE_VERIFIED", "market_fallback_enabled config, timeout_ms, MARKET_FALLBACK decision."),
     ("Partial fill", "CODE_VERIFIED", "PARTIAL_FILL -> WAIT in OrderWatcher._decide."),
     ("Position", "PASS", "0 positions. execution_mode=LIVE."),
-    ("SL", "CODE_VERIFIED", "create_protective_sl method, SL config enabled=true, fail_closed=false."),
+    ("SL", "CODE_VERIFIED", "Local position-owned SL only: PositionOwnedSLMonitor + SLFlowMixin. No broker-side protective order (create_protective_sl removed and hard-rejected)."),
     ("Normal exit", "CODE_VERIFIED", "_handle_fill at trading_engine.py:1934."),
     ("Reversal", "CODE_VERIFIED", "_create_reversal_signal returns EXIT + arms opposite entry."),
     ("Strategy isolation", "PASS", "4 strategies, per-strategy state, isolation code verified."),

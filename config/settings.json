@@ -161,7 +161,7 @@
     "gate": "OFF",
     "broker": "stub",
     "reconcile_interval_seconds": 5,
-    "order_poll_interval_seconds": 2,
+    "order_poll_interval_seconds": 0.5,
     "position_poll_interval_seconds": 5,
     "pnl_poll_interval_seconds": 5,
     "max_retries": 3,

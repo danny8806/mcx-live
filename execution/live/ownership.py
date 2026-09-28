@@ -2,6 +2,10 @@
 
 This module is intentionally independent of TradingEngine. Every live order
 must cross this check before the broker adapter is called.
+
+There is no broker-side protective SL: a stop-loss is the local,
+position-owned SL monitor minting an ordinary ``EXIT`` order bound to the open
+position.  ``STOP_LOSS`` is therefore NOT an exit role here.
 """
 from __future__ import annotations
 
@@ -9,7 +13,7 @@ from typing import Optional
 
 
 _ENTRY_ROLES = {"ENTRY", "REVERSAL_ENTRY", "FALLBACK_MARKET"}
-_EXIT_ROLES = {"EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"}
+_EXIT_ROLES = {"EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"}
 
 
 def validate_live_order_ownership(env, order) -> Optional[str]:

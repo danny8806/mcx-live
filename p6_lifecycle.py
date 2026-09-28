@@ -86,14 +86,14 @@ trig_code = ssh("docker exec mcx-live grep -n 'TRIGGER_CROSSED\\|trigger_crossed
 print(trig_code.strip()[:400] if trig_code.strip() else "  not found")
 
 print("\n" + "=" * 80)
-print("SECTION 23: SL CREATION")
+print("SECTION 23: LOCAL POSITION-OWNED SL")
 print("=" * 80)
 
-sl_code = ssh("docker exec mcx-live python3 -c \"import inspect; from execution.live.engine import LiveExecutionEngine; src=inspect.getsource(LiveExecutionEngine.create_protective_sl); print(src)\" 2>/dev/null")
+sl_code = ssh("docker exec mcx-live python3 -c \"import inspect; from execution.live.sl_monitor import PositionOwnedSLMonitor, SLState; print('STATES:', [s.value for s in SLState]); print(inspect.getsource(PositionOwnedSLMonitor.evaluate))\" 2>/dev/null")
 print(sl_code.strip()[:800] if sl_code.strip() else "  Could not inspect")
 
-print("\n--- SL config ---")
-sl_cfg = ssh("docker exec mcx-live python3 -c \"import json; c=json.load(open('/app/config/live_settings.json')); sl=c.get('live',{}).get('broker_sl',{}); print(json.dumps(sl,indent=2))\" 2>/dev/null")
+print("\n--- broker-side SL retired? ---")
+sl_cfg = ssh("docker exec mcx-live python3 -c \"from execution.live.engine import LiveExecutionEngine; print('create_protective_sl present:', hasattr(LiveExecutionEngine, 'create_protective_sl'))\" 2>/dev/null")
 print(sl_cfg.strip()[:300] if sl_cfg.strip() else "  not found")
 
 print("\n" + "=" * 80)

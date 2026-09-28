@@ -213,6 +213,15 @@ class DhanRestTransport(LiveBrokerClient):
                            trigger_price: Optional[float] = None,
                            correlation_id: Optional[str] = None) -> dict:
         side_u = str(side).upper()
+        # INVARIANT 10 — the last gate before the wire, checked FIRST.  This
+        # system has NO broker-side protective stop: a stop-loss is the local
+        # position-owned monitor minting an ordinary LIMIT/MARKET exit.  A
+        # resting stop-limit / SLM must never reach Dhan from any caller.
+        order_type_u = (order_type or "MARKET").upper()
+        if order_type_u in ("STOP_LOSS", "STOP_LOSS_MARKET"):
+            raise ValueError(
+                "BROKER_SL_RETIRED: broker-side protective stop orders are "
+                "disabled; the stop is the local position-owned SL monitor")
         if not self.gate_enabled:
             raise BrokerGateClosed("LIVE_GATE_CLOSED: live trading master gate is OFF")
         if side_u not in ("BUY", "SELL"):
@@ -233,52 +242,22 @@ class DhanRestTransport(LiveBrokerClient):
                 f"no Dhan security mapping for instrument {instrument}; "
                 "configure instruments.<name>.security_id")
 
-        order_type_u = (order_type or "MARKET").upper()
-        if order_type_u not in ("MARKET", "LIMIT", "STOP_LOSS", "STOP_LOSS_MARKET"):
+        if order_type_u not in ("MARKET", "LIMIT"):
             raise ValueError(f"unsupported Dhan orderType: {order_type_u}")
         if order_type_u == "LIMIT" and not (price is not None and float(price) > 0):
             raise ValueError("LIMIT orders require a positive price")
-        if order_type_u == "STOP_LOSS_MARKET" and not (
-                trigger_price is not None and float(trigger_price) > 0):
-            raise ValueError("STOP_LOSS_MARKET orders require a positive trigger_price")
-        # STOP_LOSS (stop-limit, broker-side trigger) carries BOTH legs.  Dhan
-        # semantics (verified live 2026-09-16, DH-906): for a BUY stop-limit the
-        # limit price must be STRICTLY above the trigger (price > trigger); for
-        # a SELL stop-limit the limit price must be STRICTLY below the trigger
-        # (price < trigger).  Sending price == trigger is rejected.
-        if order_type_u == "STOP_LOSS":
-            if not (price is not None and trigger_price is not None
-                    and float(price) > 0 and float(trigger_price) > 0):
-                raise ValueError(
-                    "STOP_LOSS orders require both a positive price and a "
-                    "positive trigger_price")
-            if side_u == "BUY" and not (float(price) > float(trigger_price)):
-                raise ValueError(
-                    "STOP_LOSS BUY requires limit price > trigger price "
-                    f"(price={price}, trigger={trigger_price})")
-            if side_u == "SELL" and not (float(price) < float(trigger_price)):
-                raise ValueError(
-                    "STOP_LOSS SELL requires limit price < trigger price "
-                    f"(price={price}, trigger={trigger_price})")
         # §9.11 — pre-trade circuit-limit validation: only priced order types
-        # (LIMIT price / SL trigger / SLM trigger) are checked against the
-        # exchange band.  A MARKET order has no price to validate.
-        if self._circuit_gate_enabled and order_type_u in (
-                "LIMIT", "STOP_LOSS", "STOP_LOSS_MARKET"):
-            gate_price = float(price or 0.0) if order_type_u == "LIMIT" \
-                else float(price or trigger_price or 0.0)
-            self._enforce_circuit_gate(instrument, gate_price, order_type_u)
+        # are checked against the exchange band.  A MARKET order has no price
+        # to validate.
+        if self._circuit_gate_enabled and order_type_u == "LIMIT":
+            self._enforce_circuit_gate(instrument, float(price or 0.0),
+                                       order_type_u)
         # §9.4 — exact payload: exactly ONE of price/trigger is nonzero per
-        # order type; MARKET carries both zero (never leaks caller junk);
-        # STOP_LOSS (stop-limit) carries BOTH.
+        # order type; MARKET carries both zero (never leaks caller junk).
         if order_type_u == "MARKET":
             limit_price, trigger = 0.0, 0.0
-        elif order_type_u == "LIMIT":
+        else:  # LIMIT
             limit_price, trigger = float(price), 0.0
-        elif order_type_u == "STOP_LOSS":
-            limit_price, trigger = float(price), float(trigger_price)
-        else:  # STOP_LOSS_MARKET
-            limit_price, trigger = 0.0, float(trigger_price)
         # §9.4 — the engine-owned correlation id; minted here only when the
         # caller didn't provide one (keeps signal->order->broker lineage).
         correlation_id = correlation_id or f"MCX-{uuid.uuid4().hex[:12]}"
@@ -350,8 +329,15 @@ class DhanRestTransport(LiveBrokerClient):
                 "last_accounted_qty": 0,
             }
             self._orders[broker_order_id] = rec
-            # Async transport: the fill ALWAYS flows through the order-status
-            # poll with the exchange-reported price, never from this response.
+            # A FILLED status is never taken from the placement response - the
+            # fill always flows through the status poll with the exchange
+            # price.  A TERMINAL FAILURE is different: Dhan has already settled
+            # the order (e.g. a 100-qty margin rejection), so reporting
+            # "submitted" would leave the engine believing a dead order is
+            # working until the next poll - holding the entry slot and, worse,
+            # counting it as exposure.
+            if rec["status"] in ("rejected", "cancelled", "expired"):
+                return dict(rec, status=rec["status"])
             return dict(rec, status="submitted")
 
     def _resolve_unknown_placement(self, correlation_id, side_u, quantity,
@@ -772,33 +758,20 @@ class DhanRestTransport(LiveBrokerClient):
                      validity: str = "DAY") -> dict:
         """Modify a live Dhan order (``PUT /orders/{order-id}``)."""
         order_type_u = (order_type or "MARKET").upper()
-        if order_type_u not in ("MARKET", "LIMIT", "STOP_LOSS", "STOP_LOSS_MARKET"):
+        # A modify must not be able to CREATE a resting broker-side stop
+        # either (INVARIANT 10).
+        if order_type_u in ("STOP_LOSS", "STOP_LOSS_MARKET"):
+            raise ValueError(
+                "BROKER_SL_RETIRED: broker-side protective stop orders are "
+                "disabled; the stop is the local position-owned SL monitor")
+        if order_type_u not in ("MARKET", "LIMIT"):
             raise ValueError(f"unsupported Dhan orderType: {order_type_u}")
         if order_type_u == "LIMIT" and not (price is not None and float(price) > 0):
             raise ValueError("LIMIT orders require a positive price")
-        if order_type_u == "STOP_LOSS_MARKET" and not (
-                trigger_price is not None and float(trigger_price) > 0):
-            raise ValueError("STOP_LOSS_MARKET orders require a positive trigger_price")
-        if order_type_u == "STOP_LOSS" and not (
-                price is not None and trigger_price is not None
-                and float(price) > 0 and float(trigger_price) > 0):
-            raise ValueError(
-                "STOP_LOSS orders require both a positive price and a "
-                "positive trigger_price")
-        limit_price = float(price or 0.0) if order_type_u in ("LIMIT", "STOP_LOSS") else 0.0
+        limit_price = float(price or 0.0) if order_type_u == "LIMIT" else 0.0
         bid = str(broker_order_id)
         with self._lock:
             rec = self._orders.get(bid)
-            if order_type_u == "STOP_LOSS" and rec is not None:
-                rec_side = str(rec.get("side") or "").upper()
-                if rec_side == "BUY" and not (float(price) > float(trigger_price)):
-                    raise ValueError(
-                        "STOP_LOSS BUY requires limit price > trigger price "
-                        f"(price={price}, trigger={trigger_price})")
-                if rec_side == "SELL" and not (float(price) < float(trigger_price)):
-                    raise ValueError(
-                        "STOP_LOSS SELL requires limit price < trigger price "
-                        f"(price={price}, trigger={trigger_price})")
             payload = {
                 "dhanClientId": self.client_id,
                 "orderId": bid,
@@ -1138,7 +1111,27 @@ class DhanRestTransport(LiveBrokerClient):
                 unrealized = float(row.get("unrealizedProfit")
                                    or row.get("unrealized_profit")
                                    or row.get("unRealizedProfit") or 0.0)
-                ltp = float(row.get("ltp") or row.get("LTP") or 0.0)
+                # Dhan's GET /positions carries NO last-traded price.  Use the
+                # authoritative LTP from the market-quote cache when the
+                # instrument has one; leave it None rather than inventing 0.0,
+                # which would render as a real (wrong) price downstream.
+                ltp_raw = (row.get("ltp") or row.get("LTP")
+                           or row.get("last_price") or row.get("lastTradedPrice"))
+                try:
+                    ltp = float(ltp_raw) if ltp_raw not in (None, "") else None
+                except (TypeError, ValueError):
+                    ltp = None
+                if ltp is None:
+                    # Fall back to the live market quote the transport already
+                    # keeps for the circuit gate.
+                    try:
+                        cached = self.circuit_quote(instrument) or {}
+                    except Exception:
+                        cached = {}
+                    try:
+                        ltp = float(cached.get("ltp")) if cached.get("ltp") else None
+                    except (TypeError, ValueError):
+                        ltp = None
                 sids = self.instrument_strategies.get(instrument) or [""]
                 for sid in sids:
                     out.append({

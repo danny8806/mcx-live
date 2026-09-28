@@ -41,6 +41,7 @@ class SignalFlowMixin:
             strategy.pending_exit_trigger = None
             strategy.pending_entry = None
             strategy._last_fired_trigger_signal_id = None
+            strategy._fired_trigger_signal_ids.clear()
         strategy.state = (StrategyState.LONG_POSITION
                           if strategy.position_side == "LONG"
                           else StrategyState.SHORT_POSITION)
@@ -274,6 +275,37 @@ class SignalFlowMixin:
                                          {"gate": gates.to_dict()}, env)
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
+            # §38 — never open exposure on a feed we already know is dead.
+            # The stop is evaluated locally from market data, so an entry
+            # taken on a stale feed is an unprotected entry from the moment it
+            # fills.  Refusing here (rather than auto-flatting) is deliberate:
+            # exiting on stale data is a second failure, not a remedy.
+            # §35 — never open exposure on an UNRECONCILED book.  If startup
+            # could not establish the broker's real position state we do not
+            # know what is already open, so a new entry could stack onto a
+            # position the local book has no record of.
+            reconciled = getattr(self, "_reconciled_envs", None)
+            if (env.is_live and reconciled is not None
+                    and env.name not in reconciled):
+                self._publish_gate_block(
+                    signal, "startup_reconciliation_failed",
+                    {"env": env.name}, env)
+                log.error("[Engine] entry BLOCKED: env %s has no confirmed "
+                          "broker position state", env.name)
+                self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+                return
+            health = getattr(self, "market_data_health", None)
+            if health is not None and not health.is_healthy(signal.instrument):
+                age = health.age(signal.instrument)
+                self._publish_gate_block(
+                    signal, "market_data_unhealthy",
+                    {"instrument": signal.instrument,
+                     "last_tick_age_seconds": age,
+                     "stale_after_seconds": health.stale_after}, env)
+                log.error("[Engine] entry BLOCKED: market data unhealthy for %s "
+                          "(age=%s)", signal.instrument, age)
+                self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+                return
             ok, reject_reason = self._validate_strategy_risk_gate(signal, env, gates)
             if not ok:
                 self._publish_gate_block(signal, reject_reason,
@@ -403,26 +435,12 @@ class SignalFlowMixin:
             if trade is None:
                 log.error("Exit signal %s has no explicit open trade", signal.signal_id)
                 return
-            # §22-24 — LIVE positions already protected by a resting broker-side
-            # SL must NOT mint a duplicate broker exit order when the strategy
-            # stop fires: the broker SL is the exit mechanism.  Suppressed only
-            # for stop-loss exits AND only while the protection is active
-            # (placed/verified).  A failed/cancelled protection lets the
-            # strategy's own SL exit act as the safety net.
-            if env.mode == "LIVE" and position is not None:
-                exit_reason_md = str((signal.metadata or {}).get("exit_reason") or "").lower()
-                is_sl_signal = (exit_reason_md in ("stop_loss_hit", "stop_loss")
-                                or resolve_order_role(signal) == "STOP_LOSS")
-                if is_sl_signal and getattr(position, "sl_state", None) in ("placed", "verified"):
-                    self.publish_event("sl_exit_suppressed", {
-                        "signal_id": signal.signal_id,
-                        "position_id": position.position_id,
-                        "sl_order_id": position.sl_order_id,
-                        "strategy_id": signal.strategy_id,
-                        "instrument": signal.instrument,
-                        "reason": "broker_protective_sl_active",
-                        "execution_mode": env.mode}, env_name=env.name)
-                    return
+            # There is no broker-side protective SL, so a local SL exit is
+            # never suppressed here.  §9/§10 duplicate + race protection lives
+            # in the position-owned SL monitor's state machine (TRIGGERED ->
+            # EXITING), which is consulted immediately before the order is
+            # minted.  A second exit for an already-exiting position is blocked
+            # further down by validate_live_order_ownership.
         else:
             # §25/§28/§108 — EXIT-FIRST: a LIVE entry is only placed after the
             # broker proves the instrument FLAT (only when live.exit_first is
@@ -488,50 +506,11 @@ class SignalFlowMixin:
         exit_side = None
         if is_exit and position is not None:
             exit_side = "SELL" if position.is_long else "BUY"
-            if (env.mode == "LIVE"
-                    and resolve_order_role(signal) != "STOP_LOSS"
-                    and getattr(position, "sl_order_id", None)
-                    and getattr(position, "sl_state", None) in ("placed", "verified")):
-                try:
-                    cancelled = bool(env.execution_engine.cancel_order(position.sl_order_id))
-                except Exception:
-                    cancelled = False
-                if not cancelled:
-                    self._uncancelled_sl[(env.name, position.strategy_id,
-                                          position.instrument)] = position.sl_order_id
-                    if env.safe_mode is not None:
-                        env.safe_mode.enter_safe_mode(
-                            "order_state_uncertain", "protective stop cancel unconfirmed")
-                    self.publish_event("exit_blocked_sl_cancel_unconfirmed", {
-                        "signal_id": signal.signal_id,
-                        "position_id": position.position_id,
-                        "sl_order_id": position.sl_order_id,
-                        "execution_mode": env.mode}, env_name=env.name)
-                    return
-                position.sl_state = "cancelled"
-                self._persist_position(position, env.name)
-            if (env.mode == "LIVE"
-                    and resolve_order_role(signal) != "STOP_LOSS"
-                    and getattr(position, "sl_order_id", None)
-                    and getattr(position, "sl_state", None) in ("placed", "verified")):
-                try:
-                    cancelled = bool(env.execution_engine.cancel_order(position.sl_order_id))
-                except Exception:
-                    cancelled = False
-                if not cancelled:
-                    self._uncancelled_sl[(env.name, position.strategy_id,
-                                          position.instrument)] = position.sl_order_id
-                    if env.safe_mode is not None:
-                        env.safe_mode.enter_safe_mode(
-                            "order_state_uncertain", "protective stop cancel unconfirmed")
-                    self.publish_event("exit_blocked_sl_cancel_unconfirmed", {
-                        "signal_id": signal.signal_id,
-                        "position_id": position.position_id,
-                        "sl_order_id": position.sl_order_id,
-                        "execution_mode": env.mode}, env_name=env.name)
-                    return
-                position.sl_state = "cancelled"
-                self._persist_position(position, env.name)
+            # EVERY exit (local-SL fire, reversal, manual, emergency) moves the
+            # position-owned SL to EXITING before the order is minted, so a
+            # concurrent tick cannot race a second exit (§10: one authoritative
+            # exit state per position).
+            self._mark_sl_exiting(env, position)
 
         order = order_manager.submit_signal(
             signal, multiplier=multiplier, trade_id=trade.trade_id, side=exit_side,
@@ -543,13 +522,10 @@ class SignalFlowMixin:
                 strategy.state = (StrategyState.LONG_POSITION if position.is_long
                                   else StrategyState.SHORT_POSITION)
                 strategy.stop_exit_submitted = False
-                if (position.sl_state == "cancelled"
-                        and bool((self.config.get("live") or {}).get(
-                            "broker_sl", {}).get("enabled", False))):
-                    position.sl_state = "failed"
-                    self._guard_live_position(env, position,
-                                              position.entry_signal_id or "",
-                                              trade, position.entry_signal_id)
+                # The exit never reached the broker: re-arm the position-owned
+                # SL so a later tick can still protect this position.
+                self._release_sl_after_failed_exit(env, position,
+                                                  reason="exit_not_submitted")
                 if reversal_sig:
                     strategy.pending_entry = None
             else:
@@ -558,9 +534,12 @@ class SignalFlowMixin:
         if is_exit and position is not None and order.state.value in (
                 "submitted", "acknowledged", "partially_filled", "filled"):
             position.exit_started = True
-        # §22-24 — register the exit as STOP_LOSS when the signal classifies as
-        # one, so the lifecycle + exit_reason stay canonical even without a
-        # strategy last_exit_reason (broker-driven protective SL fills).
+            self._mark_sl_exiting(env, position, order.order_id,
+                                  getattr(order, "_broker_order_id", None))
+        elif is_exit and position is not None:
+            # Order exists but was rejected/cancelled by the engine or broker.
+            self._release_sl_after_failed_exit(env, position,
+                                              reason=(order.reason or "exit_rejected"))
         order_role = resolve_order_role(signal)
         lifecycle.register_order(trade.trade_id, order.order_id,
                                  order_role or ("EXIT" if is_exit else "ENTRY"))

@@ -193,10 +193,9 @@ class FillFlowMixin:
                     "instrument": fill.instrument,
                     "quantity": new_qty, "average_entry": current.average_entry,
                     "execution_mode": env.mode}, env_name=env.name)
-                # §22-24 — a broker-side protective SLM guards the OPEN live
-                # position as soon as the entry leg is on the books.
-                self._guard_live_position(env, current, fill.order_id, trade,
-                                          signal_id)
+                # Position-owned SL: arm the local monitor on THIS position's
+                # own stop_price.  No broker-side protective order exists.
+                self._arm_position_sl(env, current, source="entry_fill_augment")
                 self._notify_entry_fill(fill, current, env, signal_id)
                 self._sync_strategy_on_entry_fill(
                     env, fill.strategy_id, "LONG" if current.is_long else "SHORT",
@@ -247,6 +246,8 @@ class FillFlowMixin:
                     entry_signal_id=signal_id, trade_id=trade.trade_id,
                     position_generation=(getattr(entry_order, "position_generation", None)
                                          if entry_order is not None else None),
+                    entry_order_id=(getattr(entry_order, "order_id", None)
+                                    or fill.order_id),
                 )
                 fill.position_id = position.position_id
                 fill.lifecycle_id = trade.trade_id
@@ -293,10 +294,9 @@ class FillFlowMixin:
                     "position_id": position.position_id, "fill_id": fill.fill_id,
                     "strategy_id": fill.strategy_id, "instrument": fill.instrument,
                     "execution_mode": env.mode}, env_name=env.name)
-                # §22-24 — broker-side protective SLM placement right after the
-                # entry fill opens the position.
-                self._guard_live_position(env, position, fill.order_id, trade,
-                                          signal_id)
+                # Position-owned SL: the broker-confirmed entry fill opened THIS
+                # position, so its stop is armed now.  No broker SL order.
+                self._arm_position_sl(env, position, source="entry_fill")
                 # REVERSAL — the broker-confirmed NEW opposite entry creates
                 # the NEW position; record its fill + SL on the reversal.
                 if getattr(entry_order, "order_role", "") == "REVERSAL_ENTRY":
@@ -326,10 +326,9 @@ class FillFlowMixin:
             raw_reason = (env.strategies[fill.strategy_id].last_exit_reason
                           or "signal_exit")
             is_stop_loss = (raw_reason or "").lower() in ("stop_loss_hit", "stop_loss")
-            # V4 — a fill that belongs to a STOP_LOSS-role order (a broker-side
-            # protective SLM that triggered, OR the strategy's own SL exit
-            # order) is always a stop-loss regardless of stale strategy
-            # last_exit_reason state.  Broker-driven SL fills carry no signal.
+            # Defensive: a STOP_LOSS-role order can no longer be created (the
+            # live engine rejects it outright), but if one ever appeared its
+            # fill is still a stop-loss regardless of stale strategy state.
             sl_order = env.execution_engine.get_order(fill.order_id) \
                 if env.execution_engine is not None else None
             sl_role = getattr(sl_order, "order_role", None)
@@ -338,18 +337,15 @@ class FillFlowMixin:
             exit_reason = "STOP_LOSS" if is_stop_loss else raw_reason
             exit_signal_id = "" if is_stop_loss else (signal_id or "")
             if sl_role == "EMERGENCY_EXIT":
-                # §24 — fail-closed protective-SL market close: canonical
-                # EMERGENCY_EXIT reason, no strategy signal is ever attached.
+                # Emergency market close: canonical EMERGENCY_EXIT reason, no
+                # strategy signal is ever attached.
                 exit_reason = "EMERGENCY_EXIT"
                 exit_signal_id = ""
-            # §22-24 — protective-SL lifecycle: when the closing order IS the
-            # protective SLM fill the position's protection is consumed; any
-            # OTHER exit (reversal/strategy/emergency) must cancel the resting
-            # protective SLM FIRST so it can never fire against a later
-            # opposite position.
-            # C2 — a PARTIAL exit leaves the position OPEN on the remaining
-            # quantity; the protective SL and strategy position state must
-            # stay armed until the position is fully gone.
+            current.exit_order_id = fill.order_id
+            # A PARTIAL exit leaves the position OPEN on the remaining
+            # quantity; the local SL and strategy position state must stay
+            # armed (at the new, smaller quantity) until the position is
+            # fully gone (§12).
             exit_qty = int(fill.quantity or 0)
             pos_qty = int(current.quantity or 0)
             if 0 < exit_qty < pos_qty:
@@ -400,6 +396,26 @@ class FillFlowMixin:
             self._reset_strategy_state(fill.strategy_id, keep_pending=pending_armed,
                                        env_name=env.name)
         env.fill_dedup.mark_processed(fill.fill_id)
+    def _exit_order_still_working(self, env, position) -> bool:
+        """True when a live exit order still has unfilled quantity for this
+        position.  Used to decide between "SL stays EXITING" and "SL re-arms"
+        after a partial fill (§12 / §10)."""
+        engine = getattr(env, "execution_engine", None)
+        if engine is None or position is None:
+            return False
+        oid = getattr(position, "exit_order_id", None)
+        if not oid:
+            return False
+        order = engine.get_order(oid)
+        if order is None:
+            return False
+        if str(getattr(order.state, "value", order.state)).lower() in (
+                "filled", "canceled", "cancelled", "rejected"):
+            return False
+        filled = sum(int(getattr(f, "quantity", 0) or 0)
+                     for f in (getattr(order, "fills", None) or []))
+        return filled < int(getattr(order, "quantity", 0) or 0)
+
     def _handle_partial_exit(self, env, fill, position, trade, signal_id: Optional[str],
                              exit_reason: str, exit_signal_id: str) -> None:
         """C2 — apply a partial exit fill (exit qty < held qty).
@@ -515,6 +531,12 @@ class FillFlowMixin:
             "remaining_quantity": int(remaining),
             "gross_pnl": gross_pnl, "charges": charges, "net_pnl": net_pnl,
             "execution_mode": env.mode}, env_name=env.name)
+        # §12 — the position stays OPEN on the remainder.  If the exit order
+        # still has working quantity the SL stays EXITING (one authoritative
+        # exit state); otherwise the local SL re-arms at the REMAINING quantity.
+        self._rearm_sl_after_partial_exit(
+            env, position,
+            exit_still_working=self._exit_order_still_working(env, position))
     def _live_account_snapshot(self, env) -> dict:
         """Best-effort REAL Dhan account snapshot for LIVE notifications.
 

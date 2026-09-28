@@ -23,9 +23,16 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
+from config import as_dict
+
 log = logging.getLogger(__name__)
 
 _DEFAULT_HEALTH_TICK = 1.0   # seconds between watchdog checks
+# The order-update feed may legitimately sit idle (market closed, no order
+# events) and Dhan closes it with code 1000.  Warning on every 1 s tick
+# would bury real warnings in ~86k lines/day, so report the edge plus a
+# slow heartbeat instead.
+_WS_STALE_WARN_INTERVAL = 300.0
 _STALE_TICKS = 3             # cycles missed before marking stale
 
 
@@ -78,7 +85,7 @@ class BrokerSyncService:
         self._on_reconcile = on_reconcile
         self._wire_now = wire_now
 
-        live_cfg = config.get("live", {}) if isinstance(config, dict) else {}
+        live_cfg = as_dict(config).get("live", {}) or {}
         self._health_tick = _DEFAULT_HEALTH_TICK
         self._stale_threshold = int(live_cfg.get("stale_threshold", 90) or 90)
         self._ws_cfg = live_cfg.get("order_ws") or {}
@@ -95,6 +102,8 @@ class BrokerSyncService:
         # ── optional WS feed ──────────────────────────────────────────
         self._ws_feed: Any = None
         self._ws_thread: Optional[threading.Thread] = None
+        self._ws_stale_active = False
+        self._ws_stale_warned_at = 0.0
 
         # ── health watchdog ───────────────────────────────────────────
         self._running = False
@@ -312,9 +321,19 @@ class BrokerSyncService:
             if self._ws_enabled and self._ws_feed is not None:
                 ws_alive = self._ws_feed.connected
                 stale = self._ws_feed.is_stale() if hasattr(self._ws_feed, "is_stale") else False
+                now = self._clock()
                 if stale:
-                    log.warning("[BrokerSync:%s] WS feed stale (heartbeat timeout)",
-                                self.env.name)
+                    if (not self._ws_stale_active
+                            or (now - self._ws_stale_warned_at) >= _WS_STALE_WARN_INTERVAL):
+                        log.warning("[BrokerSync:%s] WS feed stale (heartbeat timeout) "
+                                    "connected=%s — retrying every %.0fs",
+                                    self.env.name, ws_alive, _WS_STALE_WARN_INTERVAL)
+                        self._ws_stale_warned_at = now
+                        self._ws_stale_active = True
+                elif self._ws_stale_active:
+                    log.info("[BrokerSync:%s] WS feed recovered", self.env.name)
+                    self._ws_stale_active = False
+                    self._ws_stale_warned_at = 0.0
             # Overall health
             self._healthy = worker_alive
 

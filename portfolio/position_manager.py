@@ -49,12 +49,17 @@ class Position:
     multiplier: float = 1.0
     entry_signal_id: Optional[str] = None
     exit_signal_id: Optional[str] = None
-    # Broker-side protective SL lineage (spec §22-24): state, the broker SL
-    # order id, the SL trigger price, and when protection was verified.
-    sl_state: Optional[str] = None           # None|placed|verified|failed
-    sl_order_id: Optional[str] = None        # broker SL order id
-    sl_trigger_price: Optional[float] = None # trigger for the protective SLM
-    sl_protected_at: Optional[float] = None  # engine clock when protection verified
+    # ── Position-owned SL (the only stop-loss mechanism) ──────────────────
+    # ``stop_price`` above is the ONE authority for the stop level.  ``sl_state``
+    # is the local monitor lifecycle only — it never means "a broker order is
+    # resting".  There is deliberately no broker SL order id: no broker-side
+    # protective order exists in this system.
+    #   NONE | ARMED | TRIGGERED | EXITING | CLOSED | SL_UNAVAILABLE
+    sl_state: Optional[str] = None
+    sl_trigger_price: Optional[float] = None  # market price that crossed stop
+    sl_protected_at: Optional[float] = None  # engine clock when the SL was armed
+    entry_order_id: Optional[str] = None     # broker entry order id
+    exit_order_id: Optional[str] = None      # broker exit order id, once exiting
     position_generation: int = 0
     exit_started: bool = False
     lifecycle_id: Optional[str] = None
@@ -117,9 +122,10 @@ class Position:
             "entry_signal_id": self.entry_signal_id,
             "exit_signal_id": self.exit_signal_id,
             "sl_state": self.sl_state,
-            "sl_order_id": self.sl_order_id,
             "sl_trigger_price": self.sl_trigger_price,
             "sl_protected_at": self.sl_protected_at,
+            "entry_order_id": self.entry_order_id,
+            "exit_order_id": self.exit_order_id,
             "position_generation": self.position_generation,
             "exit_started": self.exit_started,
             "lifecycle_id": self.lifecycle_id or self.trade_id,
@@ -155,6 +161,7 @@ class PositionManager:
         entry_signal_id: Optional[str] = None,
         trade_id: Optional[str] = None,
         position_generation: int = 0,
+        entry_order_id: Optional[str] = None,
     ) -> Position:
         """Open a new position from an entry fill."""
         trade_id = trade_id or fill.trade_id
@@ -179,6 +186,7 @@ class PositionManager:
             entry_signal_id=entry_signal_id or fill.entry_signal_id,
             position_generation=int(position_generation or 0),
             lifecycle_id=trade_id,
+            entry_order_id=entry_order_id or fill.order_id,
         )
         with self._lock:
             self._positions[position.position_id] = position
@@ -202,6 +210,9 @@ class PositionManager:
             position.exit_fills.append(fill)
             position.exit_reason = reason
             position.status = PositionStatus.CLOSED
+            # INVARIANT 5 — a closed position's SL is terminal at the data
+            # layer too, so no code path can leave it looking ARMED.
+            position.sl_state = "CLOSED"
             if exit_signal_id:
                 position.exit_signal_id = exit_signal_id
 
@@ -219,6 +230,28 @@ class PositionManager:
                     * position.multiplier
                 )
 
+            self._closed_positions.append(position)
+            if len(self._closed_positions) > 500:
+                self._closed_positions = self._closed_positions[-250:]
+            del self._positions[position_id]
+            return position
+
+    def abandon_stale_position(self, position_id: str) -> Optional[Position]:
+        """Close a local OPEN row the broker does not confirm (startup sync).
+
+        No synthetic fill is recorded: the broker says this position does not
+        exist, so there was no exit to price.  ``sl_state`` goes terminal in
+        the same step (INVARIANT 5).
+        """
+        with self._lock:
+            position = self._positions.get(position_id)
+            if position is None:
+                return None
+            position.status = PositionStatus.CLOSED
+            position.sl_state = "CLOSED"
+            position.sl_trigger_price = None
+            position.exit_reason = "startup_broker_flat"
+            position.quantity = 0
             self._closed_positions.append(position)
             if len(self._closed_positions) > 500:
                 self._closed_positions = self._closed_positions[-250:]
@@ -463,10 +496,20 @@ class PositionManagerFacade:
         return None, None
 
     def open_position(self, fill, multiplier=1.0, stop_price=None, margin=0.0,
-                      entry_signal_id=None, trade_id=None) -> Position:
+                      entry_signal_id=None, trade_id=None,
+                      position_generation=0, entry_order_id=None) -> Position:
+        """Forward the FULL position identity to the owning strategy manager.
+
+        ``position_generation`` and ``entry_order_id`` MUST be forwarded: the
+        SL monitor binds to ``(position_id, position_generation)`` and the
+        startup stop resolver reads ``entry_order_id``.  Dropping either here
+        silently breaks INVARIANT 7.
+        """
         return self._owner(getattr(fill, "strategy_id", None)).open_position(
             fill, multiplier=multiplier, stop_price=stop_price, margin=margin,
             entry_signal_id=entry_signal_id, trade_id=trade_id,
+            position_generation=position_generation or 0,
+            entry_order_id=entry_order_id,
         )
 
     def close_position(self, position_id, fill, reason, exit_signal_id=None) -> Position:
@@ -474,6 +517,19 @@ class PositionManagerFacade:
         if mgr is None:
             raise ValueError(f"Position {position_id} not found")
         return mgr.close_position(position_id, fill, reason, exit_signal_id)
+
+    def abandon_stale_position(self, position_id: str) -> Optional[Position]:
+        """Drop a local OPEN row the broker does not confirm (startup sync).
+
+        The broker is the only authority on whether a position exists.  A row
+        the broker reports flat cannot have been filled, so it is closed
+        WITHOUT a synthetic fill: no exit fill, no fabricated P&L.  Its SL is
+        terminal at the same moment (INVARIANT 5).
+        """
+        mgr, _ = self._find_owner(position_id)
+        if mgr is None:
+            return None
+        return mgr.abandon_stale_position(position_id)
 
     def get_position(self, position_id: str) -> Optional[Position]:
         _, pos = self._find_owner(position_id)

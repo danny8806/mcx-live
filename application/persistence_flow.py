@@ -336,6 +336,7 @@ class PersistenceFlowMixin:
             # trades) are evaluated normally.
             setattr(strategy, "stop_exit_submitted", False)
             strategy._last_fired_trigger_signal_id = None
+            strategy._fired_trigger_signal_ids.clear()
             if not keep:
                 strategy._cancel_trigger(strategy.pending_entry)
                 strategy.pending_entry = None

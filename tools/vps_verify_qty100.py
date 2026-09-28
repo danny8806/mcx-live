@@ -57,13 +57,15 @@ for sid, sc in strategies.items():
     if not entry_ok or sub.quantity != 100:
         total_pass = False
 
-    sl = engine.create_protective_sl(
-        strategy_id=sid, instrument=inst, side='SELL', quantity=sub.quantity,
-        trigger_price=72400.0, trade_id=f'T-{sid}-E', entry_order_id=order.order_id)
-    sls = engine.submit_order(sl)
-    sl_state = sls.state.value
-    sl_ok = (sl.quantity == 100)
-    print(f'[{sid}] SL     qty={sl.quantity} state={sl_state} ==100: {sl_ok}')
+    # The broker-side protective SL is RETIRED.  There is no
+    # create_protective_sl any more; the only stop is the local
+    # position-owned monitor.  Verify the retired path is truly gone and that
+    # any attempt is hard-rejected at the engine boundary.
+    has_create_sl = hasattr(engine, 'create_protective_sl')
+    sl_state = 'RETIRED'
+    sl_ok = not has_create_sl
+    print(f'[{sid}] SL     create_protective_sl present={has_create_sl} '
+          f'-> {sl_state} (local position-owned SL only)')
     if not sl_ok:
         total_pass = False
 

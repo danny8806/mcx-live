@@ -322,6 +322,15 @@ class EnvironmentFactoryMixin:
             )
             strategy.reversal_entry_gap_points = int(
                 ((self.config.get("live") or {}).get("reversal") or {}).get("entry_gap_points", 0))
+            # Fail FAST at startup, not mid-reversal: a non-positive gap makes
+            # the opposite entry trigger land at or behind the exit trigger, so
+            # the new position could open before the old one is flat.
+            if strategy.reversal_entry_gap_points <= 0:
+                raise ValueError(
+                    f"REVERSAL_GAP_INVALID: strategy {strat_name!r} has "
+                    f"live.reversal.entry_gap_points="
+                    f"{strategy.reversal_entry_gap_points}; it must be >= 1 so "
+                    f"the reversal entry trigger sits strictly beyond the exit")
             env.strategies[strat_name] = strategy
 
             # Bind this strategy's indicator slots to the environment's
@@ -404,6 +413,10 @@ class EnvironmentFactoryMixin:
         if reason:
             return reason
         role = str(getattr(order, "order_role", "") or "").upper()
+        if role in {"EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"}:
+            reason = self._validate_broker_position_for_exit(env, order)
+            if reason:
+                return reason
         if role == "EMERGENCY_EXIT":
             return None
         strategy = (getattr(env, "strategies", {}) or {}).get(order.strategy_id)
@@ -422,22 +435,94 @@ class EnvironmentFactoryMixin:
         elif role == "REVERSAL_EXIT":
             if not self._gate_for(order.strategy_id).reversal_enabled:
                 return "STRATEGY_REVERSAL_GATE_CLOSED"
-        elif role == "STOP_LOSS":
-            if not self._gate_for(order.strategy_id).sl_enabled:
-                return "STRATEGY_SL_GATE_CLOSED"
         elif role == "EXIT":
             if not self._gate_for(order.strategy_id).exit_enabled:
                 return "STRATEGY_EXIT_GATE_CLOSED"
         if role in {"ENTRY", "REVERSAL_ENTRY", "FALLBACK_MARKET",
-                    "EXIT", "STOP_LOSS", "REVERSAL_EXIT"}:
+                    "EXIT", "REVERSAL_EXIT"}:
             if str(getattr(order, "trigger_state", "") or "").upper() != "FIRED":
                 return "ORDER_TRIGGER_NOT_FIRED"
-            if (getattr(strategy, "_last_fired_trigger_signal_id", None)
-                    != getattr(order, "parent_signal_id", None)):
+            is_fired = getattr(strategy, "is_fired_trigger_signal", None)
+            if callable(is_fired):
+                fired = bool(is_fired(getattr(order, "parent_signal_id", None)))
+            else:  # duck-typed stand-ins in tests
+                fired = (getattr(strategy, "_last_fired_trigger_signal_id", None)
+                         == getattr(order, "parent_signal_id", None))
+            if not fired:
                 return "ORDER_TRIGGER_SIGNAL_STALE"
             if (getattr(order, "trigger_generation", None)
                     != getattr(strategy, "_trigger_generation", None)):
                 return "ORDER_TRIGGER_GENERATION_STALE"
+        return None
+
+    @staticmethod
+    def _validate_broker_position_for_exit(env, order) -> Optional[str]:
+        """Prove Dhan still has enough matching exposure before closing it.
+
+        The local position/lifecycle check prevents stale strategy exits. This
+        second check prevents a stale local position from sending the opposite
+        side after Dhan is already flat. Dhan positions are expanded to one row
+        per configured strategy, so use the largest matching instrument-level
+        quantity rather than summing duplicate strategy rows. Reserve the
+        unfilled remainder of other active close orders to avoid overshooting
+        shared instrument exposure.
+        """
+        broker = getattr(env, "broker", None)
+        positions_fn = getattr(broker, "positions", None)
+        if not callable(positions_fn):
+            return "BROKER_POSITION_UNAVAILABLE"
+        try:
+            rows = positions_fn()
+        except Exception:
+            return "BROKER_POSITION_QUERY_FAILED"
+        if not isinstance(rows, (list, tuple)):
+            return "BROKER_POSITION_QUERY_INVALID"
+
+        close_side = str(getattr(order, "side", "") or "").upper()
+        expected_position_side = "LONG" if close_side == "SELL" else "SHORT"
+        aliases = {expected_position_side,
+                   "BUY" if expected_position_side == "LONG" else "SELL"}
+        broker_quantity = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("instrument") or "") != str(order.instrument):
+                continue
+            side = str(row.get("side") or "").upper()
+            try:
+                quantity = abs(int(row.get("quantity") or 0))
+            except (TypeError, ValueError):
+                continue
+            if side in aliases and quantity > broker_quantity:
+                broker_quantity = quantity
+        if broker_quantity <= 0:
+            return "BROKER_POSITION_NOT_OPEN"
+
+        reserved = 0
+        engine = getattr(env, "execution_engine", None)
+        active_states = {"created", "submitted", "acknowledged", "partially_filled"}
+        close_roles = {"EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"}
+        for prior in (getattr(engine, "_orders", {}) or {}).values():
+            if prior is order:
+                continue
+            if (str(getattr(prior, "instrument", "")) != str(order.instrument)
+                    or str(getattr(prior, "side", "")).upper() != close_side
+                    or str(getattr(getattr(prior, "state", None), "value",
+                                    getattr(prior, "state", ""))).lower()
+                        not in active_states
+                    or str(getattr(prior, "order_role", "") or "").upper()
+                        not in close_roles):
+                continue
+            try:
+                reserved += max(
+                    0, int(getattr(prior, "quantity", 0) or 0)
+                    - int(getattr(prior, "filled_quantity", 0) or 0))
+            except (TypeError, ValueError):
+                return "BROKER_EXIT_RESERVATION_INVALID"
+
+        available = max(0, broker_quantity - reserved)
+        if available < int(getattr(order, "quantity", 0) or 0):
+            return "BROKER_POSITION_QUANTITY_INSUFFICIENT"
         return None
 
     def _build_live_broker(self, live_cfg: dict, gate_enabled: bool,
@@ -622,8 +707,8 @@ class EnvironmentFactoryMixin:
                     log.error(
                         "[Engine] %s strategy %s trade-restore FAILED — the "
                         "engine stands READY over un-restored open state; "
-                        "startup reconcile + recover_missing_sl are the "
-                        "safety net", env.name, sid)
+                        "the broker-authoritative SL sync is the safety net",
+                        env.name, sid)
             order_manager = OrderManager(execution_engine=env.execution_engine)
             position_manager = PositionManager()
             runtime = StrategyRuntime(

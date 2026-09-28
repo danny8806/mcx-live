@@ -9,6 +9,33 @@ from typing import Any, Optional
 CONFIG_PATH = Path(__file__).parent / "settings.json"
 
 
+def as_dict(config: Any) -> dict[str, Any]:
+    """Normalize ``config`` to a plain dict.
+
+    ``TradingEngine`` hands a :class:`Config` singleton to components whose
+    signatures say ``dict``.  Callers that did ``isinstance(config, dict)``
+    therefore silently dropped every ``live.*`` setting and fell back to
+    hardcoded defaults (poll cadence, WS feed, reprice budget).  This reads
+    the already-loaded payload without ever triggering a lazy ``load()``.
+    """
+    if isinstance(config, dict):
+        return config
+    if config is None:
+        return {}
+    loaded = getattr(config, "_config", None)
+    if isinstance(loaded, dict):
+        return loaded
+    get = getattr(config, "get", None)
+    if callable(get):
+        try:
+            data = get()
+        except TypeError:
+            return {}
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
 class Config:
     """Singleton configuration manager."""
     _instance: Optional["Config"] = None

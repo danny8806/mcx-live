@@ -96,6 +96,17 @@ class MarketEventFlowMixin:
         # Market-data bookkeeping (always, even for a bad-LTP sentinel tick)
         ws = getattr(self.data_adapter, "ws", None)
         ws_connected = bool(ws and ws.connected)
+
+        # Per-instrument tick freshness.  A completed candle still refreshes
+        # health, because REST is an independent confirmation that the market
+        # is reachable; only the LOSS of both is a genuine outage.
+        health = getattr(self, "market_data_health", None)
+        if health is not None:
+            if valid_ltp:
+                health.record_tick(instrument, timestamp)
+            elif not ws_connected:
+                health.mark_unhealthy(instrument)
+
         self.market_status.update_data_status(
             connected=ws_connected,
             last_tick_time=(ws._last_tick_time if ws else 0.0),
@@ -142,6 +153,27 @@ class MarketEventFlowMixin:
                     except Exception:
                         pass
 
+                # ── Position-owned SL evaluation ──────────────────────────
+                # The ONLY stop-loss path.  Each environment's own open
+                # positions are evaluated against THEIR stop_price by their own
+                # SL monitor; no strategy and no other strategy's position can
+                # influence the decision (§18 strategy isolation).
+                for env in self._envs.values():
+                    try:
+                        positions = env.position_manager.get_positions_by_instrument(instrument)
+                    except Exception:
+                        continue
+                    for pos in positions:
+                        if not pos.is_open:
+                            continue
+                        try:
+                            self._evaluate_position_sl(
+                                env, pos, ltp, env_name=getattr(env, "name", None))
+                        except Exception as e:
+                            log.error("[Engine] SL evaluation failed for %s/%s: %s",
+                                      getattr(pos, "strategy_id", "?"),
+                                      getattr(pos, "position_id", "?"), e)
+
             # Always publish the tick — strategies guard on ltp <= 0/sentinels.
             event = TickEvent(
                 instrument=instrument, ltp=float(ltp) if valid_ltp else 0.0,
@@ -160,6 +192,24 @@ class MarketEventFlowMixin:
         self.health.record_bar()
         self.market_status.mark_rest_data_fresh()
 
+        # A fresh REST candle is independent evidence the market is reachable,
+        # so it clears the tick-feed staleness window for this instrument.
+        health = getattr(self, "market_data_health", None)
+        if health is not None and getattr(bar, "instrument", None):
+            health.record_tick(bar.instrument)
+
+        # The stop is evaluated on EVERY completed candle as well as on every
+        # tick.  The MCX tick feed is allowed to go silent while REST keeps
+        # flowing, and nothing in the order book represents a local stop - so
+        # without this a dead tick feed silently strips every position of its
+        # protection.  This runs BEFORE the candle reaches any strategy, so a
+        # stop breach always wins over a signal from the same candle.
+        try:
+            self._evaluate_positions_from_candle(None, bar)
+        except Exception as e:
+            log.error("[Engine] candle SL evaluation failed: %s", e)
+        self._report_sl_protection_gaps()
+
         router = getattr(self, "candle_router", None)
         if router is not None:
             router.on_candle(bar, is_complete=True)
@@ -174,6 +224,59 @@ class MarketEventFlowMixin:
             source="rest",
         )
         self.event_bus.publish(f"candle:{bar.instrument}:{bar.timeframe}", event)
+    def _report_sl_protection_gaps(self) -> None:
+        """Raise an explicit alarm for any position whose stop cannot be checked.
+
+        A local stop is invisible in the order book, so a position whose feed
+        has gone quiet is UNPROTECTED and nothing else in the system would say
+        so.  Each blind position is reported once per outage (not once per
+        candle) so a persistent outage cannot flood the event log.
+        """
+        health = getattr(self, "market_data_health", None)
+        if health is None:
+            return
+        reported = getattr(self, "_sl_blind_reported", None)
+        if reported is None:
+            reported = set()
+            self._sl_blind_reported = reported
+
+        blind = []
+        for env in self._envs.values():
+            try:
+                blind.extend(health.blind_positions(
+                    env.position_manager.open_positions))
+            except Exception:
+                continue
+
+        current = {getattr(p, "position_id", None) for p in blind}
+        for position in blind:
+            pid = getattr(position, "position_id", None)
+            if pid in reported:
+                continue
+            reported.add(pid)
+            log.error("[Engine] SL PROTECTION GAP: position %s (%s %s) cannot be "
+                      "evaluated - market data for %s is stale. The position is "
+                      "UNPROTECTED until the feed recovers.",
+                      pid, getattr(position, "strategy_id", "?"),
+                      getattr(position, "instrument", "?"),
+                      getattr(position, "instrument", "?"))
+            try:
+                self.publish_event("sl_protection_gap", {
+                    "position_id": pid,
+                    "strategy_id": getattr(position, "strategy_id", None),
+                    "instrument": getattr(position, "instrument", None),
+                    "stop_price": getattr(position, "stop_price", None),
+                    "last_tick_age_seconds": health.age(
+                        getattr(position, "instrument", "")),
+                    "severity": "CRITICAL",
+                })
+            except Exception:
+                pass
+        # Forget positions that closed or recovered so a NEW outage re-alarms.
+        for pid in list(reported):
+            if pid not in current:
+                reported.discard(pid)
+
     def _on_status(self, status) -> None:
         pass
     def _on_fill(self, fill) -> None:

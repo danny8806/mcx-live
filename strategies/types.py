@@ -157,15 +157,31 @@ class PendingEntry:
 def resolve_order_role(signal: Optional['Signal'], *, exit_reason: Optional[str] = None) -> str:
     """Resolve the canonical order_role for an order created from a signal.
 
-    Spec §12-14 order roles: ENTRY, EXIT, STOP_LOSS, REVERSAL_EXIT,
-    REVERSAL_ENTRY, EMERGENCY_EXIT.  Pure, shared resolution so paper and
-    live engines and persistence all agree on the same classification.
+    Order roles: ENTRY, EXIT, REVERSAL_EXIT, REVERSAL_ENTRY, EMERGENCY_EXIT
+    (plus FALLBACK_MARKET).  Pure, shared resolution so paper and live engines
+    and persistence all agree on the same classification.
+
+    This function NEVER returns ``STOP_LOSS``.  There is no broker-side
+    protective stop left in the system, so manufacturing that role could only
+    ever do harm: ``LiveExecutionEngine.submit_order`` hard-rejects it, which
+    would silently DISCARD a genuine local-SL exit and leave the position
+    unprotected.  A stop-loss exit therefore resolves to an ordinary ``EXIT``,
+    exactly like every other exit.  The retired role survives only as an
+    explicit value a caller may set on an order, and it is rejected at the
+    engine and at the transport.
     """
     reason = exit_reason
     if signal is not None:
         md = signal.metadata or {}
         if md.get("market_fallback"):
             return "FALLBACK_MARKET"
+        # The local position-owned SL exit is an ORDINARY exit order: the stop
+        # is monitored in-process and the exit is submitted directly to the
+        # broker.  It is never a broker-side protective (resting) STOP_LOSS
+        # order, so it must classify as EXIT.  Its exit_reason still reads
+        # "stop_loss_hit" so P&L keeps its canonical STOP_LOSS reason.
+        if md.get("local_sl_exit"):
+            return "EXIT"
         if reason is None:
             reason = md.get("exit_reason") or md.get("reason")
         if signal.signal_type == SignalType.REVERSAL:
@@ -178,15 +194,17 @@ def resolve_order_role(signal: Optional['Signal'], *, exit_reason: Optional[str]
             if signal.signal_type == SignalType.REVERSAL or md.get("is_reversal"):
                 return "REVERSAL_EXIT"
             reason_l = str(reason or "").lower()
-            if "stop_loss" in reason_l or "sl_" in reason_l or reason_l.startswith("sl"):
-                return "STOP_LOSS"
             if "reversal" in reason_l:
                 return "REVERSAL_EXIT"
+            # A stop-loss reason on an exit signal is an ORDINARY exit.  The
+            # stop is monitored locally, so classifying this as "STOP_LOSS"
+            # would be rejected by the engine and the real protective exit
+            # would be silently DROPPED — leaving the position unprotected.
+            # "STOP_LOSS" is reserved for an explicit broker-side request,
+            # which resolve_order_role must never manufacture.
             return "EXIT"
     if reason is not None:
         reason_l = str(reason).lower()
-        if "stop_loss" in reason_l or reason_l.startswith("sl"):
-            return "STOP_LOSS"
         if "reversal" in reason_l:
             return "REVERSAL_EXIT"
     if signal is not None and signal.metadata is not None and signal.metadata.get("is_reversal"):

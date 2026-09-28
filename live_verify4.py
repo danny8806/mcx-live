@@ -159,12 +159,16 @@ print("=" * 80)
 r = ssh("docker exec mcx-live python3 -c \"import json; c=json.load(open('/app/config/live_settings.json')); sl=c.get('live',{}).get('broker_sl',{}); print(json.dumps(sl,indent=2))\"")
 print(r.strip()[:300])
 
-# ====================================================================
-# create_protective_sl CODE
-# ====================================================================
 print("\n" + "=" * 80)
-print("create_protective_sl CODE")
+print("LOCAL POSITION-OWNED SL")
 print("=" * 80)
 
-r = ssh("docker exec mcx-live python3 -c \"import inspect; from execution.live.engine import LiveExecutionEngine; print(inspect.getsource(LiveExecutionEngine.create_protective_sl))\"")
+# The broker-side protective SL is RETIRED.  Verify the retired method is gone
+# and that the local position-owned monitor is the only stop mechanism.
+r = ssh("docker exec mcx-live python3 -c \"import inspect; "
+        "from execution.live.engine import LiveExecutionEngine; "
+        "from execution.live.sl_monitor import PositionOwnedSLMonitor, SLState; "
+        "print('create_protective_sl present:', hasattr(LiveExecutionEngine, 'create_protective_sl')); "
+        "print('local monitor:', PositionOwnedSLMonitor.__name__); "
+        "print('local states:', [s.value for s in SLState])\"")
 print(r.strip()[:1000])

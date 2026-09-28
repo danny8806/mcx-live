@@ -32,10 +32,19 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from config import as_dict
+
 log = logging.getLogger(__name__)
 
 _TASKS = ("orders", "positions", "account", "reconcile")
 _DEFAULT_INTERVAL = 5.0
+
+# Exit-family order roles: an order whose whole purpose is to REDUCE or close
+# exposure.  These are the only roles a MARKET order is ever allowed to serve
+# (a MARKET *entry* stays banned at the engine).
+_EXIT_ROLES = ("EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT")
+# Terminal broker states that mean "this order is finished at the broker".
+_TERMINAL_ORDER_STATES = ("rejected", "canceled", "cancelled", "expired")
 
 
 def _is_live(env) -> bool:
@@ -96,7 +105,7 @@ class LiveBrokerPoller:
         # (TradingEngine._reset_strategy_state wrapped with env lock).
         self._reset_strategy_fn = reset_strategy_fn
 
-        live_cfg = config.get("live", {}) if isinstance(config, dict) else {}
+        live_cfg = as_dict(config).get("live", {}) or {}
         self.intervals = {
             "orders": _interval(live_cfg, "order_poll_interval_seconds", 2.0),
             "positions": _interval(live_cfg, "position_poll_interval_seconds", _DEFAULT_INTERVAL),
@@ -116,7 +125,7 @@ class LiveBrokerPoller:
         self._stats: dict[str, int] = {
             "orders_polled": 0, "positions_polled": 0, "accounts_polled": 0,
             "reconciles_run": 0, "fills_created": 0, "fills_routed": 0,
-            "order_persist_errors": 0, "sl_verified": 0, "sl_failures": 0,
+            "order_persist_errors": 0, "sl_reconciled": 0,
             "pending_terminalized": 0,
         }
         self._last_broker_positions: list[dict] = []
@@ -212,6 +221,12 @@ class LiveBrokerPoller:
         # and the sweep actively probes each stranded row's broker order.
         engine_orders = getattr(engine, "_orders", {})
         self._terminalize_pending_from_broker(statuses)
+        # F3 — an exit the broker ended WITHOUT closing the position must
+        # re-arm the local SL.  Runs BEFORE the empty-statuses guard for the
+        # same reason as above: right after a restart the broker status map is
+        # empty, yet a DAY-expired exit from the previous session is exactly the
+        # order that left a position unprotected.
+        self._release_terminal_exits()
         if not statuses:
             return []
         applied: list = []
@@ -233,16 +248,18 @@ class LiveBrokerPoller:
                 self._stats["fills_routed"] += 1
                 applied.append(fill)
             self._upgrade_dbs_order_row(fill)
-        # Phase 6 — persist any order whose state flipped to REJECTED or
-        # CANCELLED during apply_broker_statuses (no fill is produced for
-        # those, so _upgrade_dbs_order_row is never reached).
+        # Phase 6 — persist any order whose state flipped to REJECTED, CANCELLED
+        # or EXPIRED during apply_broker_statuses (no fill is produced for
+        # those, so _upgrade_dbs_order_row is never reached).  EXPIRED matters:
+        # a DAY-validity exit that never filled is the classic "SL order died
+        # and the position is still open" case.
         # Dhan-linked state: when an ENTRY order is rejected/cancelled by the
         # broker, reset the strategy state back to FLAT so it is never stuck
         # in ENTRY_TRIGGERED with no Dhan fill to confirm the position.
         engine_orders = getattr(engine, "_orders", {})
         strategies = getattr(self.env, "strategies", {}) or {}
         for order in list(engine_orders.values()):
-            if order.state.value in ("rejected", "canceled"):
+            if order.state.value in ("rejected", "canceled", "cancelled", "expired"):
                 self._persist_order_state(order)
                 role = (getattr(order, "order_role", "") or "").upper()
                 if role in ("EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"):
@@ -309,9 +326,6 @@ class LiveBrokerPoller:
                                   self.env.name, order.strategy_id, e)
         self._terminalize_pending_entries(engine_orders.values(), statuses)
         self._terminalize_pending_from_broker(statuses)
-        # V4 — verify resting protective-SL placements (sl_state placed ->
-        # verified/failed) once the broker confirms acceptance.
-        self.verify_sl_protections(statuses)
         # Order Watcher — continuous broker+market+intent observation with
         # priority-safe recovery (WAIT/REPRICE/CANCEL/LOCK/MARKET-fallback).
         # Runs AFTER broker truth is applied so it never acts on assumptions.
@@ -325,175 +339,6 @@ class LiveBrokerPoller:
                           self.env.name, e)
         return applied
 
-    def verify_sl_protections(self, statuses: dict) -> list:
-        """V4 — spec §22-24 SL verification: confirm resting broker-side
-        protective STOP_LOSS_MARKET orders are accepted.
-
-        * broker shows the SLM accepted/submitted/open -> sl_state 'verified'
-          (protection is live; kept for the exit-first gate).
-        * broker REJECTED/CANCELLED/EXPIRED the SLM               -> sl_state
-          'failed' + durable SL_PROTECTION_FAILED audit event (the position's
-          LOCAL stop stays armed as the safety net; broker_sl.fail_closed is
-          evaluated at placement time, not here).
-
-        Idempotent: only positions whose sl_state is exactly 'placed' are
-        visited; every other state is left untouched.
-        """
-        pm = getattr(self.env, "position_manager", None)
-        engine = getattr(self.env, "execution_engine", None)
-        persistence = getattr(self.env, "persistence", None)
-        if pm is None or engine is None or persistence is None:
-            return []
-        changed: list = []
-        strategies = getattr(self.env, "strategies", {}) or {}
-        accept = {"submitted", "open", "accepted", "pending", "open_pending", "pendingnew", "triggered"}
-        # C10 — 'unknown' is deliberately NOT in the fail set: a single missed
-        # poll or the first cycle after restart was previously escalated to a
-        # permanent sl_state='failed' (removing the position from every future
-        # verify pass while the protective SL may actually be live).  Unknown
-        # now keeps the position in 'placed' and bumps a bounded attempt count;
-        # only after max_unknown_polls consecutive unknowns is it failed.
-        fail = {"rejected", "cancelled", "canceled", "expired"}
-        sl_cfg = (self.config.get("live") or {}).get("broker_sl") or {}
-        max_unknown = max(1, int(sl_cfg.get("max_unknown_polls", 5) or 5))
-        for sid in list(strategies.keys()):
-            positions = pm.get_positions_by_strategy(sid)
-            for position in positions:
-                if getattr(position, "sl_state", None) != "placed":
-                    continue
-                sl_id = getattr(position, "sl_order_id", None)
-                if not sl_id:
-                    continue
-                order = engine.get_order(sl_id)
-                broker_oid = getattr(order, "_broker_order_id", None) \
-                    if order is not None else None
-                st = None
-                if broker_oid:
-                    rec = (statuses or {}).get(broker_oid) or {}
-                    st = str(rec.get("status") or "").lower()
-                base_status = st or "unknown"
-                unknown_attempts = 0
-                if base_status in accept:
-                    position.sl_state = "verified"
-                    position.sl_protected_at = time.time()
-                    position.sl_verify_attempts = 0
-                    try:
-                        persistence.save_position(position)
-                    except Exception as e:
-                        self._errors["sl_verify"] += 1
-                        log.error("[LivePoller:%s] SL verify persist failed %s: %s",
-                                  self.env.name, sl_id, e)
-                    self._stats["sl_verified"] += 1
-                    changed.append({"sl_order_id": sl_id, "sl_state": "verified"})
-                elif base_status == "unknown":
-                    # C10 — transient/non-confirmed broker state: keep the
-                    # position pending verification ('placed') and requery next
-                    # cycle.  Escalate to 'failed' only after the configured
-                    # number of consecutive unknown polls.
-                    unknown_attempts = int(getattr(
-                        position, "sl_verify_attempts", 0) or 0) + 1
-                    position.sl_verify_attempts = unknown_attempts
-                    try:
-                        persistence.save_position(position)
-                    except Exception as e:
-                        self._errors["sl_verify"] += 1
-                        log.error(
-                            "[LivePoller:%s] SL unknown-persist failed %s: %s",
-                            self.env.name, sl_id, e)
-                    if unknown_attempts < max_unknown:
-                        changed.append({
-                            "sl_order_id": sl_id, "sl_state": "placed",
-                            "note": f"status_unknown_requery_{unknown_attempts}"})
-                        continue
-                    # Sustained unknown -> treat as failed (local stop stays
-                    # armed as the safety net).
-
-                elif base_status in fail or (
-                        base_status == "unknown"
-                        and unknown_attempts >= max_unknown):
-                    # SL retry policy: re-place the protective SLM at the same
-                    # trigger (retry_same_price) up to the configured limit
-                    # before declaring the protection failed.  A re-place only
-                    # happens while the position is still open; if retries are
-                    # disabled/exhausted the state flips to 'failed' and the
-                    # fail_closed policy decides the emergency exit.
-                    sl_cfg = (self.config.get("live") or {}).get("broker_sl") or {}
-                    if bool(sl_cfg.get("retry_enabled", False)):
-                        retry_max = int(sl_cfg.get("retry_max_attempts", 1) or 1)
-                        attempts = int(getattr(position, "sl_retry_count", 0) or 0)
-                        recreate = hasattr(engine, "create_protective_sl")
-                        if attempts < retry_max and recreate and \
-                                getattr(position, "is_open", False):
-                            theme = getattr(position, "sl_trigger_price", 0.0) or 0.0
-                            if theme:
-                                try:
-                                    sl2 = engine.create_protective_sl(
-                                        strategy_id=position.strategy_id,
-                                        instrument=position.instrument,
-                                        side="SELL" if getattr(
-                                            position, "is_long", False) else "BUY",
-                                        quantity=getattr(position, "quantity", 0),
-                                        trigger_price=theme,
-                                        trade_id=str(getattr(position, "trade_id", "") or ""),
-                                        entry_order_id=str(getattr(
-                                            position, "entry_signal_id", "") or ""),
-                                    )
-                                    engine.submit_order(sl2)
-                                except Exception as e:
-                                    log.warning("[LivePoller:%s] SL re-place failed: %s",
-                                                self.env.name, e)
-                                    sl2 = None
-                                if sl2 is not None and \
-                                        getattr(sl2, "_broker_order_id", None):
-                                    position.sl_state = "placed"
-                                    position.sl_order_id = sl2.order_id
-                                    position.sl_retry_count = attempts + 1
-                                    try:
-                                        persistence.save_position(position)
-                                    except Exception as e:
-                                        self._errors["sl_verify"] += 1
-                                        log.error(
-                                            "[LivePoller:%s] SL re-place persist failed: %s",
-                                            self.env.name, e)
-                                    changed.append({
-                                        "sl_order_id": sl2.order_id,
-                                        "sl_state": "placed",
-                                        "retry": True,
-                                        "retry_count": attempts + 1})
-                                    continue
-                        # Retries disabled or exhausted -> protection failed.
-                    position.sl_state = "failed"
-                    try:
-                        persistence.save_position(position)
-                    except Exception as e:
-                        self._errors["sl_verify"] += 1
-                        log.error("[LivePoller:%s] SL fail persist failed %s: %s",
-                                  self.env.name, sl_id, e)
-                    try:
-                        import uuid as _uu
-                        persistence.save_execution_failure_event({
-                            "event_id": f"SLF-{_uu.uuid4().hex}",
-                            "event_type": "SL_PROTECTION_FAILED",
-                            "strategy_id": position.strategy_id,
-                            "trade_id": position.trade_id,
-                            "order_id": sl_id,
-                            "broker_order_id": broker_oid,
-                            "instrument": position.instrument,
-                            "error": f"broker_status_{base_status}",
-                            "action": "verify_failed",
-                            "final_state": "position_local_stop_armed",
-                            "details": {
-                                "sl_state": "placed", "status": "verify",
-                                "broker_status": base_status,
-                            },
-                        })
-                    except Exception as e:
-                        self._errors["sl_verify"] += 1
-                        log.error("[LivePoller:%s] SL fail audit write failed: %s",
-                                  self.env.name, e)
-                    self._stats["sl_failures"] += 1
-                    changed.append({"sl_order_id": sl_id, "sl_state": "failed"})
-        return changed
 
     def _route_fill(self, fill, signal_id, is_exit=None) -> None:
         if self._handle_fill is not None:
@@ -594,6 +439,95 @@ class LiveBrokerPoller:
         if changed:
             self._stats["pending_terminalized"] += changed
         return changed
+
+    def _release_terminal_exits(self) -> int:
+        """Re-arm the position-owned SL for exits the broker ended unclosed.
+
+        An exit order that reaches REJECTED / CANCELLED / EXPIRED while its
+        position is still open is the dangerous case: there is no broker-side
+        stop backing the position any more, and the local monitor is latched in
+        EXITING, so ``evaluate`` can never fire it again.  The position would
+        sit open and unprotected until the next restart.
+
+        Releasing the latch makes the very next tick re-evaluate that
+        position's OWN stop and mint a FRESH exit, which is the only correct
+        recovery now that no resting stop exists at the broker.
+
+        Safety properties:
+
+        * one-shot per latch — a position is only touched while its SL is
+          actually latched, so the 2 s poll cannot churn the book;
+        * scoped to ``open_positions`` and requires the SAME ``trade_id`` and
+          ``position_generation`` as the order, so a position that really did
+          close — or that a reversal already superseded — can never be
+          resurrected here;
+        * a position whose SL is NONE / SL_UNAVAILABLE (never armed) is left
+          alone rather than being falsely reported as ARMED.
+        """
+        engine = getattr(self.env, "execution_engine", None)
+        monitor = getattr(self.env, "sl_monitor", None)
+        if engine is None or monitor is None:
+            return 0
+        if not hasattr(monitor, "release_exit") or not hasattr(monitor, "state_of"):
+            return 0
+        strategies = getattr(self.env, "strategies", {}) or {}
+        open_positions = list(getattr(
+            getattr(self.env, "position_manager", None), "open_positions", []) or [])
+        if not open_positions:
+            return 0
+        persistence = getattr(self.env, "persistence", None)
+        released = 0
+        for order in list((getattr(engine, "_orders", {}) or {}).values()):
+            state_v = str(getattr(order.state, "value", order.state) or "").lower()
+            if state_v not in _TERMINAL_ORDER_STATES:
+                continue
+            role = str(getattr(order, "order_role", "") or "").upper()
+            if role not in _EXIT_ROLES:
+                continue
+            position_id = getattr(order, "parent_position_id", None)
+            if not position_id:
+                continue
+            position = next((
+                p for p in open_positions
+                if str(getattr(p, "position_id", "") or "") == str(position_id)
+                and getattr(p, "trade_id", None) == (
+                    getattr(order, "lifecycle_id", None)
+                    or getattr(order, "trade_id", None))
+                and getattr(p, "position_generation", None) == getattr(
+                    order, "position_generation", None)), None)
+            if position is None:
+                continue
+            pid = str(getattr(position, "position_id", "") or "")
+            # One-shot: only act while the SL is genuinely latched on a dead
+            # exit.  Already-ARMED / NONE / SL_UNAVAILABLE positions are left
+            # exactly as they are.
+            if monitor.state_of(pid) not in ("EXITING", "TRIGGERED"):
+                continue
+            monitor.release_exit(pid)
+            if monitor.state_of(pid) != "ARMED":
+                continue
+            position.exit_started = False
+            position.exit_order_id = None
+            position.sl_state = "ARMED"
+            strat = strategies.get(getattr(order, "strategy_id", None))
+            if strat is not None:
+                strat.stop_exit_submitted = False
+            try:
+                if persistence is not None:
+                    persistence.save_position(position)
+            except Exception as e:
+                log.debug("[LivePoller:%s] SL re-arm persist failed %s: %s",
+                          self.env.name, pid, e)
+            released += 1
+            log.warning(
+                "[LivePoller:%s] SL RE-ARMED after %s exit %s (%s) ended %s "
+                "without closing — position %s still open, next tick "
+                "re-evaluates its own stop",
+                self.env.name, role, getattr(order, "order_id", "?"),
+                getattr(position, "instrument", "?"), state_v, pid)
+        if released:
+            self._stats["sl_rearmed"] = self._stats.get("sl_rearmed", 0) + released
+        return released
 
     def _terminalize_pending_from_broker(self, statuses: dict) -> int:
         """F2 — self-heal stale ENTRY_SENT pending rows against broker truth by
