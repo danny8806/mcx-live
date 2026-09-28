@@ -1097,6 +1097,17 @@ class OrderWatcher:
             new_order.position_generation = rec.position_generation
             new_order.original_order_id = rec.internal_order_id
             engine.submit_order(new_order)
+            if str(getattr(getattr(new_order, "state", None), "value",
+                           getattr(new_order, "state", ""))).lower() == "rejected":
+                reason = getattr(new_order, "reason", None) or "market_fallback_rejected"
+                self._fail_event("ENTRY_MARKET_FALLBACK_FAILED", rec, {
+                    "error": str(reason),
+                    "new_order_id": getattr(new_order, "order_id", None),
+                })
+                return {"order_id": rec.internal_order_id,
+                        "decision": "MARKET_FALLBACK", "ok": False,
+                        "error": str(reason),
+                        "market_order_id": getattr(new_order, "order_id", None)}
         except Exception as e:
             rec.last_error = str(e)
             self._fail_event("ENTRY_MARKET_FALLBACK_FAILED", rec, {"error": str(e)})

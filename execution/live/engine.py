@@ -248,6 +248,21 @@ class LiveExecutionEngine:
             order.reason = "ORDER_ROLE_INVALID"
             order.updated_at = self._now()
             return order
+        # LIVE entry execution has one permitted route: a locally fired
+        # trigger followed by the configured LIMIT order.  Do not allow a
+        # timeout/recovery path (or a direct caller) to turn an entry into a
+        # MARKET order, even if market-fallback config is accidentally enabled.
+        if role == "FALLBACK_MARKET":
+            order.state = OrderState.REJECTED
+            order.reason = "LIVE_MARKET_ENTRY_DISABLED"
+            order.updated_at = self._now()
+            return order
+        if role in {"ENTRY", "REVERSAL_ENTRY"} and str(
+                getattr(order, "order_type", "") or "").upper() != "LIMIT":
+            order.state = OrderState.REJECTED
+            order.reason = "LIVE_ENTRY_MUST_BE_LIMIT"
+            order.updated_at = self._now()
+            return order
         if (role in {"ENTRY", "REVERSAL_ENTRY", "EXIT", "STOP_LOSS",
                      "REVERSAL_EXIT", "FALLBACK_MARKET"}
                 and str(getattr(order, "trigger_state", "") or "").upper() != "FIRED"):
