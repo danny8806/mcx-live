@@ -214,13 +214,6 @@
       "enabled": true,
       "max_escalations_per_order": 8
     },
-    "broker_sl": {
-      "enabled": false,
-      "fail_closed": false,
-      "retry_enabled": false,
-      "retry_max_attempts": 3,
-      "retry_interval_seconds": 4
-    },
     "exit_first": {
       "enabled": true
     },
