@@ -51,7 +51,7 @@ files = [
     "execution/price_model.py", "execution/live/engine.py",
     "execution/live/dhan_transport.py", "execution/live/order_watcher.py",
     "execution/live/poller.py", "execution/live/broker_sync.py",
-    "strategies/instance.py", "strategies/base_dema_strategy.py",
+    "strategies/instance.py",
     "strategies/runtime.py", "persistence/database.py",
     "persistence/manager.py", "live/api.py", "live/engine.py",
     "live/run.py", "notifications/telegram_client.py",

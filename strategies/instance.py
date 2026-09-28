@@ -265,7 +265,7 @@ class StrategyInstance:
         self.slow_htf_state.update(bar)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # STRATEGY EVALUATION — identical to BaseDEMAStrategy.on_bar()
+    # STRATEGY EVALUATION
     # ═══════════════════════════════════════════════════════════════════════
 
     def on_bar(
@@ -275,7 +275,7 @@ class StrategyInstance:
         fast_dema_atr: Optional[float],
         mid_mapped: Optional[HTFMappedValue] = None,
     ) -> Optional[Signal]:
-        """Process a fast timeframe bar. Identical logic to BaseDEMAStrategy.on_bar().
+        """Process a fast timeframe bar.
 
         This is the core strategy evaluation. Called ONLY on fast TF close.
         """
@@ -357,8 +357,8 @@ class StrategyInstance:
                     if old_pending_id:
                         signal.metadata["old_pending_id"] = old_pending_id
                     return signal
-                # BaseDEMAStrategy arms pending_entry as side-effect; return
-                # the pending signal if it was created.
+                # The strategy arms pending_entry as a side effect; return
+                # that pending signal when it was created.
                 if (self.pending_entry is not None
                         and self.pending_entry.signal is not None):
                     self.pending_entry.signal.metadata = self.pending_entry.signal.metadata or {}
@@ -416,7 +416,7 @@ class StrategyInstance:
         return signal
 
     # ═══════════════════════════════════════════════════════════════════════
-    # CROSSOVER DETECTION — identical to BaseDEMAStrategy
+    # CROSSOVER DETECTION
     # ═══════════════════════════════════════════════════════════════════════
 
     def _check_long_cross(
@@ -434,7 +434,7 @@ class StrategyInstance:
         return short_crossover(close, prev_close, htf_val, mid_val)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # SIGNAL CREATION — identical to BaseDEMAStrategy
+    # SIGNAL CREATION
     # ═══════════════════════════════════════════════════════════════════════
 
     def _detect_signal(
@@ -673,7 +673,7 @@ class StrategyInstance:
         return pen.signal
 
     # ═══════════════════════════════════════════════════════════════════════
-    # PENDING ENTRY + STOP LOSS — identical to BaseDEMAStrategy
+    # PENDING ENTRY + STOP LOSS
     # ═══════════════════════════════════════════════════════════════════════
 
     def _close_position(self, reason: str) -> None:
@@ -892,7 +892,7 @@ class StrategyInstance:
     ) -> Optional[dict]:
         """Emit the pending entry as a dict keyed for the dashboard panel.
 
-        Mirrors BaseDEMAStrategy.snapshot() (fast O(1) — no broker calls).
+        Captures strategy state (fast O(1) — no broker calls).
         All values are the frozen signal-time snapshot captured when the entry
         was armed; the live signal candle stays unchanged until the trigger
         crosses, then the engine acts on it.
@@ -920,7 +920,6 @@ class StrategyInstance:
             "trigger_price": pe.trigger_price,
             "stop_price": (sig.stop_price if sig else None) or 0,
             "bars_pending": pe.bars_pending,
-            "immediate": getattr(pe, "immediate", False),
             "created_at": getattr(pe, "created_at", 0) or 0.0,
             "instrument": sig.instrument if sig else self.instrument,
             "strategy_id": sig.strategy_id if sig else self.strategy_id,

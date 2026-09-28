@@ -57,8 +57,8 @@ print("\n--- Price model (STOP-LIMIT entry) ---")
 pm_code = ssh("docker exec mcx-live python3 -c \"import inspect; from execution.price_model import PriceModel; src=inspect.getsource(PriceModel._stop_limit_legs); print(src)\" 2>/dev/null")
 print(pm_code.strip()[:600] if pm_code.strip() else "  Could not inspect")
 
-print("\n--- immediate_limit in instance ---")
-im_code = ssh("docker exec mcx-live python3 -c \"import inspect; from strategies.instance import StrategyInstance; src=inspect.getsource(StrategyInstance._create_immediate_limit_signal); print(src)\" 2>/dev/null")
+print("\n--- local-trigger entry creation in instance ---")
+im_code = ssh("docker exec mcx-live python3 -c \"import inspect; from strategies.instance import StrategyInstance; src=inspect.getsource(StrategyInstance._create_triggered_entry_signal); print(src)\" 2>/dev/null")
 print(im_code.strip()[:600] if im_code.strip() else "  Could not inspect")
 
 print("\n" + "=" * 80)

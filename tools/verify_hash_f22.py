@@ -2,7 +2,6 @@ import paramiko, hashlib
 
 files = [
     'strategies/instance.py',
-    'strategies/base_dema_strategy.py',
     'trading_engine.py',
     'execution/price_model.py',
     'config/live_settings.json',

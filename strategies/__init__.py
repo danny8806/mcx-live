@@ -11,7 +11,6 @@ from importlib import import_module
 from .types import Signal, SignalType, StrategyState
 
 _LAZY_EXPORTS = {
-    "BaseDEMAStrategy": (".base_dema_strategy", "BaseDEMAStrategy"),
     "GoldStrategy01": (".gold", "GoldStrategy01"),
     "GoldStrategy02": (".gold", "GoldStrategy02"),
     "GoldStrategy03": (".gold", "GoldStrategy03"),

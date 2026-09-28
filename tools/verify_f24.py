@@ -45,7 +45,6 @@ print(f"Local live_settings.json: {lines2[0] if lines2 else 'N/A'}")
 print("\n" + "=" * 60)
 print("[5] STRATEGY GAP WIRING IN CONTAINER")
 print(run("docker exec mcx-live grep -n 'reversal_entry_gap_points' /app/strategies/instance.py"))
-print(run("docker exec mcx-live grep -n 'reversal_entry_gap_points' /app/strategies/base_dema_strategy.py"))
 print(run("docker exec mcx-live grep -n 'reversal_entry_gap_points' /app/trading_engine.py"))
 
 # 6. Engine reads from live.reversal (not root.reversal)

@@ -142,7 +142,7 @@ checklist = [
     ("Dhan order WS", "UNKNOWN", "No order WS logs in recent output. REST polling active."),
     ("Startup reconciliation", "PASS", "Lifecycle restored 2+4+7+2=15 trades. Market: init->reconcile->warmup->ready."),
     ("Signal generation", "NOT_OBSERVED", "/api/signals returns 404. No signals in current session."),
-    ("STOP-LIMIT entry", "CODE_VERIFIED", "_create_immediate_limit_signal creates STOP_LOSS with trigger=HIGH/LOW."),
+    ("Locally triggered LIMIT entry", "CODE_VERIFIED", "_create_triggered_entry_signal arms on the candle; a live tick must fire it before submission."),
     ("Broker order ID", "NOT_OBSERVED", "All 15 orders rejected. broker_order_id=none for all."),
     ("Pending tracking", "CODE_VERIFIED", "OrderWatcher._decide handles PENDING_BUT_VALID with WAIT."),
     ("Trigger detection", "CODE_VERIFIED", "TRIGGER_CROSSED_NOT_FILLED event exists in order_watcher."),

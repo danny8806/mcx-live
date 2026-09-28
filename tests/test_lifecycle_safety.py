@@ -237,10 +237,10 @@ def test_local_stop_loss_fires_once_and_uses_limit_exit_plan():
     with pytest.raises(ValueError, match="triggered"):
         PricePreset().plan_for(untriggered, "BUY")
 
-    legacy = _signal("LONG")
-    legacy.metadata = {"triggered": True, "immediate_limit": True}
+    missing_trigger_state = _signal("LONG")
+    missing_trigger_state.metadata = {"triggered": True}
     with pytest.raises(ValueError, match="FIRED"):
-        PricePreset().plan_for(legacy, "BUY")
+        PricePreset().plan_for(missing_trigger_state, "BUY")
 
 
 def test_strategy_triggers_are_isolated_and_live_gate_rejects_stale_generation():

@@ -56,7 +56,7 @@ run('docker exec mcx-live python3 -c "import json; c=json.load(open(\\\"/app/con
     "8. LAST 5 KEYS OF CONFIG")
 
 # 9. Container hash
-run('docker exec mcx-live md5sum /app/trading_engine.py /app/strategies/instance.py /app/strategies/base_dema_strategy.py /app/config/live_settings.json',
+run('docker exec mcx-live md5sum /app/trading_engine.py /app/strategies/instance.py /app/config/live_settings.json',
     "9. CONTAINER FILE HASHES")
 
 # 10. Local hashes

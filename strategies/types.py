@@ -152,7 +152,6 @@ class PendingEntry:
     status: str = "pending"
     created_at: float = 0.0  # timestamp when pending entry was created
     bars_pending: int = 0    # number of bars since creation
-    immediate: bool = False  # direct-market re-entry: engine flips right after a reversal exit
 
 
 def resolve_order_role(signal: Optional['Signal'], *, exit_reason: Optional[str] = None) -> str:
@@ -212,5 +211,5 @@ class StrategyInput:
     htf_source_timestamp: Optional[float]
 
 
-# Forward reference for type hints - Bar is imported at runtime in base_dema_strategy
-Bar = Any  # Placeholder, actual import happens in base_dema_strategy
+# Bar type is supplied by the strategy runtime at runtime.
+Bar = Any
