@@ -9,8 +9,9 @@ from strategies.types import (
     SignalType, StrategyState, Signal, PendingEntry, StrategyInput,
     freeze_signal_context,
 )
+from strategies.intent import long_crossover, short_crossover
 from core.timeframe_engine import Bar
-from htf.backtest_style_htf import HTFMappedValue
+from htf.confirmation import HTFMappedValue
 
 
 class BaseDEMAStrategy:
@@ -275,15 +276,7 @@ class BaseDEMAStrategy:
         Tolerance: 15m can be up to 1.5% above 1H (accounts for DEMA drift between TFs
         caused by different data ranges in live vs backtest).
         """
-        cross = close > htf_val and prev_close <= htf_val
-        if not cross:
-            return False
-        # Confirmation: 15m line must be strictly below 1H line for LONG
-        # (matches backtest exactly: h15 < h1)
-        if mid_val is not None and htf_val is not None:
-            if mid_val >= htf_val:
-                return False
-        return True
+        return long_crossover(close, prev_close, htf_val, mid_val)
 
     def _check_short_cross(
         self, close: float, prev_close: float,
@@ -296,14 +289,7 @@ class BaseDEMAStrategy:
         Strict filter: 15m MUST be above 1H for SHORT confirmation.
         (15m below 1H = bullish trend, contradicting a SHORT signal)
         """
-        cross = close < htf_val and prev_close >= htf_val
-        if not cross:
-            return False
-        # Confirmation: 15m line must be above 1H line for bearish confirmation
-        if mid_val is not None and htf_val is not None:
-            if mid_val <= htf_val:
-                return False
-        return True
+        return short_crossover(close, prev_close, htf_val, mid_val)
 
     def _detect_signal(
         self,

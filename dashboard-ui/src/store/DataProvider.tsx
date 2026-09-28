@@ -3,6 +3,7 @@ import {
   useSyncExternalStore, useMemo, type ReactNode,
 } from "react";
 import { api } from "../lib/api";
+import { connectDashboardSocket } from "../lib/realtime";
 
 export type DataState = "loading" | "live" | "stale" | "empty" | "error";
 
@@ -120,7 +121,6 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [wsState, setWsState] = useState<any>(null);
   const [lastError, setLastError] = useState<string | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
   const timersRef = useRef<Record<string, number>>({});
   const mountedRef = useRef(true);
   const wsActiveRef = useRef(false);
@@ -329,27 +329,14 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, [fetchOverview, fetchGoldOverview, fetchSilverOverview, fetchStrategies, fetchPositions, fetchOrders, fetchFills, fetchTrades, fetchPnl, fetchRisk, fetchIndicators, fetchHtf, fetchHealth, fetchAudit, fetchAlerts, fetchEquityCurve, fetchMarketData]);
 
   useEffect(() => {
-    let reconnectTimer: number;
-    function connect() {
-      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsBase = (window.APP_WS_BASE ?? "").replace(/\/$/, "");
-      const ws = new WebSocket(`${proto}//${window.location.host}${wsBase}/ws`);
-      wsRef.current = ws;
-      ws.onopen = () => {
-        ws.send(JSON.stringify({ action: "subscribe", channels: ["all"] }));
-        if (mountedRef.current) setConnected(true);
-      };
-      ws.onclose = () => {
-        wsActiveRef.current = false;
-        if (mountedRef.current) setConnected(false);
-        reconnectTimer = window.setTimeout(connect, 3000);
-      };
-      ws.onerror = () => ws.close();
-      ws.onmessage = (evt) => {
+    return connectDashboardSocket((msg) => {
         try {
-          const msg = JSON.parse(evt.data);
+          if (msg.type === "parse_error") {
+            setLastError(String(msg.data));
+            return;
+          }
           if (msg.type === "engine_state") {
-            const s = msg.data;
+            const s = msg.data as any;
             safe(setWsState)(s);
             if (s?.account) {
               wsActiveRef.current = true;
@@ -455,14 +442,14 @@ export function DataProvider({ children }: { children: ReactNode }) {
             }
           }
           if (msg.type === "events") {
-            const events = msg.data ?? [];
+            const events = (msg.data ?? []) as any[];
             safe(setWsEvents)((prev: any[]) => [...events, ...prev].slice(0, 200));
           }
         } catch (e: any) { setLastError(`ws: ${e?.message || e}`); }
-      };
-    }
-    connect();
-    return () => { clearTimeout(reconnectTimer); wsRef.current?.close(); };
+      }, (isConnected) => {
+        if (!isConnected) wsActiveRef.current = false;
+        if (mountedRef.current) setConnected(isConnected);
+      });
   }, [safe]);
 
   const contextValue = useMemo<DataContextType>(() => ({

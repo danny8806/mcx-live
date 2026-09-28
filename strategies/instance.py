@@ -18,6 +18,7 @@ from strategies.htf_state import HTFState
 from strategies.types import (
     SignalType, StrategyState, Signal, PendingEntry, freeze_signal_context,
 )
+from strategies.intent import long_crossover, short_crossover, entry_levels, reversal_levels
 from indicators.shared import (
     IndicatorStream, StrategyIndicatorView, StreamHTFStateView,
 )
@@ -466,28 +467,14 @@ class StrategyInstance:
         htf_val: float, prev_htf_val: float,
         mid_val: Optional[float] = None, prev_mid_val: Optional[float] = None,
     ) -> bool:
-        """Long crossover: close crosses ABOVE 1H line AND 15m below 1H."""
-        cross = close > htf_val and prev_close <= htf_val
-        if not cross:
-            return False
-        if mid_val is not None and htf_val is not None:
-            if mid_val >= htf_val:
-                return False
-        return True
+        return long_crossover(close, prev_close, htf_val, mid_val)
 
     def _check_short_cross(
         self, close: float, prev_close: float,
         htf_val: float, prev_htf_val: float,
         mid_val: Optional[float] = None, prev_mid_val: Optional[float] = None,
     ) -> bool:
-        """Short crossover: close crosses BELOW 1H line AND 15m above 1H."""
-        cross = close < htf_val and prev_close >= htf_val
-        if not cross:
-            return False
-        if mid_val is not None and htf_val is not None:
-            if mid_val <= htf_val:
-                return False
-        return True
+        return short_crossover(close, prev_close, htf_val, mid_val)
 
     # ═══════════════════════════════════════════════════════════════════════
     # SIGNAL CREATION — identical to BaseDEMAStrategy
@@ -552,14 +539,7 @@ class StrategyInstance:
         order watcher cancels it (skip policy) with a MARKET fallback for the
         remaining quantity when it fails to fill.
         """
-        if side == "LONG":
-            trigger = high
-            sl_low = prev_low if prev_low is not None else low
-            stop = min(low, sl_low)
-        else:
-            trigger = low
-            sl_high = prev_high if prev_high is not None else high
-            stop = max(high, sl_high)
+        trigger, stop = entry_levels(side, high, low, prev_high, prev_low)
 
         signal = Signal(
             signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,
@@ -615,14 +595,7 @@ class StrategyInstance:
         htf_val=None, mid_val=None, fast_dema_atr=None, open_=None,
     ) -> Signal:
         """Create a pending entry signal (breakout trigger)."""
-        if side == "LONG":
-            trigger = high
-            sl_low = prev_low if prev_low is not None else low
-            stop = min(low, sl_low)
-        else:
-            trigger = low
-            sl_high = prev_high if prev_high is not None else high
-            stop = max(high, sl_high)
+        trigger, stop = entry_levels(side, high, low, prev_high, prev_low)
 
         signal = Signal(
             signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,
@@ -679,28 +652,20 @@ class StrategyInstance:
         prev_high=None, prev_low=None,
         htf_val=None, mid_val=None, fast_dema_atr=None, open_=None,
     ) -> Signal:
-        """Create a reversal: return an exit signal AND an entry signal.
-        Both are returned immediately so the engine submits BOTH orders
-        to Dhan in the same processing cycle.  The entry is no longer
-        armed as a PendingEntry waiting for a future bar breakout.
+        """Create an exit now and arm the opposite entry behind confirmed flat.
 
-        The entry trigger is offset from the exit trigger by
-        ``reversal_entry_gap_points`` so the old position exits FIRST
-        and the new opposite position enters SECOND:
+        The entry remains a PendingEntry while the old position is being
+        exited and reconciled. Only after the broker confirms flat can its
+        breakout trigger fire and begin a new trade lifecycle.
+
+        ``reversal_entry_gap_points`` offsets the opposite entry trigger from
+        the signal candle's reversal trigger:
           LONG → SHORT: entry trigger = signal LOW - gap
           SHORT → LONG: entry trigger = signal HIGH + gap
         """
         gap = int(getattr(self, "reversal_entry_gap_points", 0))
-        if side == "LONG":
-            trigger = high
-            sl_low = prev_low if prev_low is not None else low
-            stop = min(low, sl_low)
-            entry_trigger = trigger + gap
-        else:
-            trigger = low
-            sl_high = prev_high if prev_high is not None else high
-            stop = max(high, sl_high)
-            entry_trigger = trigger - gap
+        trigger, entry_trigger, stop = reversal_levels(
+            side, high, low, prev_high, prev_low, gap)
 
         # The opposite entry is a distinct lifecycle and stays armed, but
         # cannot fire until the old position has been confirmed flat.

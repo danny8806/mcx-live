@@ -4,6 +4,9 @@ from execution.live.engine import LiveExecutionEngine
 from execution.models import Fill, OrderState
 from portfolio.position_manager import PositionManager
 from strategies.types import Signal, SignalType
+from strategies.intent import (
+    entry_levels, long_crossover, reversal_levels, short_crossover,
+)
 from trading_engine import TradingEngine
 
 
@@ -119,3 +122,18 @@ def test_old_long_stop_cannot_close_new_short_and_current_stop_submits_once():
     execution.submit_order(duplicate)
     assert duplicate.state == OrderState.REJECTED
     assert len(broker.placed) == 4  # exactly one current SHORT exit
+
+
+def test_dema_atr_strategy_intent_stays_explicit_and_shared():
+    assert long_crossover(101, 99, 100, 98)
+    assert not long_crossover(101, 99, 100, 100)
+    assert short_crossover(99, 101, 100, 102)
+    assert not short_crossover(99, 101, 100, 100)
+
+    assert entry_levels("LONG", high=105, low=99,
+                        previous_high=104, previous_low=98) == (105, 98)
+    assert entry_levels("SHORT", high=105, low=99,
+                        previous_high=106, previous_low=100) == (99, 106)
+    assert reversal_levels("SHORT", high=105, low=99,
+                           previous_high=106, previous_low=100,
+                           gap=2) == (99, 97, 106)
