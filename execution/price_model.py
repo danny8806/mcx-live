@@ -4,16 +4,10 @@ Contract: every LIVE execution price is derived from the immutable signal's
 trigger/stop values through pure functions, so a price is never improvised at
 the broker and PAPER/LIVE can never diverge by mistake.
 
-LIVE uses a LIMIT-first execution model: when the system detects a trigger
-crossing via Market WS, it sends a LIMIT order at the trigger price.  The
-order watcher monitors the resting LIMIT and performs cancel→verify→MARKET
-remaining if the LIMIT fails to fill within the configured skip policy
-thresholds.  This avoids duplicate orders and ensures quantity safety (market
-qty = requested - filled, never the full requested amount).
-
-For legacy broker-side STOP_LOSS entries (``immediate_limit``), a broker-side
-trigger order is still used — both price and trigger_price are sent to Dhan
-(SM/SLM).  Broker-side SL orders are disabled (``broker_sl.enabled=false``).
+LIVE has one entry model: the strategy emits an immediate-limit signal and
+the engine sends a LIMIT at its trigger level. Exits are created only after
+the system stop monitor or strategy exit fires. Broker-side protective stop
+orders are disabled; the local tick monitor owns stop triggering.
 """
 from __future__ import annotations
 
@@ -107,14 +101,8 @@ class ExecutionPricePlan:
     """The concrete execution intent derived from one signal.
 
     ``order_type`` is what gets sent to the broker transport:
-      * ``LIMIT``           -> system-triggered entries and exits (the system
-                               detected the trigger crossing via Market WS;
-                               LIMIT rests at the trigger price; the order
-                               watcher handles cancel→verify→MARKET remaining
-                               if unfilled)
-      * ``STOP_LOSS``       -> legacy broker-side trigger entries (both
-                               ``price`` = limit and ``trigger_price`` = trigger
-                               are sent; the broker activates on the trigger)
+      * ``LIMIT``           -> immediate-limit entries and system-triggered
+                               exits, priced from the immutable signal
     ``kind`` classifies the intent for reporting and forensics.
     """
     order_type: str
@@ -125,14 +113,7 @@ class ExecutionPricePlan:
 
 @dataclass(frozen=True)
 class PricePreset:
-    """Offset margins + tick grid applied to LIVE executions.
-
-    Offset values are pure configuration; the functions stay pure.  A zero
-    offset produces a broker-side STOP_LOSS with the trigger exactly at the
-    signal level and the LIMIT leg one tick tradeable-side of it (degenerate
-    but valid); the LIVE master gate default OFF means no real order is ever
-    sent until the operator enables both the gate and this model.
-    """
+    """Apply configured price offsets and tick rounding to LIVE orders."""
     entry_offset: float = 0.0
     sl_offset: float = 0.0
     tick_size: float = 1.0
@@ -156,11 +137,9 @@ class PricePreset:
         (the strategies.types.Signal contract).  ``side`` is the resolved order
         side ("BUY"/"SELL").
 
-        LIMIT-first model: when the system detects a trigger crossing via
-        Market WS (``metadata["triggered"] = True``), the entry/exit is
-        executed as a LIMIT order at the trigger price.  The order watcher
-        monitors the resting LIMIT and performs cancel→verify→MARKET remaining
-        if it fails to fill within the configured skip policy thresholds.
+        Entry signals must carry ``triggered=True``. Ordinary entries use the
+        immediate-limit path; reversal entries arrive here only after their
+        trigger fires and the previous position is flat.
         """
         metadata = signal.metadata or {}
         is_exit = bool(metadata.get("exit"))
@@ -199,43 +178,18 @@ class PricePreset:
                 kind="system_sl_exit" if is_sl else "system_exit",
                 price=_tick_round(level, self.tick_size))
 
-        # ── DIRECT-FIRE ENTRIES: system-side trigger → LIMIT ─────────
-        # When on_tick detects the trigger crossing, ``triggered=True``
-        # signals a LIMIT order at the trigger price — the order watcher
-        # monitors and falls back to MARKET remaining if unfilled.
-        if metadata.get("triggered"):
-            trigger = _tick_round(signal.trigger_price, self.tick_size) if signal.trigger_price else None
-            return ExecutionPricePlan(
-                order_type="LIMIT", kind="direct_fire_entry", price=trigger)
-
-        # ── immediate_limit entries ──────────────────────────────
-        # The strategy's immediate-limit factory ALWAYS co-sets
-        # metadata["triggered"]=True (strategies/instance.py
-        # _create_immediate_limit_signal), so immediate-limit ENTRY signals
-        # are planned above as a plain resting LIMIT (kind
-        # direct_fire_entry) supervised by the order watcher's
-        # cancel→verify→MARKET fallback — never as a raw STOP_LOSS.
-        # A legacy broker-side STOP_LOSS stop-limit planning branch lived
-        # here but was unreachable dead code; had it ever been reached it
-        # would place a broker-side trigger order this flow does not
-        # supervise.  Fail loudly instead of mis-planning.
-        if metadata.get("immediate_limit") and not metadata.get("triggered"):
-            raise ValueError(
-                "immediate_limit entry signal is missing triggered=True: the "
-                "immediate-limit factory must emit triggered=True so the entry "
-                "plans as a direct-fire LIMIT (never a raw STOP_LOSS).")
+        # There is no alternate initial-entry mode. Pending reversal entries
+        # reach this point only after their own trigger fires.
+        if not metadata.get("triggered"):
+            raise ValueError("entry must be triggered before immediate-limit submission")
+        if not signal.trigger_price:
+            raise ValueError("immediate-limit entry requires a positive trigger price")
         if side_u == "BUY":
-            trigger = self.long_entry_trigger(signal.trigger_price)
-            limit, trigger = _stop_limit_legs(
-                trigger=trigger, side=side_u, tick_size=self.tick_size,
-                direction="same")
-            return ExecutionPricePlan(
-                order_type="STOP_LOSS", kind="long_entry",
-                price=limit, trigger_price=trigger)
-        trigger = self.short_entry_trigger(signal.trigger_price)
-        limit, trigger = _stop_limit_legs(
-            trigger=trigger, side=side_u, tick_size=self.tick_size,
-            direction="same")
+            price = self.long_entry_trigger(signal.trigger_price)
+            kind = "long_entry"
+        else:
+            price = self.short_entry_trigger(signal.trigger_price)
+            kind = "short_entry"
         return ExecutionPricePlan(
-            order_type="STOP_LOSS", kind="short_entry",
-            price=limit, trigger_price=trigger)
+            order_type="LIMIT", kind=kind,
+            price=_tick_round(price, self.tick_size))

@@ -1,8 +1,11 @@
 from types import SimpleNamespace
+import pytest
 
 from execution.live.engine import LiveExecutionEngine
 from execution.models import Fill, OrderState
+from execution.price_model import PricePreset
 from portfolio.position_manager import PositionManager
+from strategies.gold import create_gold_5m
 from strategies.types import Signal, SignalType
 from strategies.intent import (
     entry_levels, long_crossover, reversal_levels, short_crossover,
@@ -33,7 +36,7 @@ def _signal(side, strategy="s1", *, lifecycle=None, position=None,
         signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,
         instrument="GOLDM", strategy_id=strategy, timestamp=1,
         trigger_price=100, stop_price=95 if side == "LONG" else 105,
-        quantity=1, metadata={},
+        quantity=1, metadata={"triggered": True, "immediate_limit": True},
     )
     if signal_id:
         sig.signal_id = signal_id
@@ -137,3 +140,42 @@ def test_dema_atr_strategy_intent_stays_explicit_and_shared():
     assert reversal_levels("SHORT", high=105, low=99,
                            previous_high=106, previous_low=100,
                            gap=2) == (99, 97, 106)
+
+
+def test_live_uses_one_immediate_limit_entry_and_system_triggered_stop_exit():
+    strategy = create_gold_5m()
+    entry = strategy._entry_signal(
+        "LONG", close=101, high=105, low=99, timestamp=1,
+        prev_high=104, prev_low=98)
+
+    assert strategy.execution_model == "immediate_limit"
+    assert entry.metadata["immediate_limit"] is True
+    assert entry.metadata["pending"] is False
+    assert entry.metadata["triggered"] is True
+    entry_plan = PricePreset(tick_size=1).plan_for(entry, "BUY")
+    assert (entry_plan.order_type, entry_plan.kind, entry_plan.price) == (
+        "LIMIT", "long_entry", 105)
+    entry_order = LiveExecutionEngine(CountingBroker()).create_order(
+        entry, trade_id="entry-plan")
+    assert entry_order.order_type == "LIMIT"
+    assert entry_order.planned_sl == 98
+
+    strategy.position_side = "LONG"
+    strategy.stop_price = 98
+    strategy.position_quantity = 1
+    stop_signal = strategy.on_tick(97, timestamp=2)
+    assert stop_signal is not None
+    assert stop_signal.metadata["exit_reason"] == "stop_loss_hit"
+
+    stop_exit = _signal(
+        "SHORT", lifecycle="trade-long", exit=True, reason="stop_loss_hit")
+    stop_exit.trigger_price = 94  # observed LTP after the stop was crossed
+    stop_exit.stop_price = 95     # the strategy's monitored stop level
+    stop_plan = PricePreset(tick_size=1).plan_for(stop_exit, "SELL")
+    assert (stop_plan.order_type, stop_plan.kind, stop_plan.price) == (
+        "LIMIT", "system_sl_exit", 95)
+
+    untriggered = _signal("LONG")
+    untriggered.metadata = {"pending": True, "triggered": False}
+    with pytest.raises(ValueError, match="triggered"):
+        PricePreset().plan_for(untriggered, "BUY")

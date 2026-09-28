@@ -64,19 +64,9 @@ class StrategyInstance:
         pending_timeout_bars: int = 50,
         capital: float = 300_000.0,
         multiplier: float = 10.0,
-        execution_model: str = "pending_breakout",
     ):
         self.strategy_id = strategy_id
-        # Appendix I execution model:
-        #   "pending_breakout"  — signal arms a trigger; entry LIMIT is only
-        #                         placed when LTP crosses the signal candle's
-        #                         HIGH (LONG) / LOW (SHORT) later.
-        #   "immediate_limit"   — a LIMIT at the trigger level rests at the
-        #                         broker from signal creation; the broker does
-        #                         the trigger-cross detection; a LIMIT-skip
-        #                         policy cancels it and falls back to MARKET
-        #                         for the remaining quantity.
-        self.execution_model = execution_model
+        self.execution_model = "immediate_limit"
         # Set while an immediate-limit entry order rests at the broker.  Locks
         # out new signal detection for this strategy until the fill arrives
         # (engine syncs position) or the order reaches a terminal state (engine
@@ -485,19 +475,12 @@ class StrategyInstance:
         mid_val=None, prev_mid_val=None, prev_high=None, prev_low=None,
         fast_dema_atr=None, open_=None,
     ) -> Optional[Signal]:
-        """Detect new entry signal.
-
-        In the default ``pending_breakout`` model this arms a pending breakout
-        entry (the LIMIT is placed by the engine only after the trigger
-        crosses).  In the Appendix I ``immediate_limit`` model the entry LIMIT
-        is emitted NOW at the signal bar's trigger level so it can rest at the
-        broker from signal creation.
-        """
+        """Detect a crossover and emit its immediate-limit entry signal."""
         # IMMEDIATE-LIMIT LOCK: while a LIMIT emitted by this strategy rests at
         # the broker (or is filling), no NEW signal may be detected from a
         # later bar — otherwise every subsequent bar would emit a duplicate
         # entry.  The engine releases the lock on fill / terminal reject.
-        if self.execution_model == "immediate_limit" and self.immediate_limit_sent is not None:
+        if self.immediate_limit_sent is not None:
             return None
         if self._check_long_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val):
             return self._entry_signal("LONG", close, high, low, timestamp, prev_high, prev_low,
@@ -514,13 +497,8 @@ class StrategyInstance:
         prev_high=None, prev_low=None,
         htf_val=None, mid_val=None, fast_dema_atr=None, open_=None,
     ) -> Signal:
-        """Dispatch to the pending-breakout or immediate-limit entry factory."""
-        if self.execution_model == "immediate_limit":
-            return self._create_immediate_limit_signal(
-                side, close, high, low, timestamp, prev_high, prev_low,
-                htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
-                open_=open_)
-        return self._create_pending_signal(
+        """Build the sole supported entry intent: an immediate-limit order."""
+        return self._create_immediate_limit_signal(
             side, close, high, low, timestamp, prev_high, prev_low,
             htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
             open_=open_)
@@ -586,64 +564,6 @@ class StrategyInstance:
         # not waiting for a trigger cross.
         self.immediate_limit_sent = side
         self.state = StrategyState.ENTRY_TRIGGERED
-        self._signals.append(signal)
-        return signal
-
-    def _create_pending_signal(
-        self, side, close, high, low, timestamp,
-        prev_high=None, prev_low=None,
-        htf_val=None, mid_val=None, fast_dema_atr=None, open_=None,
-    ) -> Signal:
-        """Create a pending entry signal (breakout trigger)."""
-        trigger, stop = entry_levels(side, high, low, prev_high, prev_low)
-
-        signal = Signal(
-            signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,
-            instrument=self.instrument,
-            strategy_id=self.strategy_id,
-            timestamp=timestamp,
-            trigger_price=trigger,
-            stop_price=stop,
-            quantity=self.quantity,
-        )
-        signal.metadata = {
-            # A signal is durable evidence, but it is not a trade.  The engine
-            # persists this state and waits for the breakout before it creates
-            # a lifecycle/trade id.
-            "pending": True,
-            "triggered": False,
-            "entry_price": close,
-            "htf_value": htf_val,
-            "mid_value": mid_val,
-            "fast_dema_atr": fast_dema_atr,
-            "trigger_level": trigger,
-            "signal_candle_start": timestamp,
-            "signal_candle_open": open_,
-            "signal_candle_high": high,
-            "signal_candle_low": low,
-            "signal_candle_close": close,
-            "signal_htf_dema_atr": htf_val,
-            "signal_mid_dema_atr": mid_val,
-            "signal_fast_dema_atr": fast_dema_atr,
-        }
-
-        # Phase 4 — freeze the executing context at arming time. The breakout
-        # may fire many bars later (bar/tick); the signal keeps ITS candle.
-        freeze_signal_context(
-            signal, close=close, high=high, low=low, timestamp=timestamp,
-            open_=open_, dema=fast_dema_atr, atr=self.fast_indicator.atr_value,
-            htf_value=htf_val, mid_value=mid_val,
-            position_side=self.position_side, position_stop=self.stop_price,
-        )
-
-        self.pending_entry = PendingEntry(
-            signal=signal,
-            trigger_price=trigger,
-            side=side,
-            created_at=time.time(),
-        )
-        self.state = StrategyState.PENDING_LONG if side == "LONG" else StrategyState.PENDING_SHORT
-        self._last_armed_pending_id = signal.signal_id
         self._signals.append(signal)
         return signal
 

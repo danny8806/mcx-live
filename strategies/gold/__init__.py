@@ -29,7 +29,6 @@ def create_gold_5m(strategy_id: str = "gold_01", instrument: str = "GOLDM", **kw
         quantity=kwargs.get("quantity", 1),
         capital=kwargs.get("capital", 300_000.0),
         multiplier=kwargs.get("multiplier", 10.0),
-        execution_model=kwargs.get("execution_model", "pending_breakout"),
     )
 
 
@@ -45,7 +44,6 @@ def create_gold_15m(strategy_id: str = "gold_02", instrument: str = "GOLDM", **k
         quantity=kwargs.get("quantity", 1),
         capital=kwargs.get("capital", 300_000.0),
         multiplier=kwargs.get("multiplier", 10.0),
-        execution_model=kwargs.get("execution_model", "pending_breakout"),
     )
 
 

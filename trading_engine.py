@@ -301,9 +301,6 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Persi
         self._warmup_forensics: dict[str, dict] = {}
         self._warmup_watermark: dict[str, dict] = {}
 
-        # Live vs bar-model signal routing
-        self.tick_signal_processing = True
-
         log.info("[Engine] Initialized with %d strategies across %d env(s)",
                  len(self.strategies), len(self._envs))
 
@@ -1960,14 +1957,6 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Persi
 
     def notify_settings_refreshed(self) -> None:
         self.publish_event("settings_refreshed", {"timestamp": time.time()})
-
-    @property
-    def tick_signal_processing(self) -> bool:
-        return getattr(self, '_tick_signal_processing', True)
-
-    @tick_signal_processing.setter
-    def tick_signal_processing(self, value: bool):
-        self._tick_signal_processing = value
 
     def _reconcile_strategy_positions(self, env_name: Optional[str] = None) -> None:
         """Reconcile strategy state with actual positions for one (or every)

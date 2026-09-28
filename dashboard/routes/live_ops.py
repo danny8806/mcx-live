@@ -202,7 +202,7 @@ def _get_profile_sync():
         "broker": live_cfg.get("broker") or "dhan",
         "client_id": _mask_client_id(dhan_cfg.get("client_id", "")),
         "product_type": dhan_cfg.get("product_type") or "MARGIN",
-        "execution_model": live_cfg.get("execution_model"),
+        "execution_model": "immediate_limit",
         "gate": (env.gate_state if env is not None else None) or live_cfg.get("gate"),
         "live_trading_enabled": bool(live_cfg.get("live_trading_enabled", False)),
         "order_ws": {

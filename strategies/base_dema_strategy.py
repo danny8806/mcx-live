@@ -9,7 +9,7 @@ from strategies.types import (
     SignalType, StrategyState, Signal, PendingEntry, StrategyInput,
     freeze_signal_context,
 )
-from strategies.intent import long_crossover, short_crossover
+from strategies.intent import long_crossover, short_crossover, entry_levels
 from core.timeframe_engine import Bar
 from htf.confirmation import HTFMappedValue
 
@@ -19,7 +19,7 @@ class BaseDEMAStrategy:
     
     Implements:
     - Crossover signal detection
-    - Pending breakout entry
+    - Immediate-limit entry
     - Stop loss management
     - Reversal logic
     
@@ -48,6 +48,8 @@ class BaseDEMAStrategy:
         self.short_compare = short_compare
         self.pending_timeout_bars = pending_timeout_bars
         self.enabled = True
+        self.immediate_limit_sent: Optional[str] = None
+        self.immediate_limit_sent: Optional[str] = None
 
         # State machine
         self.state = StrategyState.FLAT
@@ -306,81 +308,29 @@ class BaseDEMAStrategy:
         prev_low: Optional[float] = None,
         fast_dema_atr: Optional[float] = None,
     ) -> Optional[Signal]:
-        """Detect new entry signal. Arms a pending breakout entry (no immediate order).
-
-        Mirrors the backtest model: the signal bar's high/low becomes the
-        trigger; the entry fills only when a later bar crosses it (direct
-        market entry at the trigger level). Returns None — the engine places
-        no order now.
-        """
+        """Detect a crossover and emit the single immediate-limit entry."""
+        if self.immediate_limit_sent is not None:
+            return None
         if self._check_long_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val):
-            self._create_pending_signal("LONG", close, high, low, timestamp, prev_high, prev_low,
-                                        htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
-                                        candle_open=None, candle_close=close, candle_high=high, candle_low=low)
+            return self._create_entry_signal(
+                "LONG", close, high, low, timestamp, prev_high, prev_low,
+                htf_val=htf_val, mid_val=mid_val,
+                fast_dema_atr=fast_dema_atr)
         elif self._check_short_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val):
-            self._create_pending_signal("SHORT", close, high, low, timestamp, prev_high, prev_low,
-                                        htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
-                                        candle_open=None, candle_close=close, candle_high=high, candle_low=low)
+            return self._create_entry_signal(
+                "SHORT", close, high, low, timestamp, prev_high, prev_low,
+                htf_val=htf_val, mid_val=mid_val,
+                fast_dema_atr=fast_dema_atr)
         return None
 
     def _create_entry_signal(
         self, side: str, close: float, high: float, low: float, timestamp: float,
         prev_high: Optional[float] = None, prev_low: Optional[float] = None,
-    ) -> Signal:
-        """Create a DIRECT MARKET entry signal at the signal-bar close.
-
-        Execution model: no limit/trigger-breakout gating. When the crossover
-        fires, the engine buys/sells immediately at market (live LTP). The
-        strategy records the new position and its stop without leaving a
-        dangling pending entry, so subsequent reversals / stops stay live.
-        """
-        if side == "LONG":
-            stop = min(low, prev_low if prev_low is not None else low)
-        else:
-            stop = max(high, prev_high if prev_high is not None else high)
-
-        signal = Signal(
-            signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,
-            instrument=self.instrument,
-            strategy_id=self.strategy_id,
-            timestamp=timestamp,
-            trigger_price=close,
-            stop_price=stop,
-            quantity=self.quantity,
-            side=side,
-            metadata={"entry_price": close, "executed": True, "market": True},
-        )
-
-        self.stop_price = stop
-        self.just_entered = True
-        # Dhan-linked: state = ENTRY_TRIGGERED, NOT LONG/SHORT_POSITION.
-        # position_side is NOT set here — only set by the engine on Dhan
-        # fill confirmation.  On rejection the poller resets to FLAT.
-        self.state = StrategyState.ENTRY_TRIGGERED
-        self.pending_entry = None
-
-        self._emit("ENTRY_EXECUTED", side=side, price=close, stop=stop)
-        return signal
-
-    def _create_pending_signal(
-        self, side: str, close: float, high: float, low: float, timestamp: float,
-        prev_high: Optional[float] = None, prev_low: Optional[float] = None,
         htf_val: Optional[float] = None, mid_val: Optional[float] = None,
         fast_dema_atr: Optional[float] = None,
-        candle_open: Optional[float] = None, candle_close: Optional[float] = None,
-        candle_high: Optional[float] = None, candle_low: Optional[float] = None,
     ) -> Signal:
-        """Create a pending entry signal."""
-        if side == "LONG":
-            trigger = high
-            sl_high = prev_high if prev_high is not None else high
-            sl_low = prev_low if prev_low is not None else low
-            stop = min(low, sl_low)
-        else:
-            trigger = low
-            sl_high = prev_high if prev_high is not None else high
-            sl_low = prev_low if prev_low is not None else low
-            stop = max(high, sl_high)
+        """Create the immediate-limit intent at the signal candle's level."""
+        trigger, stop = entry_levels(side, high, low, prev_high, prev_low)
 
         signal = Signal(
             signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,
@@ -390,30 +340,36 @@ class BaseDEMAStrategy:
             trigger_price=trigger,
             stop_price=stop,
             quantity=self.quantity,
-        )
-        signal.metadata = {
-            "signal_candle_start": timestamp,
-            "signal_candle_open": candle_open,
-            "signal_candle_high": candle_high if candle_high is not None else high,
-            "signal_candle_low": candle_low if candle_low is not None else low,
-            "signal_candle_close": candle_close if candle_close is not None else close,
-            "signal_htf_dema_atr": htf_val,
-            "signal_mid_dema_atr": mid_val,
-            "signal_fast_dema_atr": fast_dema_atr,
-            "signal_side": side,
-        }
-
-        self.pending_entry = PendingEntry(
-            signal=signal,
-            trigger_price=trigger,
             side=side,
-            created_at=time.time(),
+            metadata={
+                "pending": False,
+                "triggered": True,
+                "immediate_limit": True,
+                "entry_price": close,
+                "trigger_level": trigger,
+                "signal_candle_start": timestamp,
+                "signal_candle_high": high,
+                "signal_candle_low": low,
+                "signal_candle_close": close,
+                "signal_htf_dema_atr": htf_val,
+                "signal_mid_dema_atr": mid_val,
+                "signal_fast_dema_atr": fast_dema_atr,
+            },
         )
-        self._last_armed_pending_id = signal.signal_id
-        self.state = StrategyState.PENDING_LONG if side == "LONG" else StrategyState.PENDING_SHORT
 
-        self._emit("PENDING_ENTRY_CREATED", side=side, trigger=trigger, stop=stop)
+        freeze_signal_context(
+            signal, close=close, high=high, low=low, timestamp=timestamp,
+            dema=fast_dema_atr, position_side=self.position_side,
+            position_stop=self.stop_price,
+        )
+        self.stop_price = stop
+        self.state = StrategyState.ENTRY_TRIGGERED
+        self.pending_entry = None
+        self.immediate_limit_sent = side
+
+        self._emit("ENTRY_ORDER_CREATED", side=side, trigger=trigger, stop=stop)
         return signal
+
 
     def _create_reversal_signal(
         self, side: str, close: float, high: float, low: float, timestamp: float,
@@ -528,9 +484,7 @@ class BaseDEMAStrategy:
         triggered = False
 
         if getattr(pen, "immediate", False):
-            # Direct-market re-entry that survived to the next bar (rare: the
-            # engine normally consumes it in the same bar as the reversal
-            # exit). Fire it immediately instead of waiting for a breakout.
+            # Reversal entry whose old position was already confirmed flat.
             triggered = True
         elif pen.side == "LONG" and bar.high > pen.trigger_price:
             triggered = True
@@ -538,16 +492,15 @@ class BaseDEMAStrategy:
             triggered = True
 
         if triggered:
-            # Entry fills at the pending TRIGGER LEVEL (direct market entry on
-            # the high/low crossing), matching the live placement model.  The
-            # backtest fills this same cross at the crossing bar's open; only
-            # the entry price level differs.
+            # Once the reversal trigger crosses, emit the same immediate-limit
+            # order intent used by ordinary entries.
             fill_px = pen.trigger_price
             base_md = dict(pen.signal.metadata or {})
             entry_md = dict(base_md)
             entry_md.update({
-                "entry_price": fill_px, "fill_price": fill_px, "executed": True,
-                "source": "breakout",
+                "pending": False, "triggered": True, "immediate_limit": True,
+                "entry_price": fill_px, "trigger_level": fill_px,
+                "source": "reversal_trigger",
                 "placement_candle_start": bar.start_ts,
             })
             signal = Signal(
@@ -569,7 +522,9 @@ class BaseDEMAStrategy:
             self.state = StrategyState.ENTRY_TRIGGERED
             self.pending_entry = None
 
-            self._emit("ENTRY_EXECUTED", side=pen.side, price=fill_px, stop=self.stop_price)
+            self.immediate_limit_sent = pen.side
+            self._emit("ENTRY_ORDER_CREATED", side=pen.side,
+                       trigger=fill_px, stop=self.stop_price)
             return signal
 
         return None

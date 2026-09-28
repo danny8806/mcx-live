@@ -243,7 +243,8 @@ def install_crossover_loggers(engine) -> None:
                                fast_dema_atr=fast_dema_atr, **kws)
             return wrapped
 
-        strategy._create_pending_signal = wrap_creator(strategy._create_pending_signal)
+        strategy._create_immediate_limit_signal = wrap_creator(
+            strategy._create_immediate_limit_signal)
         strategy._create_reversal_signal = wrap_creator(strategy._create_reversal_signal)
 
     for sid in SIDS:

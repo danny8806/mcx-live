@@ -29,7 +29,6 @@ def create_silver_5m(strategy_id: str = "silver_02", instrument: str = "SILVERM"
         quantity=kwargs.get("quantity", 1),
         capital=kwargs.get("capital", 300_000.0),
         multiplier=kwargs.get("multiplier", 5.0),
-        execution_model=kwargs.get("execution_model", "pending_breakout"),
     )
 
 
@@ -45,7 +44,6 @@ def create_silver_15m(strategy_id: str = "silver_01", instrument: str = "SILVERM
         quantity=kwargs.get("quantity", 1),
         capital=kwargs.get("capital", 300_000.0),
         multiplier=kwargs.get("multiplier", 5.0),
-        execution_model=kwargs.get("execution_model", "pending_breakout"),
     )
 
 

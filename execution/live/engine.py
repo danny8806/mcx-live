@@ -24,7 +24,7 @@ from execution.broker_router import BrokerEventRouter
 from execution.live.broker_client import BrokerGateClosed, LiveBrokerClient
 from execution.models import Fill, Order, OrderState
 from execution.price_model import (
-    ExecutionPricePlan, PricePreset, _stop_limit_legs,
+    ExecutionPricePlan, PricePreset,
     calculate_long_sl_price, calculate_short_sl_price,
 )
 from strategies.types import Signal, SignalType, resolve_order_role
@@ -61,10 +61,10 @@ class LiveExecutionEngine:
         # broker_fill_id -> engine fill_id (idempotency / reconcile map)
         self._broker_fill_map: dict[str, str] = {}
         self.broker_router: Optional[BrokerEventRouter] = None
-        # Phase 3 — LIVE-only offset/LIMIT price model. None keeps the legacy
-        # MARKET execution exactly as before (default). set -> entries become
-        # LIMIT at trigger+/-entry_offset, SL exits plan an SLM trigger.
-        self._price_preset: Optional[PricePreset] = price_preset
+        # One LIVE execution plan is always active. No preset means zero
+        # offsets on the standard instrument tick grid, never a MARKET-mode
+        # fallback for ordinary entries.
+        self._price_preset = price_preset or PricePreset()
         self._plans: dict[str, ExecutionPricePlan] = {}
         # §9.5 — price plans are IMMUTABLE PER SIGNAL: the plan computed for a
         # signal_id is stored once and every recompute must equal it exactly.
@@ -72,8 +72,7 @@ class LiveExecutionEngine:
         # Tick grid used to derive the mandatory minimum separation between the
         # LIMIT and TRIGGER legs of STOP_LOSS orders (Dhan DH-906); defaults to
         # 1.0 and is refined by the PricePreset when one is configured.
-        self._tick_size = (float(price_preset.tick_size)
-                           if price_preset is not None else 1.0)
+        self._tick_size = float(self._price_preset.tick_size)
         # Installed by TradingEngine. This is the single LIVE submission
         # boundary used by normal orders, recovery orders, and protection.
         self.submission_guard = None
@@ -131,9 +130,8 @@ class LiveExecutionEngine:
         # signal -> order -> broker -> status -> fill carrier is stable and the
         # same id ends up in WS/REST records and the persisted order row.
         order.correlation_id = f"MCX-{uuid.uuid4().hex[:12]}"
-        # Phase 3 — LIVE-only execution pricing (entries LIMIT @ offset-adjusted
-        # trigger; SL exits plan SLM trigger; reversal exits MARKET). PAPER is
-        # untouched: only this LIVE engine consults the price preset.
+        # LIVE uses one immediate-limit entry plan plus system-triggered exits.
+        # PAPER is untouched: only this LIVE engine consults the price preset.
         if self._price_preset is not None:
             plan = self._price_preset.plan_for(signal, order_side)
             # §9.5 — immutability: the first plan for a signal_id is canonical;
@@ -141,8 +139,8 @@ class LiveExecutionEngine:
             # C3 — the plan is keyed by (signal_id, role), NOT signal_id alone:
             # a reversal intentionally reuses ONE signal_id for the old trade's
             # exit leg and the new opposite-side entry leg, and those two legs
-            # legitimately carry different plans (LIMIT/system_exit vs
-            # STOP_LOSS/long_entry).  Immutability is preserved per-leg.
+            # legitimately carry different plans (system exit vs.
+            # immediate-limit entry). Immutability is preserved per-leg.
             plan_key = (signal.signal_id, order.order_role)
             prior = self._plan_by_signal.get(plan_key)
             if prior is not None and prior != plan:
@@ -155,12 +153,7 @@ class LiveExecutionEngine:
             order.trigger_price = plan.trigger_price
             order.requested_price = plan.price
             order.planned_order_type = plan.order_type
-            # For a broker-side STOP_LOSS entry the STRATEGY-trigger level is
-            # the stop's trigger leg (the breakout level the watcher monitors);
-            # the LIMIT leg is the guaranteed fill price and stays on `price`.
-            order.planned_entry_price = (plan.trigger_price
-                                         if plan.order_type == "STOP_LOSS"
-                                         else plan.price)
+            order.planned_entry_price = plan.price
             if plan.order_type == "STOP_LOSS_MARKET":
                 order.planned_sl = plan.trigger_price
             elif plan.kind == "long_entry":

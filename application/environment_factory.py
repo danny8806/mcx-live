@@ -312,10 +312,6 @@ class EnvironmentFactoryMixin:
 
             instrument = strat_config.get("instrument", "GOLDM")
             inst_cfg = instruments_config.get(instrument, {})
-            if env.is_live and (self.config.get("live") or {}).get("execution_model") == "immediate_limit":
-                exec_model = "immediate_limit"
-            else:
-                exec_model = "pending_breakout"
             strategy = factory(
                 strategy_id=strat_name,
                 instrument=instrument,
@@ -323,7 +319,6 @@ class EnvironmentFactoryMixin:
                 capital=strat_config.get("capital", 300_000.0),
                 multiplier=inst_cfg.get("multiplier", 10.0),
                 security_id=str(inst_cfg.get("security_id", "") or ""),
-                execution_model=exec_model,
             )
             strategy.reversal_entry_gap_points = int(
                 ((self.config.get("live") or {}).get("reversal") or {}).get("entry_gap_points", 0))
@@ -392,18 +387,8 @@ class EnvironmentFactoryMixin:
         env.broker_router = BrokerEventRouter(persistence=None)
         env.execution_engine.broker_router = env.broker_router
     def _build_price_preset(self, live_cfg: dict):
-        """Resolve the Phase-3 LIVE price model from ``live.price_model``.
-
-        Disabled (default) returns None -> LIVE keeps the legacy MARKET
-        behavior exactly as before.  Enabled offsets the broker-side STOP_LOSS
-        trigger by entry_offset/high+ and low- and plans protective SL exits at
-        sl_offset-adjusted stops, both as STOP_LOSS stop-limits on the
-        instrument tick grid (Dhan DH-906: BUY limit>trigger, SELL limit<trigger).
-        PAPER never consults this knob.
-        """
+        """Build the one LIVE limit plan, using zero offsets by default."""
         pm = live_cfg.get("price_model") or {}
-        if not bool(pm.get("enabled", False)):
-            return None
         from execution.price_model import PricePreset
         tick_size = float(pm.get("tick_size") or 1.0)
         if tick_size <= 0:

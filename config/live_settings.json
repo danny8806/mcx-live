@@ -162,7 +162,6 @@
     "live_trading_enabled": true,
     "gate": "ON",
     "broker": "dhan",
-    "execution_model": "immediate_limit",
     "reconcile_interval_seconds": 5,
     "order_poll_interval_seconds": 2,
     "position_poll_interval_seconds": 5,
@@ -180,7 +179,6 @@
       "product_type": "MARGIN"
     },
     "price_model": {
-      "enabled": true,
       "entry_offset": 0.0,
       "sl_offset": 0.0,
       "tick_size": 1.0

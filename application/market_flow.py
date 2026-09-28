@@ -45,7 +45,7 @@ class MarketEventFlowMixin:
         return handler
     def _make_tick_handler(self, strategy: StrategyInstance, env_name: str = "paper"):
         def handler(event):
-            if not self._running or not self.tick_signal_processing:
+            if not self._running:
                 return
             if strategy.instrument != event.instrument:
                 return
