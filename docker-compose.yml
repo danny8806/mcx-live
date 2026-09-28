@@ -1,0 +1,73 @@
+# LIVE-MCX — single real-broker gateway behind nginx (no demo/paper services).
+#
+#   nginx     single ingress (TLS + WebSockets), publishes 80/443 only
+#   live-mcx  real-broker gateway (live.run, live/data/db, port 8001)
+#
+# Only nginx publishes ports.  live-mcx keeps its own DB volume and env file.
+# Generate env files with:  python scripts/gen_service_envs.py
+# TLS certs must exist before nginx starts: ./nginx/certs/live.crt + live.key
+name: live-only
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    container_name: live-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/certs:/etc/nginx/certs:ro
+    networks:
+      - trading_backend
+    depends_on:
+      live-mcx:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pidof nginx >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M }
+        reservations: { memory: 16M }
+
+  live-mcx:
+    build:
+      context: .
+      dockerfile: services/live-mcx/Dockerfile
+    container_name: live-mcx
+    env_file:
+      - .env.live
+    volumes:
+      - live_db:/app/live/data/db
+      - live_mcx_logs:/app/logs/live-mcx
+    networks:
+      - trading_backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    init: true
+    stop_grace_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 768M }
+        reservations: { memory: 256M }
+
+networks:
+  trading_backend:
+    driver: bridge
+
+volumes:
+  live_db:
+    name: live_mcx_db
+  live_mcx_logs:
+    name: live_mcx_logs

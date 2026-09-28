@@ -1,0 +1,21 @@
+{
+  "phase": "BEFORE",
+  "timestamp": 0,
+  "note": "Reconstructed from Phase 1b first run (pre-optimization); original artifact overwritten by a pre-flag run.",
+  "runner": "tools/benchmark_latency.py",
+  "host": "local",
+  "benches": [
+    {"bench": "trigger_scan_pending", "N": 2000, "mean_us": 0.2, "median_us": 0.2, "p50_us": 0.2, "p95_us": 0.2, "p99_us": 0.2, "max_us": 0.7},
+    {"bench": "trigger_scan_sl", "N": 2000, "mean_us": 0.2, "median_us": 0.2, "p50_us": 0.2, "p95_us": 0.3, "p99_us": 0.3, "max_us": 1.8},
+    {"bench": "trigger_fire_entry", "N": 2000, "mean_us": 1.9, "median_us": 1.9, "p50_us": 1.9, "p95_us": 2.2, "p99_us": 2.7, "max_us": 5.8},
+    {"bench": "trigger_fire_sl", "N": 2000, "mean_us": 3.4, "median_us": 2.9, "p50_us": 2.9, "p95_us": 4.5, "p99_us": 6.6, "max_us": 114.4},
+    {"bench": "engine_tick_flat", "N": 2000, "mean_us": 4.5, "median_us": 4.5, "p50_us": 4.5, "p95_us": 4.8, "p99_us": 5.3, "max_us": 12.4},
+    {"bench": "engine_tick_armed_pending", "N": 2000, "mean_us": 4.6, "median_us": 4.6, "p50_us": 4.6, "p95_us": 4.9, "p99_us": 5.6, "max_us": 8.7},
+    {"bench": "engine_tick_armed_sl", "N": 2000, "mean_us": 5.0, "median_us": 4.7, "p50_us": 4.7, "p95_us": 5.5, "p99_us": 6.8, "max_us": 53.4},
+    {"bench": "process_signal_entry_gold_01", "N": 2000, "mean_us": 5400.0, "median_us": 5084.8, "p50_us": 5084.8, "p95_us": 12923.0, "p99_us": 18027.1, "max_us": 26698.9},
+    {"bench": "process_signal_entry_silver_01", "N": 2000, "mean_us": 18000.0, "median_us": 17725.5, "p50_us": 17725.5, "p95_us": 24906.3, "p99_us": 39416.3, "max_us": 60105.8},
+    {"bench": "watcher_feed_market", "N": 2000, "mean_us": 0.4, "median_us": 0.4, "p50_us": 0.4, "p95_us": 0.5, "p99_us": 0.6, "max_us": 5.3},
+    {"bench": "watcher_scan_wait", "N": 2000, "mean_us": 1.4, "median_us": 1.3, "p50_us": 1.3, "p95_us": 1.6, "p99_us": 2.1, "max_us": 39.8},
+    {"bench": "eventbus_tick_dispatch", "N": 2000, "mean_us": 1.3, "median_us": 1.2, "p50_us": 1.2, "p95_us": 1.5, "p99_us": 2.0, "max_us": 6.0}
+  ]
+}

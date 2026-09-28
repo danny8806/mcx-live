@@ -1,0 +1,30 @@
+{
+  "phase": "AFTER",
+  "generated": "2026-09-26",
+  "optimizations": [
+    "persistence/database.py:_db_key — memoized resolved DB path (Path.resolve/realpath syscall per transaction removed)",
+    "notifications/telegram_router.py — signal alerts (on_signal) deferred to a bounded single-writer async worker; ledger write + send off the order-submission path; full-queue falls back inline (never dropped); stop() drains",
+    "events/bus.py — per-publish wildcard scan restricted to a maintained wildcard-only index (exact-match tick publishes skip the full-topic scan); subscribe/unsubscribe keep the index in registration order"
+  ],
+  "local_engine_us": {
+    "process_signal_entry_gold_01": {"p50_us": 2531.6, "p95_us": 10029.7, "p99_us": 15434.9, "max_us": 30824.3},
+    "process_signal_entry_silver_01": {"p50_us": 16920.1, "p95_us": 26056.3, "p99_us": 37128.3, "max_us": 57066.1},
+    "eventbus_tick_dispatch": {"p50_us": 0.2, "p95_us": 0.3, "p99_us": 0.3, "max_us": 0.4},
+    "engine_tick_flat": {"p50_us": 3.0, "p95_us": 3.6, "p99_us": 4.5, "max_us": 9.5},
+    "engine_tick_armed_pending": {"p50_us": 3.2, "p95_us": 3.7, "p99_us": 5.2, "max_us": 77.7},
+    "engine_tick_armed_sl": {"p50_us": 3.2, "p95_us": 3.5, "p99_us": 4.2, "max_us": 15.4}
+  },
+  "deltas": {
+    "process_signal_entry_gold_01_p50": "5084.8 -> 2531.6 us (2.0x faster)",
+    "eventbus_tick_dispatch_p50": "1.2 -> 0.2 us (6.0x faster)",
+    "engine_tick_p50": "4.5 -> 3.0 us (1.5x faster)",
+    "process_signal_entry_silver_01_p50": "17725.5 -> 16920.1 us (1.05x faster; bench artifact - silver runs after 2000 gold iterations on a growing trades table)"
+  },
+  "notes": [
+    "silver_01 remains DB-write bound at scale: it benches the second half of 4000 total signals so its trades tables are ~2x larger (index maintenance, WAL). p99 delta 39416 -> 37128 us.",
+    "gold_01 p95/p99 (10.0/15.4 ms) are occasional DB flush/fsync iterations, not steady-state; p50 clean at 2.53 ms.",
+    "REST transport already reuses requests.Session (keep-alive) - no per-order DNS/TCP/TLS; the ~285ms order POST is Dhan server + network RTT, unaffected by local work.",
+    "async signal alerts: alert ledger row is now written on the emit worker; order/trade/signal/event durable stores remain synchronous (safety untouched).",
+    "full regression (fresh_audit suite) is next - must stay green."
+  ]
+}

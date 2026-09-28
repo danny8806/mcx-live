@@ -1,0 +1,104 @@
+{
+  "raw_ceiling_tps": 141909.3,
+  "raw_per_tick": {
+    "N": 20000,
+    "mean_us": 6.867,
+    "p50_us": 5.918,
+    "p95_us": 15.772,
+    "p99_us": 22.152,
+    "max_us": 828.012
+  },
+  "paced": {
+    "100": {
+      "sent": 5000,
+      "arrived": 5000,
+      "wall_s": 50.0,
+      "expected_s": 50.0,
+      "observed_avg_ms": 10.0
+    },
+    "500": {
+      "sent": 5000,
+      "arrived": 5000,
+      "wall_s": 10.072,
+      "expected_s": 10.0,
+      "observed_avg_ms": 2.014
+    },
+    "1000": {
+      "sent": 5000,
+      "arrived": 5000,
+      "wall_s": 5.051,
+      "expected_s": 5.0,
+      "observed_avg_ms": 1.01
+    },
+    "5000": {
+      "sent": 5000,
+      "arrived": 5000,
+      "wall_s": 1.133,
+      "expected_s": 1.0,
+      "observed_avg_ms": 0.227
+    }
+  },
+  "sustained": {
+    "ticks": 60000,
+    "wall_s": 0.37,
+    "tps": 161397.5,
+    "rss_first_kb": 62772,
+    "rss_last_kb": 62776,
+    "rss_delta_kb": 4,
+    "rss_samples": [
+      {
+        "at": 0,
+        "rss_kb": 62772
+      },
+      {
+        "at": 5000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 10000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 15000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 20000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 25000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 30000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 35000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 40000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 45000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 50000,
+        "rss_kb": 62776
+      },
+      {
+        "at": 55000,
+        "rss_kb": 62776
+      }
+    ],
+    "threads_before": 1,
+    "threads_after": 1
+  },
+  "orders_created": 0,
+  "python": "3.11.16",
+  "host_epyc": true
+}

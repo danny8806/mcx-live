@@ -1,0 +1,42 @@
+﻿import paramiko, sys, io, json, datetime
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+env = {}
+for line in open("mcx-trader.env"):
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        k, v = line.split("=", 1)
+        env[k] = v
+ssh = paramiko.SSHClient()
+ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh.connect("200.234.44.93", username="root", password=env["VPS_PASS"], timeout=15)
+def run(cmd, timeout=45):
+    _, o, e = ssh.exec_command(cmd, timeout=timeout)
+    try:
+        out = o.read().decode("utf-8", "replace").strip()
+    except Exception:
+        out = ""
+    return out.encode("ascii", "replace").decode("ascii")
+print("=== VPS time / container status ===")
+print(run("date; docker ps --filter name=mcx-live --format '{{.Names}} {{.Status}}'"))
+print("=== health ===")
+print(run("curl -s http://127.0.0.1:8001/api/live/health 2>/dev/null | head -c 700"))
+print()
+print("=== strategies live ===")
+print(run("curl -s http://127.0.0.1:8001/api/strategies 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(s['strategy_id'],'state=',s['state'],'bars=',s['bars_processed'],'trades=',s['trade_count'],'pend=',s.get('pending_entry')) for s in d['strategies']]\" 2>&1"))
+print("=== snap counters ===")
+print(run("""docker exec mcx-live python3 -c "
+import json
+d = json.load(open('/app/live/data/db/live_system_state.json'))
+for sid, s in d.get('strategies', {}).items():
+    if s.get('enabled'):
+        g = d.get('strategy_gates', {}).get(sid, {})
+        print(sid, 'state=', s.get('state'), 'bars=', s.get('bars_processed'), 'sig=', s.get('signals_generated'), 'gate=', g.get('live_gate'), 'close_only=', g.get('close_only'))
+" 2>&1"""))
+print("=== signals / orders / positions ===")
+print(run("curl -s http://127.0.0.1:8001/api/live/signals 2>/dev/null | head -c 300"))
+print()
+print(run("curl -s http://127.0.0.1:8001/api/live/orders 2>/dev/null | head -c 200"))
+print()
+print(run("curl -s http://127.0.0.1:8001/api/live/positions 2>/dev/null | head -c 300"))
+print()
+ssh.close()

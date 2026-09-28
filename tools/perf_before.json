@@ -1,0 +1,44 @@
+{
+  "phase": "BEFORE",
+  "generated": "2026-09-26",
+  "local_engine_us": {
+    "trigger_scan_pending": {"p50_us": 0.2, "p95_us": 0.2, "p99_us": 0.2, "max_us": 0.7},
+    "trigger_scan_sl": {"p50_us": 0.2, "p95_us": 0.3, "p99_us": 0.3, "max_us": 1.8},
+    "trigger_fire_entry": {"p50_us": 1.9, "p95_us": 2.2, "p99_us": 2.7, "max_us": 5.8},
+    "trigger_fire_sl": {"p50_us": 2.9, "p95_us": 4.5, "p99_us": 6.6, "max_us": 114.4},
+    "engine_tick_flat": {"p50_us": 4.5, "p95_us": 4.8, "p99_us": 5.3, "max_us": 12.4},
+    "engine_tick_armed_pending": {"p50_us": 4.6, "p95_us": 4.9, "p99_us": 5.6, "max_us": 8.7},
+    "engine_tick_armed_sl": {"p50_us": 4.7, "p95_us": 5.5, "p99_us": 6.8, "max_us": 53.4},
+    "process_signal_entry_gold_01": {"p50_us": 5084.8, "p95_us": 12923.0, "p99_us": 18027.1, "max_us": 26698.9},
+    "process_signal_entry_silver_01": {"p50_us": 17725.5, "p95_us": 24906.3, "p99_us": 39416.3, "max_us": 60105.8},
+    "watcher_feed_market": {"p50_us": 0.4, "p95_us": 0.5, "p99_us": 0.6, "max_us": 5.3},
+    "watcher_scan_wait": {"p50_us": 1.3, "p95_us": 1.6, "p99_us": 2.1, "max_us": 39.8},
+    "eventbus_tick_dispatch": {"p50_us": 1.2, "p95_us": 1.5, "p99_us": 2.0, "max_us": 6.0}
+  },
+  "vps_to_dhan_ms": {
+    "dns_resolve": {"p50_ms": 0.48, "p95_ms": 0.93, "p99_ms": 0.96, "max_ms": 0.97},
+    "tcp_connect_orders_api": {"p50_ms": 2.48, "p95_ms": 2.84, "p99_ms": 3.02, "max_ms": 3.06},
+    "tcp_connect_market_ws": {"p50_ms": 3.24, "p95_ms": 3.55, "p99_ms": 3.55, "max_ms": 3.55},
+    "tcp_connect_order_ws": {"p50_ms": 3.79, "p95_ms": 4.05, "p99_ms": 4.05, "max_ms": 4.05},
+    "tls_handshake_rest": {"p50_ms": 5.07, "p95_ms": 5.68, "p99_ms": 5.69, "max_ms": 5.70},
+    "tls_handshake_market_ws": {"p50_ms": 4.42, "p95_ms": 4.70, "p99_ms": 4.70, "max_ms": 4.70},
+    "tls_handshake_order_ws": {"p50_ms": 5.32, "p95_ms": 6.22, "p99_ms": 6.29, "max_ms": 6.31},
+    "http_get_orders": {"p50_ms": 285.2, "p95_ms": 289.0, "p99_ms": 289.0, "max_ms": 289.0, "mean_ms": 229.7}
+  },
+  "estimated_end_to_end_ms": {
+    "ws_tick_to_decision": {"p50_ms": 0.005, "note": "engine _on_tick e2e 4.6us + watcher feed 0.4us"},
+    "signal_to_order_submit_local": {"p50_ms": 5.1, "p95_ms": 12.9, "p99_ms": 18.0},
+    "http_post_orders": {"p50_ms": 285.2, "note": "proxy: measured on GET /orders"},
+    "total_trigger_to_broker_ack_p50_ms": 290.3,
+    "total_trigger_to_broker_ack_p99_ms": 303.2
+  },
+  "notes": [
+    "local process_signal bench alternates LONG/SHORT -> exercises reversal+entry+exit lifecycle incl DB persistence; p99 dominated by DB writes.",
+    "silver_01 slower than gold_01 (runs later, larger DB/trade tables -> slower inserts).",
+    "GET /orders used as HTTP-order-endpoint proxy (order POST ~ same path; could not measure POST without placing an order).",
+    "marketfeed/quote POST probe hit 401 + local rate-limit -> account briefly throttled; NOT re-run; app circuit-gate is fail-open so unaffected.",
+    "token renewal path broken: totp_secret yields 'Non-base32 digit found' (config issue only if token expires).",
+    "in-app WS cadence: market CLOSED (Saturday) -> 0 ticks in 20s window; adapter ws.tick frozen at 13867. Deferred to a live session.",
+    "cadence sub-window uses api-feed.dhan.co / api-order-update.dhan.co connect tiers as WS-connect proxy."
+  ]
+}

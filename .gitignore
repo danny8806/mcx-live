@@ -1,0 +1,161 @@
+# Runtime files (in data/ volume — persisted via Docker -v mount)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/system_state.json
+data/dhan_token.json
+data/db/*.db
+data/db/*.db-shm
+data/db/*.db-wal
+data/db/system_state.json
+data/db/dhan_token.json
+*.db
+*.db-shm
+*.db-wal
+system_state.json
+dhan_token.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Pytest cache
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Logs
+*.log
+
+# Runtime credentials (never commit)
+*.env
+*.env.live
+.env
+.env.live
+mcx-trader.env
+
+# Resolved live config (generated on deploy with real secrets — never commit)
+config/live_settings.resolved.json
+
+# Temp
+*.tmp
+*.bak
+
+# CSV files (result/data/market data — never commit)
+*.csv
+
+# Generated result directories
+replay_input/
+replay_output/
+_BACKTEST_VS_LIVE_AUDIT/
+_DEEP_AUDIT_LIVE_VS_BT_2026-08-30/
+_FINAL_AUDIT/
+_SIGNAL_CANDLE_AUDIT_2026-09-01/
+_TRADE_LIFECYCLE_AUDIT/
+reports/final_forensic/
+tests/live_runtime_v2/reports/
+
+# Generated data files
+test_results.json
+reverse_engineering_results.json
+_bt5_backtest_out.txt
+_bt6_backtest_out.txt
+
+# Large generated docs (audit output)
+_audit_5day.py
+_audit_artifacts.py
+_audit_auth_gate.py
+_audit_pass2.py
+_bt5_backtest.py
+_bt5_offline.py
+_build_local_prod_db.py
+_check_db.py
+_check_vps.py
+_deploy_heal_fix.py
+_deploy_heal_pnl_fix.py
+_diag.py
+_diag2.py
+_diag3.py
+_frontend_deep_check.py
+_fullstack_check.py
+_inspect_db.py
+_live_e2e_test.py
+_live_flow_check.py
+_live_sl.py
+_p1_continuity_test.py
+_p1_lib.py
+_p1_lifecycle_test.py
+_p1_map4_test.py
+_p1_parity_test.py
+_p1_regression_test.py
+_p1_resample_test.py
+_p1_restart_test.py
+_p1_run_all.py
+_p1_signal4_test.py
+_p1_warmup_test.py
+_p2_reversal_e2e_test.py
+_p3_carry_e2e_test.py
+_p4_full_flow_e2e_test.py
+_parity_ref.py
+_parity_replay.py
+_rebuild_prod_db.py
+_replay.py
+_server_deep_audit.py
+_step1_data_check.py
+_step2_15m_check.py
+_step3_1h_check.py
+_step4_dema_check.py
+_step5_htf_check.py
+_step6_warmup_alignment_check.py
+_test_api.py
+_test_telegram_trades.py
+_test_ws_ticks.py
+_validate_compare.py
+_verify_fix.py
+_ws_check.py
+audit_signal_candles.py
+check_chats.py
+check_container.py
+compare_replay_trades.py
+compare_yesterday_signals.py
+deploy_restart.py
+deploy_vps.py
+fix_analytics.py
+fix_safe_mode.py
+full_simulator.py
+live_test_err.log
+live_test.log
+seed_replay.py
+tmp_check.py
+verify_deploy.py
+verify_live_signals.py
+verify_vps.py
+
+# DB
+trading.db
+trading.db-shm
+trading.db-wal
+
+# Archive (large legacy output)
+archive/
+
+# Docker runtime volumes
+data/
+
+# Three-service platform: runtime log mounts + TLS certs (never commit)
+logs/
+nginx/certs/
