@@ -17,13 +17,14 @@ export default function LiveTrading() {
   const goldStrats = strategies.filter((s: any) => s.instrument === "GOLDM");
   const silverStrats = strategies.filter((s: any) => s.instrument === "SILVERM");
 
-  // Collect all pending entries from strategies
+  // Show the next live trigger: reversal exits first, then the opposite entry.
   const pendingEntries = strategies
-    .filter((s: any) => s.pending_entry)
+    .filter((s: any) => s.pending_exit_trigger || s.pending_entry)
     .map((s: any) => ({
       strategy_id: s.strategy_id,
       instrument: s.instrument,
-      ...s.pending_entry,
+      ltp: s.instrument === "GOLDM" ? (goldOverview?.ltp ?? 0) : (silverOverview?.ltp ?? 0),
+      ...(s.pending_exit_trigger || s.pending_entry),
     }));
 
   return (
@@ -92,6 +93,8 @@ export default function LiveTrading() {
         ) : (
           pendingEntries.map((pe: any) => {
             const isShort = pe.side === "SHORT";
+            const isReversalExit = pe.metadata?.pending_trigger_kind === "REVERSAL_EXIT";
+            const isReversal = Boolean(pe.metadata?.is_reversal_entry || isReversalExit);
             const exitAction = isShort ? "SELL (Exit Long)" : "BUY (Exit Short)";
             const enterAction = isShort ? "SELL (Enter Short)" : "BUY (Enter Long)";
             return (
@@ -103,16 +106,19 @@ export default function LiveTrading() {
                     <span style={{ color: "var(--text-primary)", fontWeight: 600, fontSize: "11px" }}>{pe.instrument}</span>
                   </span>
                   <span style={{ color: "var(--text-muted)", fontSize: "10px" }}>{pe.strategy_id}</span>
-                  <span style={{ color: isShort ? "var(--red)" : "var(--green)", fontWeight: 700, fontSize: "11px" }}>{pe.side} REVERSAL</span>
+                  <span style={{ color: isShort ? "var(--red)" : "var(--green)", fontWeight: 700, fontSize: "11px" }}>{pe.side} {isReversal ? "REVERSAL" : "ENTRY"}</span>
                   <span style={{ color: "var(--text-muted)", fontSize: "9px", marginLeft: "auto" }}>Qty: {pe.quantity}</span>
                 </div>
-                {/* Actions on trigger */}
+                {/* The active trigger state and its live market input */}
                 <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "3px 8px", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: "4px", fontSize: "9px", color: "var(--red)" }}>
-                    <span style={{ fontWeight: 600 }}>1.</span> {exitAction} @ ₹{pe.trigger_price?.toLocaleString("en-IN")}
+                  <span style={{ display: "inline-flex", padding: "3px 8px", background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: "4px", fontSize: "9px", color: "var(--amber)" }}>
+                    {isReversalExit ? "REVERSAL EXIT" : isReversal ? "REVERSAL ENTRY" : "ENTRY"} · {pe.trigger_state ?? "ARMED"}
                   </span>
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", padding: "3px 8px", background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.3)", borderRadius: "4px", fontSize: "9px", color: "var(--green)" }}>
-                    <span style={{ fontWeight: 600 }}>2.</span> {enterAction} @ ₹{pe.trigger_price?.toLocaleString("en-IN")}
+                  <span style={{ display: "inline-flex", padding: "3px 8px", border: "1px solid var(--border-subtle)", borderRadius: "4px", fontSize: "9px", color: "var(--text-secondary)" }}>
+                    LTP {pe.ltp > 0 ? safeINR(pe.ltp) : "—"}
+                  </span>
+                  <span style={{ display: "inline-flex", padding: "3px 8px", border: "1px solid var(--border-subtle)", borderRadius: "4px", fontSize: "9px", color: "var(--text-secondary)" }}>
+                    {isReversalExit ? exitAction : enterAction} when {isShort ? "LTP ≤" : "LTP ≥"} {safeINR(pe.trigger_price)}
                   </span>
                 </div>
                 {/* Signal candle details */}

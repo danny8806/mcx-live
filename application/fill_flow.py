@@ -228,8 +228,8 @@ class FillFlowMixin:
                                   signal_id, exc_info=True)
                 if _stop is None and signal_id:
                     # A broker-confirmed entry fill with no recoverable stop is
-                    # an UNPROTECTED live position: _check_stop_loss() bails on
-                    # `stop_price is None`, so the exit-on-stop path is dead.
+                    # an UNPROTECTED live position: the local tick stop monitor
+                    # has no stop level, so the exit-on-stop path is dead.
                     # Never let that pass silently.
                     log.error("[Engine] entry fill %s has NO stop price "
                               "(planned_sl/strategy/signal all empty) - "
@@ -558,7 +558,7 @@ class FillFlowMixin:
         The pending-breakout model transitions the strategy optimistically
         inside ``_tick_entry_trigger`` before the order is even submitted
         (position_side/state set at trigger-cross).  The Appendix I
-        immediate-limit model does NO strategy state transition at signal
+        local-trigger model does NO strategy state transition at signal
         time — the LIMIT intentionally rests flat at the broker — so the fill
         arriving from the broker is the moment the strategy becomes an open
         position.  This mirror-step is idempotent, so it is safe for both.
@@ -577,7 +577,7 @@ class FillFlowMixin:
             strat.stop_price = position.stop_price
         strat.just_entered = True
         strat.pending_entry = None
-        setattr(strat, "immediate_limit_sent", None)
+        strat.pending_exit_trigger = None
         setattr(strat, "stop_exit_submitted", False)
     def _notify_entry_fill(self, fill, position, env, signal_id: Optional[str]) -> None:
         try:

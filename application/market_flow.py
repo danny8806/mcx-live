@@ -6,7 +6,6 @@ import math
 import time
 from typing import Optional
 
-from core.timeframe_engine import Bar
 from monitoring.health import SystemStatus
 from strategies.instance import StrategyInstance
 
@@ -24,24 +23,11 @@ class MarketEventFlowMixin:
                 self.market_status.mark_rest_data_fresh()
                 self._maybe_enable_trading()
 
-                bar = Bar(
-                    instrument=event.instrument,
-                    timeframe=event.timeframe,
-                    start_ts=event.start_ts,
-                    end_ts=event.end_ts,
-                    open=event.open, high=event.high,
-                    low=event.low, close=event.close,
-                    volume=int(event.volume),
-                )
                 is_fast = (event.timeframe == strategy.fast_timeframe)
                 signal = strategy.on_candle(event)
                 if signal and is_fast:
                     self._bind_signal_position(signal, strategy, env_name)
                     self._process_signal(signal, env_name)
-                    stop2 = strategy._consume_same_bar_stop(bar)
-                    if stop2 is not None:
-                        self._bind_signal_position(stop2, strategy, env_name)
-                        self._process_signal(stop2, env_name)
         return handler
     def _make_tick_handler(self, strategy: StrategyInstance, env_name: str = "paper"):
         def handler(event):

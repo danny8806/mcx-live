@@ -29,6 +29,26 @@ def _strategy_positions_for_risk(signal_type, open_positions) -> int:
 
 
 class SignalFlowMixin:
+    def _preserve_position_after_exit_block(self, signal, env, *, cancel_reversal=False,
+                                            stop_exit_blocked=False) -> None:
+        """Keep exposure and its local SL state when an exit is gated off."""
+        strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
+        if strategy is None or strategy.position_side not in ("LONG", "SHORT"):
+            return
+        if cancel_reversal:
+            strategy._cancel_trigger(getattr(strategy, "pending_exit_trigger", None))
+            strategy._cancel_trigger(getattr(strategy, "pending_entry", None))
+            strategy.pending_exit_trigger = None
+            strategy.pending_entry = None
+            strategy._last_fired_trigger_signal_id = None
+        strategy.state = (StrategyState.LONG_POSITION
+                          if strategy.position_side == "LONG"
+                          else StrategyState.SHORT_POSITION)
+        # Prevent duplicate stop signals while the operator's SL gate is off.
+        # A later explicit lifecycle action can still close the owned position.
+        if stop_exit_blocked:
+            strategy.stop_exit_submitted = True
+
     def _process_signal(self, signal, env_name: Optional[str] = None) -> None:
         """Move one strategy signal through the explicit durable lifecycle.
 
@@ -149,7 +169,14 @@ class SignalFlowMixin:
                 except Exception as e:
                     log.warning("[Engine] cancel_inflight: failed to "
                                 "terminalize pending %s: %s", old_pending_id, e)
-            self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+            keep_current_trigger = bool(
+                strategy is not None
+                and getattr(strategy, "pending_entry", None) is not None
+                and getattr(strategy.pending_entry.signal, "signal_id", None)
+                    == signal.signal_id)
+            self._reset_strategy_state(signal.strategy_id,
+                                       keep_pending=keep_current_trigger,
+                                       env_name=env.name)
             # If this is a cancel-only signal (no new entry intended),
             # skip further processing — no trade/order to create.
             if bool(metadata.get("cancel_only")):
@@ -189,12 +216,14 @@ class SignalFlowMixin:
         if reversal_sig and not gates.reversal_enabled:
             self._publish_gate_block(signal, "reversal_disabled",
                                      {"gate": gates.to_dict()}, env)
-            self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+            self._preserve_position_after_exit_block(
+                signal, env, cancel_reversal=True)
             return
         if reversal_sig and not self._reversal_under_cap(signal):
             self._publish_gate_block(signal, "reversal_daily_cap",
                                      {"gate": gates.to_dict()}, env)
-            self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+            self._preserve_position_after_exit_block(
+                signal, env, cancel_reversal=True)
             return
         if is_exit:
             exit_reason_md = str((metadata or {}).get("exit_reason") or "").lower()
@@ -204,12 +233,13 @@ class SignalFlowMixin:
                 if not gates.sl_enabled:
                     self._publish_gate_block(signal, "sl_disabled",
                                              {"gate": gates.to_dict()}, env)
-                    self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+                    self._preserve_position_after_exit_block(
+                        signal, env, stop_exit_blocked=True)
                     return
             elif not gates.exit_enabled:
                 self._publish_gate_block(signal, "exit_disabled",
                                          {"gate": gates.to_dict()}, env)
-                self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+                self._preserve_position_after_exit_block(signal, env)
                 return
         else:
             # Contract rollover: entries in an EXPIRING series are blocked
@@ -279,7 +309,13 @@ class SignalFlowMixin:
             # PAPER is untouched (strategy memory only, as before). The
             # strategy itself is never modified (read-only for 9.6).
             if env.mode == "LIVE":
-                self._arm_live_pending(signal, env)
+                reversal_entry = metadata.get("reversal_entry_signal")
+                if (metadata.get("pending_trigger_kind") == "REVERSAL_EXIT"
+                        and reversal_entry is not None):
+                    self._persist_signal(reversal_entry, "entry", env.name)
+                    self._arm_live_pending(reversal_entry, env)
+                elif not is_exit:
+                    self._arm_live_pending(signal, env)
             return
 
         # Exits reduce risk and remain available during a safety halt. Entries

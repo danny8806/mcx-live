@@ -363,8 +363,9 @@ class PersistenceManager:
                     planned_order_type, order_role, trigger_price,
                     protected_order_id, correlation_id, lifecycle_id,
                     parent_signal_id, position_id, parent_position_id,
-                    position_generation, original_order_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    position_generation, original_order_id, trigger_state,
+                    trigger_generation, trigger_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     state=excluded.state, filled_quantity=excluded.filled_quantity,
                     average_fill_price=excluded.average_fill_price,
@@ -390,7 +391,10 @@ class PersistenceManager:
                         position_id=COALESCE(excluded.position_id, orders.position_id),
                         parent_position_id=COALESCE(excluded.parent_position_id, orders.parent_position_id),
                         position_generation=COALESCE(excluded.position_generation, orders.position_generation),
-                        original_order_id=COALESCE(excluded.original_order_id, orders.original_order_id)
+                        original_order_id=COALESCE(excluded.original_order_id, orders.original_order_id),
+                        trigger_state=COALESCE(excluded.trigger_state, orders.trigger_state),
+                        trigger_generation=COALESCE(excluded.trigger_generation, orders.trigger_generation),
+                        trigger_source=COALESCE(excluded.trigger_source, orders.trigger_source)
                     """, (
                 order.get("order_id"),
                 order.get("strategy_id"),
@@ -421,6 +425,9 @@ class PersistenceManager:
                 order.get("parent_position_id"),
                 order.get("position_generation"),
                 order.get("original_order_id"),
+                order.get("trigger_state"),
+                order.get("trigger_generation"),
+                order.get("trigger_source"),
             ))
 
     def save_fill(self, fill: dict) -> None:
@@ -603,8 +610,9 @@ class PersistenceManager:
                     pending_order_id, trade_id, signal_id, side, order_type,
                     trigger_price, quantity, status, execution_mode,
                     created_at, updated_at, broker_order_id, correlation_id,
-                    expired_reason, armed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    expired_reason, armed_at, strategy_id, instrument, direction,
+                    trigger_state, trigger_generation, trigger_source, signal_timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(pending_order_id) DO UPDATE SET
                     trade_id=excluded.trade_id,
                     status=excluded.status,
@@ -615,7 +623,14 @@ class PersistenceManager:
                                             pending_orders.correlation_id),
                     expired_reason=COALESCE(excluded.expired_reason,
                                             pending_orders.expired_reason),
-                    armed_at=COALESCE(excluded.armed_at, pending_orders.armed_at)
+                    armed_at=COALESCE(excluded.armed_at, pending_orders.armed_at),
+                    strategy_id=COALESCE(excluded.strategy_id, pending_orders.strategy_id),
+                    instrument=COALESCE(excluded.instrument, pending_orders.instrument),
+                    direction=COALESCE(excluded.direction, pending_orders.direction),
+                    trigger_state=COALESCE(excluded.trigger_state, pending_orders.trigger_state),
+                    trigger_generation=COALESCE(excluded.trigger_generation, pending_orders.trigger_generation),
+                    trigger_source=COALESCE(excluded.trigger_source, pending_orders.trigger_source),
+                    signal_timestamp=COALESCE(excluded.signal_timestamp, pending_orders.signal_timestamp)
             """, (
                 pending.get("pending_order_id"),
                 pending.get("trade_id"),
@@ -632,6 +647,13 @@ class PersistenceManager:
                 pending.get("correlation_id"),
                 pending.get("expired_reason"),
                 pending.get("armed_at"),
+                pending.get("strategy_id"),
+                pending.get("instrument"),
+                pending.get("direction", pending.get("side")),
+                pending.get("trigger_state"),
+                pending.get("trigger_generation"),
+                pending.get("trigger_source"),
+                pending.get("signal_timestamp"),
             ))
 
     def get_pending_orders(

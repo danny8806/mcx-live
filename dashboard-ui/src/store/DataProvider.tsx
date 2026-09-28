@@ -421,6 +421,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
                 position_side: snap.position_side,
                 stop_price: snap.stop_price,
                 pending_entry: snap.pending_entry,
+                pending_exit_trigger: snap.pending_exit_trigger,
                 bars_processed: snap.bars_processed ?? 0,
                 trade_count: snap.trade_count ?? 0,
                 wins: snap.wins ?? 0,

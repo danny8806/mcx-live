@@ -30,12 +30,20 @@ def validate_live_order_ownership(env, order) -> Optional[str]:
     current = next((p for p in positions
                     if p.is_open and p.instrument == order.instrument), None)
     if role in _ENTRY_ROLES:
+        if role == "FALLBACK_MARKET":
+            # A verified fallback may finish a zero/partial-fill entry. With
+            # no fill yet the instrument must still be flat; after a partial
+            # fill it must belong to this exact lifecycle and position.
+            if current is None:
+                if getattr(order, "parent_position_id", None) is not None:
+                    return "FALLBACK_POSITION_MISSING"
+                return None
+            if (current.trade_id == lifecycle_id
+                    and current.position_id == getattr(order, "parent_position_id", None)
+                    and current.position_generation == getattr(order, "position_generation", None)):
+                return None
+            return "ENTRY_BLOCKED_POSITION_NOT_FLAT"
         if current is None:
-            return None
-        if (role == "FALLBACK_MARKET"
-                and current.trade_id == lifecycle_id
-                and current.position_id == getattr(order, "parent_position_id", None)
-                and current.position_generation == getattr(order, "position_generation", None)):
             return None
         return "ENTRY_BLOCKED_POSITION_NOT_FLAT"
     if role not in _EXIT_ROLES:

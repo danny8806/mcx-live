@@ -62,6 +62,9 @@ class Order:
     position_generation: Optional[int] = None
     original_order_id: Optional[str] = None
     reversal_parent_signal_id: Optional[str] = None
+    trigger_state: Optional[str] = None
+    trigger_generation: Optional[int] = None
+    trigger_source: Optional[str] = None
 
 
 @dataclass

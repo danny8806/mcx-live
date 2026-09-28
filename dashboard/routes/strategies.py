@@ -249,6 +249,7 @@ def _list_strategies_sync(instrument: Optional[str] = None, status: Optional[str
                 "position_side": snap.get("position_side"),
                 "stop_price": snap.get("stop_price"),
                 "pending_entry": _enrich_pending_entry(snap.get("pending_entry")),
+                "pending_exit_trigger": _enrich_pending_entry(snap.get("pending_exit_trigger")),
                 "bars_processed": snap.get("bars_processed", 0),
                 "trade_count": pnl_snap.get("trade_count", 0),
                 "wins": pnl_snap.get("wins", 0),

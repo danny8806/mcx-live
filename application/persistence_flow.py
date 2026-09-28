@@ -82,6 +82,9 @@ class PersistenceFlowMixin:
                 "parent_position_id": getattr(order, "parent_position_id", None),
                 "position_generation": getattr(order, "position_generation", None),
                 "original_order_id": getattr(order, "original_order_id", None),
+                "trigger_state": getattr(order, "trigger_state", None),
+                "trigger_generation": getattr(order, "trigger_generation", None),
+                "trigger_source": getattr(order, "trigger_source", None),
             })
     def _live_pending_row(self, env, signal) -> Optional[dict]:
         """The durable pending-order row for a signal (LIVE env only)."""
@@ -100,9 +103,16 @@ class PersistenceFlowMixin:
         base = {
             "pending_order_id": pend_id,
             "signal_id": pend_id,
+            "strategy_id": signal.strategy_id,
+            "instrument": signal.instrument,
             "side": (signal.side or getattr(signal.signal_type, "value", "LONG")).upper(),
+            "direction": (signal.side or getattr(signal.signal_type, "value", "LONG")).upper(),
             "order_type": "LIMIT",
             "trigger_price": signal.trigger_price,
+            "trigger_state": (signal.metadata or {}).get("trigger_state", "ARMED"),
+            "trigger_generation": (signal.metadata or {}).get("trigger_generation"),
+            "trigger_source": (signal.metadata or {}).get("trigger_source"),
+            "signal_timestamp": signal.timestamp,
             "quantity": signal.quantity,
             "trade_id": None,
         }
@@ -118,6 +128,9 @@ class PersistenceFlowMixin:
             row["status"] = PendingOrderState.ARMED.value
             row["armed_at"] = datetime.now(timezone.utc).isoformat()
             env.persistence.save_pending_order(row)
+            strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
+            if strategy is not None:
+                strategy._last_armed_pending_id = pend_id
             return
         row = dict(base)
         row["status"] = PendingOrderState.PENDING.value
@@ -129,6 +142,9 @@ class PersistenceFlowMixin:
             row["status"], PendingOrderState.ARMED.value, pend_id)
         row["armed_at"] = datetime.now(timezone.utc).isoformat()
         env.persistence.save_pending_order(row)
+        strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
+        if strategy is not None:
+            strategy._last_armed_pending_id = pend_id
         self.publish_event("pending_order_armed", {
             "pending_order_id": pend_id, "signal_id": pend_id,
             "state": row["status"], "execution_mode": env.mode}, env_name=env.name)
@@ -159,6 +175,14 @@ class PersistenceFlowMixin:
             "signal_id": pend_id,
             "trade_id": trade.trade_id,
             "status": status,
+            "strategy_id": signal.strategy_id,
+            "instrument": signal.instrument,
+            "direction": (signal.side or getattr(signal.signal_type, "value", "LONG")).upper(),
+            "trigger_price": signal.trigger_price,
+            "trigger_state": (signal.metadata or {}).get("trigger_state", "FIRED"),
+            "trigger_generation": (signal.metadata or {}).get("trigger_generation"),
+            "trigger_source": (signal.metadata or {}).get("trigger_source"),
+            "signal_timestamp": signal.timestamp,
             "correlation_id": getattr(order, "correlation_id", None),
             "broker_order_id": getattr(order, "_broker_order_id", None),
         })
@@ -290,9 +314,15 @@ class PersistenceFlowMixin:
         strategy = env.strategies.get(strategy_id)
         if strategy:
             keep = keep_pending and strategy.pending_entry is not None
+            strategy._cancel_trigger(getattr(strategy, "pending_exit_trigger", None))
+            strategy.pending_exit_trigger = None
             if keep:
                 pen = strategy.pending_entry
                 pen.status = "pending"
+                if pen.signal is not None:
+                    md = pen.signal.metadata or {}
+                    md.update(pending=True, triggered=False, trigger_state="ARMED")
+                    pen.signal.metadata = md
                 strategy.state = (StrategyState.PENDING_LONG if pen.side == "LONG"
                                   else StrategyState.PENDING_SHORT)
             else:
@@ -305,10 +335,9 @@ class PersistenceFlowMixin:
             # closes: the strategy is flat again, so later stop exits (new
             # trades) are evaluated normally.
             setattr(strategy, "stop_exit_submitted", False)
-            # IMMEDIATE-LIMIT: a terminal reject/cancel must release the
-            # signal lock so the strategy can detect a fresh signal again.
-            setattr(strategy, "immediate_limit_sent", None)
+            strategy._last_fired_trigger_signal_id = None
             if not keep:
+                strategy._cancel_trigger(strategy.pending_entry)
                 strategy.pending_entry = None
             strategy.current_trade_id = None
         runtime = env.runtimes.get(strategy_id) if env.runtimes is not None else None

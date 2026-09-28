@@ -399,8 +399,46 @@ class EnvironmentFactoryMixin:
             tick_size=tick_size,
         )
     def _validate_live_order_ownership(self, env, order) -> Optional[str]:
-        """Fail-closed ownership validation at the sole broker submit boundary."""
-        return validate_live_order_ownership(env, order)
+        """Fail-closed strategy, trigger, and position checks at Dhan boundary."""
+        reason = validate_live_order_ownership(env, order)
+        if reason:
+            return reason
+        role = str(getattr(order, "order_role", "") or "").upper()
+        if role == "EMERGENCY_EXIT":
+            return None
+        strategy = (getattr(env, "strategies", {}) or {}).get(order.strategy_id)
+        if strategy is None:
+            return "ORDER_STRATEGY_UNKNOWN"
+        if role in {"ENTRY", "REVERSAL_ENTRY", "FALLBACK_MARKET"}:
+            if not getattr(strategy, "enabled", True):
+                return "STRATEGY_DISABLED"
+            if not getattr(env, "gate_enabled", False):
+                return "LIVE_GATE_CLOSED"
+            gate = self._gate_for(order.strategy_id)
+            if not gate.entries_allowed:
+                return "STRATEGY_ENTRY_GATE_CLOSED"
+            if (role == "REVERSAL_ENTRY" and not gate.reversal_enabled):
+                return "STRATEGY_REVERSAL_GATE_CLOSED"
+        elif role == "REVERSAL_EXIT":
+            if not self._gate_for(order.strategy_id).reversal_enabled:
+                return "STRATEGY_REVERSAL_GATE_CLOSED"
+        elif role == "STOP_LOSS":
+            if not self._gate_for(order.strategy_id).sl_enabled:
+                return "STRATEGY_SL_GATE_CLOSED"
+        elif role == "EXIT":
+            if not self._gate_for(order.strategy_id).exit_enabled:
+                return "STRATEGY_EXIT_GATE_CLOSED"
+        if role in {"ENTRY", "REVERSAL_ENTRY", "FALLBACK_MARKET",
+                    "EXIT", "STOP_LOSS", "REVERSAL_EXIT"}:
+            if str(getattr(order, "trigger_state", "") or "").upper() != "FIRED":
+                return "ORDER_TRIGGER_NOT_FIRED"
+            if (getattr(strategy, "_last_fired_trigger_signal_id", None)
+                    != getattr(order, "parent_signal_id", None)):
+                return "ORDER_TRIGGER_SIGNAL_STALE"
+            if (getattr(order, "trigger_generation", None)
+                    != getattr(strategy, "_trigger_generation", None)):
+                return "ORDER_TRIGGER_GENERATION_STALE"
+        return None
 
     def _build_live_broker(self, live_cfg: dict, gate_enabled: bool,
                            db_path: Optional[str] = None):

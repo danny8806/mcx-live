@@ -182,6 +182,13 @@ def _get_profile_sync():
     order_ws = live_cfg.get("order_ws", {}) or {}
     watcher_cfg = live_cfg.get("order_watcher", {}) or {}
     env = _live_env()
+    execution_models = {
+        str(getattr(strategy, "execution_model", ""))
+        for strategy in (getattr(env, "strategies", {}) or {}).values()
+        if getattr(strategy, "execution_model", None)
+    } if env is not None else set()
+    execution_model = (next(iter(execution_models)) if len(execution_models) == 1
+                       else "mixed" if execution_models else None)
     adapter = getattr(env, "data_adapter", None) if env is not None else None
     data_ws_connected = None
     order_ws_connected = None
@@ -202,7 +209,7 @@ def _get_profile_sync():
         "broker": live_cfg.get("broker") or "dhan",
         "client_id": _mask_client_id(dhan_cfg.get("client_id", "")),
         "product_type": dhan_cfg.get("product_type") or "MARGIN",
-        "execution_model": "immediate_limit",
+        "execution_model": execution_model,
         "gate": (env.gate_state if env is not None else None) or live_cfg.get("gate"),
         "live_trading_enabled": bool(live_cfg.get("live_trading_enabled", False)),
         "order_ws": {

@@ -66,12 +66,12 @@ class StrategyInstance:
         multiplier: float = 10.0,
     ):
         self.strategy_id = strategy_id
-        self.execution_model = "immediate_limit"
-        # Set while an immediate-limit entry order rests at the broker.  Locks
-        # out new signal detection for this strategy until the fill arrives
-        # (engine syncs position) or the order reaches a terminal state (engine
-        # resets).  Prevents duplicate LIMITs while the first rests.
-        self.immediate_limit_sent: Optional[str] = None
+        self.execution_model = "local_trigger_limit"
+        # Each strategy owns its armed entry and reversal-exit trigger.
+        # Trigger identity is carried by the immutable signal and generation.
+        self.pending_exit_trigger: Optional[PendingEntry] = None
+        self._trigger_generation = 0
+        self._last_fired_trigger_signal_id: Optional[str] = None
         # Track the signal_id of the last LIVE armed pending order so the
         # engine can terminalize it on cancel_inflight (opposite crossover).
         self._last_armed_pending_id: Optional[str] = None
@@ -112,9 +112,6 @@ class StrategyInstance:
         self.just_entered: bool = False
         self.last_exit_reason: Optional[str] = None
         self.enabled: bool = True
-
-        # ── Same-bar stop ──
-        self.same_bar_stop: Optional[float] = None
 
         # ── Stop-out re-fire guard ──
         # Once a stop-loss exit is raised, no further stop-out is emitted
@@ -312,48 +309,18 @@ class StrategyInstance:
 
         signal = None
 
-        # 1. Execute pending entry if triggered
+        # 1. Pending triggers are evaluated only from live LTP ticks. Candle
+        # OHLC values are never used to fire an order.
         if self.pending_entry is not None and self.pending_entry.status == "pending":
             if self.pending_entry.bars_pending >= self.pending_timeout_bars:
+                self._cancel_trigger(self.pending_entry)
                 self.pending_entry = None
                 self.state = StrategyState.FLAT
                 self.position_side = None
                 return None
             self.pending_entry.bars_pending += 1
-            # position_side is None until the broker confirms the fill, so the
-            # same-bar stop breach must be evaluated against the PENDING side,
-            # not position_side.  Arming same_bar_stop lets the engine submit
-            # the immediate stop-out exit right after the entry (trading_engine
-            # _make_candle_handler: signal then _consume_same_bar_stop).
-            pending_side = self.pending_entry.side
-            signal = self._check_pending_entry(bar)
-            if signal is not None:
-                self.just_entered = False
-                if self.stop_price is not None:
-                    if (pending_side == "LONG" and bar.low <= self.stop_price) or (
-                            pending_side == "SHORT" and bar.high >= self.stop_price):
-                        self.same_bar_stop = bar.close
-                        self.last_exit_reason = "stop_loss_hit"
-                return signal
 
-        # 2. Check stop loss
-        if (self.position_side is not None
-                and self.stop_price is not None
-                and not self.just_entered
-                and not self.stop_exit_submitted):
-            stop_signal = self._check_stop_loss(bar)
-            if stop_signal is not None:
-                self.just_entered = False
-                # Re-arm signal detection on the SAME bar so a clean flip/flat
-                # after a stop-out can immediately re-enter (matches backtest).
-                self._detect_signal(
-                    close, prev_close, htf_val, prev_htf_val, high, low, bar.start_ts,
-                    mid_val, prev_mid_val, prev_high, prev_low, fast_dema_atr,
-                    open_=bar.open,
-                )
-                return stop_signal
-
-        # 2.5. OPPOSITE CROSSOVER OVERRIDE: cancel old pending/in-flight and
+        # 2. OPPOSITE CROSSOVER OVERRIDE: cancel old pending/in-flight and
         # take the new signal on the same bar.  Applies when:
         #   a) ENTRY_TRIGGERED + no position → a LIMIT rests at the broker
         #   b) PENDING_LONG / PENDING_SHORT → a trigger is waiting to cross
@@ -374,9 +341,9 @@ class StrategyInstance:
                 cancel_and_reenter = "SHORT"
             if cancel_and_reenter is not None:
                 old_pending_id = self._last_armed_pending_id
+                self._cancel_trigger(self.pending_entry)
                 self.state = StrategyState.FLAT
                 self.pending_entry = None
-                self.immediate_limit_sent = None
                 self.current_trade_id = None
                 self._last_armed_pending_id = None
                 signal = self._detect_signal(
@@ -475,12 +442,8 @@ class StrategyInstance:
         mid_val=None, prev_mid_val=None, prev_high=None, prev_low=None,
         fast_dema_atr=None, open_=None,
     ) -> Optional[Signal]:
-        """Detect a crossover and emit its immediate-limit entry signal."""
-        # IMMEDIATE-LIMIT LOCK: while a LIMIT emitted by this strategy rests at
-        # the broker (or is filling), no NEW signal may be detected from a
-        # later bar — otherwise every subsequent bar would emit a duplicate
-        # entry.  The engine releases the lock on fill / terminal reject.
-        if self.immediate_limit_sent is not None:
+        """Detect a crossover and arm a local trigger; it never submits here."""
+        if self.pending_entry is not None or self.pending_exit_trigger is not None:
             return None
         if self._check_long_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val):
             return self._entry_signal("LONG", close, high, low, timestamp, prev_high, prev_low,
@@ -497,27 +460,20 @@ class StrategyInstance:
         prev_high=None, prev_low=None,
         htf_val=None, mid_val=None, fast_dema_atr=None, open_=None,
     ) -> Signal:
-        """Build the sole supported entry intent: an immediate-limit order."""
-        return self._create_immediate_limit_signal(
+        """Build the sole entry intent; a live tick must fire it before orders."""
+        return self._create_triggered_entry_signal(
             side, close, high, low, timestamp, prev_high, prev_low,
             htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
             open_=open_)
 
-    def _create_immediate_limit_signal(
+    def _create_triggered_entry_signal(
         self, side, close, high, low, timestamp,
         prev_high=None, prev_low=None,
         htf_val=None, mid_val=None, fast_dema_atr=None, open_=None,
     ) -> Signal:
-        """Create an immediate-limit entry signal (Appendix I).
-
-        The LIMIT price is the signal bar's trigger level (HIGH for LONG / LOW
-        for SHORT); the engine's LiveExecutionEngine applies the price-model
-        entry offset on top.  Unlike a pending-breakout, NO trigger wait is
-        involved: the LIMIT rests at the broker from signal creation and the
-        order watcher cancels it (skip policy) with a MARKET fallback for the
-        remaining quantity when it fails to fill.
-        """
+        """Create a signal and arm its strategy-local live-LTP trigger."""
         trigger, stop = entry_levels(side, high, low, prev_high, prev_low)
+        self._trigger_generation += 1
 
         signal = Signal(
             signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,
@@ -529,11 +485,11 @@ class StrategyInstance:
             quantity=self.quantity,
         )
         signal.metadata = {
-            # Direct entry (not a breakout wait): the engine places the LIMIT
-            # immediately.  The broker holds trigger-cross detection.
-            "pending": False,
-            "triggered": True,
-            "immediate_limit": True,
+            "pending": True,
+            "triggered": False,
+            "trigger_state": "ARMED",
+            "trigger_generation": self._trigger_generation,
+            "trigger_source": "market_websocket_ltp",
             "entry_price": close,
             "htf_value": htf_val,
             "mid_value": mid_val,
@@ -557,13 +513,11 @@ class StrategyInstance:
             position_side=self.position_side, position_stop=self.stop_price,
         )
 
-        # Lock out re-detection until the fill arrives or the order reaches a
-        # terminal state (the engine syncs/clears via fill/reject handling).
-        # Dhan-linked: LIMIT is at the broker from signal time — state is
-        # ENTRY_TRIGGERED (not PENDING_*) because the order is already placed,
-        # not waiting for a trigger cross.
-        self.immediate_limit_sent = side
-        self.state = StrategyState.ENTRY_TRIGGERED
+        self.pending_entry = PendingEntry(
+            signal=signal, trigger_price=trigger, side=side,
+            created_at=time.time(), status="pending")
+        self.state = (StrategyState.PENDING_LONG if side == "LONG"
+                      else StrategyState.PENDING_SHORT)
         self._signals.append(signal)
         return signal
 
@@ -572,11 +526,10 @@ class StrategyInstance:
         prev_high=None, prev_low=None,
         htf_val=None, mid_val=None, fast_dema_atr=None, open_=None,
     ) -> Signal:
-        """Create an exit now and arm the opposite entry behind confirmed flat.
+        """Arm a reversal-exit trigger and an opposite entry trigger.
 
-        The entry remains a PendingEntry while the old position is being
-        exited and reconciled. Only after the broker confirms flat can its
-        breakout trigger fire and begin a new trade lifecycle.
+        No order is produced until the local exit trigger crosses on a live
+        market tick. The opposite entry trigger remains blocked until flat.
 
         ``reversal_entry_gap_points`` offsets the opposite entry trigger from
         the signal candle's reversal trigger:
@@ -584,8 +537,11 @@ class StrategyInstance:
           SHORT → LONG: entry trigger = signal HIGH + gap
         """
         gap = int(getattr(self, "reversal_entry_gap_points", 0))
+        self._cancel_trigger(self.pending_exit_trigger)
+        self._cancel_trigger(self.pending_entry)
         trigger, entry_trigger, stop = reversal_levels(
             side, high, low, prev_high, prev_low, gap)
+        self._trigger_generation += 1
 
         # The opposite entry is a distinct lifecycle and stays armed, but
         # cannot fire until the old position has been confirmed flat.
@@ -611,6 +567,9 @@ class StrategyInstance:
             "is_reversal_entry": True,
             "pending": True,
             "triggered": False,
+            "trigger_state": "ARMED",
+            "trigger_generation": self._trigger_generation,
+            "trigger_source": "market_websocket_ltp",
             "signal_candle_start": timestamp,
             "signal_candle_open": open_,
             "signal_candle_high": high,
@@ -642,6 +601,12 @@ class StrategyInstance:
         )
         exit_signal.metadata = {
             "exit": True,
+            "pending": True,
+            "triggered": False,
+            "trigger_state": "ARMED",
+            "trigger_generation": self._trigger_generation,
+            "trigger_source": "market_websocket_ltp",
+            "pending_trigger_kind": "REVERSAL_EXIT",
             "exit_reason": reason,
             "exit_price": close,
             "is_reversal": True,
@@ -662,132 +627,59 @@ class StrategyInstance:
         self.pending_entry = PendingEntry(
             signal=entry_signal, trigger_price=entry_trigger, side=side,
             created_at=time.time(), status="waiting_for_flat")
-        self.state = StrategyState.EXIT_ORDER_SUBMITTED
+        self.pending_exit_trigger = PendingEntry(
+            signal=exit_signal, trigger_price=trigger,
+            side="SHORT" if self.position_side == "LONG" else "LONG",
+            created_at=time.time(), status="pending")
+        self.state = StrategyState.EXIT_PENDING
         self.last_exit_reason = reason
-        self.stop_exit_submitted = True
         self._signals.append(entry_signal)
         self._signals.append(exit_signal)
         return exit_signal
+
+    @staticmethod
+    def _cancel_trigger(trigger: Optional[PendingEntry]) -> None:
+        if trigger is None or trigger.signal is None:
+            return
+        trigger.status = "cancelled"
+        metadata = trigger.signal.metadata or {}
+        metadata.update(pending=False, triggered=False, trigger_state="CANCELLED")
+        trigger.signal.metadata = metadata
+
+    def _tick_reversal_exit_trigger(self, pen: PendingEntry,
+                                    ltp: float) -> Optional[Signal]:
+        """Fire the old-position exit trigger once, from live LTP only."""
+        metadata = pen.signal.metadata or {} if pen.signal is not None else {}
+        if (pen.status != "pending" or pen.signal is None
+                or pen.signal.strategy_id != self.strategy_id
+                or pen.signal.instrument != self.instrument
+                or metadata.get("trigger_generation") != self._trigger_generation
+                or metadata.get("position_side") != self.position_side):
+            self._cancel_trigger(pen)
+            self.pending_exit_trigger = None
+            return None
+        crossed = ((pen.side == "LONG" and ltp >= pen.trigger_price)
+                   or (pen.side == "SHORT" and ltp <= pen.trigger_price))
+        if not crossed:
+            return None
+        pen.status = "fired"
+        metadata.update(pending=False, triggered=True, trigger_state="FIRED",
+                        trigger_ltp=float(ltp), trigger_source="market_websocket_ltp")
+        pen.signal.metadata = metadata
+        self._last_fired_trigger_signal_id = pen.signal.signal_id
+        self.pending_exit_trigger = None
+        self.state = StrategyState.EXIT_ORDER_SUBMITTED
+        self.stop_exit_submitted = True
+        return pen.signal
 
     # ═══════════════════════════════════════════════════════════════════════
     # PENDING ENTRY + STOP LOSS — identical to BaseDEMAStrategy
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _check_pending_entry(self, bar: Bar) -> Optional[Signal]:
-        """Check if pending breakout entry is triggered by this bar."""
-        pen = self.pending_entry
-        if pen is None or pen.status != "pending":
-            return None
-
-        triggered = False
-        if pen.side == "LONG" and bar.high > pen.trigger_price:
-            triggered = True
-        elif pen.side == "SHORT" and bar.low < pen.trigger_price:
-            triggered = True
-
-        if not triggered:
-            return None
-
-        # Trigger fired — DO NOT assume position exists yet.
-        # State becomes ENTRY_TRIGGERED: the engine will send the order to Dhan,
-        # and ONLY on Dhan fill confirmation does position_side / state flip to
-        # LONG_POSITION / SHORT_POSITION.  On Dhan rejection the poller resets
-        # to FLAT.  This eliminates the optimistic-assumption race condition.
-        self.stop_price = pen.signal.stop_price
-        self.just_entered = True
-        self.state = StrategyState.ENTRY_TRIGGERED
-        self.pending_entry = None
-
-        if pen.signal.metadata is None:
-            pen.signal.metadata = {}
-        pen.signal.metadata["pending"] = False
-        pen.signal.metadata["triggered"] = True
-
-        return pen.signal
-
-    def _check_stop_loss(self, bar: Bar) -> Optional[Signal]:
-        """Check if stop loss is hit."""
-        if self.position_side is None or self.stop_price is None:
-            return None
-
-        # A stop-out is already in flight: never re-emit a duplicate exit.
-        if self.stop_exit_submitted:
-            return None
-
-        hit = False
-        if self.position_side == "LONG" and bar.low <= self.stop_price:
-            hit = True
-        elif self.position_side == "SHORT" and bar.high >= self.stop_price:
-            hit = True
-
-        if not hit:
-            return None
-
-        exit_signal = Signal(
-            signal_type=SignalType.SHORT if self.position_side == "LONG" else SignalType.LONG,
-            instrument=self.instrument,
-            strategy_id=self.strategy_id,
-            timestamp=bar.start_ts,
-            trigger_price=bar.close,
-            stop_price=self.stop_price,
-            quantity=self.position_quantity or self.quantity,
-        )
-        exit_signal.metadata = {
-            "exit": True,
-            "exit_reason": "stop_loss_hit",
-            "exit_price": bar.close,
-            "position_side": self.position_side,
-        }
-
-        # Phase 4 — freeze the full signal-candle context on the exit.
-        freeze_signal_context(
-            exit_signal, bar=bar,
-            dema=self.fast_indicator.value, atr=self.fast_indicator.atr_value,
-            position_side=self.position_side, position_stop=self.stop_price,
-        )
-
-        self._close_position("stop_loss_hit")
-        self.stop_exit_submitted = True
-        self._signals.append(exit_signal)
-        return exit_signal
-
     def _close_position(self, reason: str) -> None:
         """Mark exit as pending; engine clears state after fill."""
         self.last_exit_reason = reason
         self.state = StrategyState.EXIT_ORDER_SUBMITTED
-
-    def _consume_same_bar_stop(self, bar: Bar) -> Optional[Signal]:
-        """Handle same-bar stop: entry AND stop-loss on one candle."""
-        if self.same_bar_stop is None:
-            return None
-
-        exit_signal = Signal(
-            signal_type=SignalType.SHORT if self.position_side == "LONG" else SignalType.LONG,
-            instrument=self.instrument,
-            strategy_id=self.strategy_id,
-            timestamp=(bar.start_ts or 0.0) + 0.25,
-            trigger_price=self.same_bar_stop,
-            stop_price=self.stop_price,
-            quantity=self.quantity,
-        )
-        exit_signal.metadata = {
-            "exit": True,
-            "exit_reason": "stop_loss_hit",
-            "exit_price": self.same_bar_stop,
-            "same_bar": True,
-        }
-
-        # Phase 4 — freeze the same-bar stop context (idempotent).
-        freeze_signal_context(
-            exit_signal, bar=bar,
-            dema=self.fast_indicator.value, atr=self.fast_indicator.atr_value,
-            position_side=self.position_side, position_stop=self.stop_price,
-        )
-
-        self._close_position("stop_loss_hit")
-        self.same_bar_stop = None
-        self._signals.append(exit_signal)
-        return exit_signal
 
     # ═══════════════════════════════════════════════════════════════════════
     # TICK HANDLER — for live LTP processing
@@ -817,9 +709,23 @@ class StrategyInstance:
             elif self.position_side == "SHORT" and ltp >= self.stop_price:
                 return self._tick_stop_loss(ltp, timestamp)
 
+        if (self.pending_exit_trigger is not None
+                and self.pending_exit_trigger.status == "pending"):
+            exit_signal = self._tick_reversal_exit_trigger(
+                self.pending_exit_trigger, ltp)
+            if exit_signal is not None:
+                self._signals.append(exit_signal)
+                return exit_signal
+
         # Check pending entry trigger on tick
         if self.pending_entry is not None and self.pending_entry.status == "pending":
             pen = self.pending_entry
+            if (pen.signal is None or pen.signal.strategy_id != self.strategy_id
+                    or pen.signal.instrument != self.instrument
+                    or (pen.signal.metadata or {}).get("trigger_state") == "CANCELLED"):
+                self._cancel_trigger(pen)
+                self.pending_entry = None
+                return None
             if pen.side == "LONG" and ltp >= pen.trigger_price:
                 return self._tick_entry_trigger(pen, ltp, timestamp)
             elif pen.side == "SHORT" and ltp <= pen.trigger_price:
@@ -843,7 +749,16 @@ class StrategyInstance:
             "exit_reason": "stop_loss_hit",
             "exit_price": ltp,
             "source": "tick",
+            "triggered": True,
+            "trigger_state": "FIRED",
+            "trigger_generation": self._trigger_generation,
+            "trigger_source": "market_websocket_ltp",
         }
+        self._cancel_trigger(self.pending_exit_trigger)
+        self.pending_exit_trigger = None
+        self._cancel_trigger(self.pending_entry)
+        self.pending_entry = None
+        self._last_fired_trigger_signal_id = exit_signal.signal_id
         # Phase 4 — tick exits freeze the LTP snapshot (no candle bar).
         freeze_signal_context(
             exit_signal, close=ltp, high=ltp, low=ltp, timestamp=timestamp,
@@ -857,20 +772,29 @@ class StrategyInstance:
 
     def _tick_entry_trigger(self, pen: PendingEntry, ltp: float, timestamp: float) -> Optional[Signal]:
         """Execute pending entry from tick."""
-        if pen.status != "pending":
+        metadata = pen.signal.metadata or {} if pen.signal is not None else {}
+        if (pen.status != "pending" or pen.signal is None
+                or pen.signal.strategy_id != self.strategy_id
+                or pen.signal.instrument != self.instrument
+                or metadata.get("trigger_generation") != self._trigger_generation
+                or metadata.get("trigger_state") != "ARMED"):
+            self._cancel_trigger(pen)
+            if self.pending_entry is pen:
+                self.pending_entry = None
             return None
-        fill_px = pen.trigger_price
         # Dhan-linked: state = ENTRY_TRIGGERED, NOT LONG/SHORT_POSITION.
         # position_side is NOT set here — only set by _sync_strategy_on_entry_fill
         # when Dhan confirms the fill.
         self.stop_price = pen.signal.stop_price
         self.just_entered = True
         self.state = StrategyState.ENTRY_TRIGGERED
+        pen.status = "fired"
         self.pending_entry = None
-        if pen.signal.metadata is None:
-            pen.signal.metadata = {}
-        pen.signal.metadata["pending"] = False
-        pen.signal.metadata["triggered"] = True
+        metadata.update(
+            pending=False, triggered=True, trigger_state="FIRED",
+            trigger_ltp=float(ltp), trigger_source="market_websocket_ltp")
+        pen.signal.metadata = metadata
+        self._last_fired_trigger_signal_id = pen.signal.signal_id
         return pen.signal
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -902,9 +826,11 @@ class StrategyInstance:
         self.state = StrategyState.FLAT
         self.position_side = None
         self.stop_price = None
+        self._cancel_trigger(self.pending_entry)
+        self._cancel_trigger(self.pending_exit_trigger)
         self.pending_entry = None
-        self.immediate_limit_sent = None
-        self.same_bar_stop = None
+        self.pending_exit_trigger = None
+        self._last_fired_trigger_signal_id = None
         self._prev_fast_close = None
         self._prev_htf_value = None
         self._prev_mid_value = None
@@ -961,7 +887,9 @@ class StrategyInstance:
     def has_pending(self) -> bool:
         return self.pending_entry is not None
 
-    def _pending_entry_snapshot(self) -> Optional[dict]:
+    def _pending_entry_snapshot(
+        self, trigger: Optional[PendingEntry] = None, *, use_current: bool = True,
+    ) -> Optional[dict]:
         """Emit the pending entry as a dict keyed for the dashboard panel.
 
         Mirrors BaseDEMAStrategy.snapshot() (fast O(1) — no broker calls).
@@ -969,7 +897,7 @@ class StrategyInstance:
         was armed; the live signal candle stays unchanged until the trigger
         crosses, then the engine acts on it.
         """
-        pe = self.pending_entry
+        pe = self.pending_entry if use_current and trigger is None else trigger
         if pe is None:
             return None
         sig = pe.signal
@@ -998,7 +926,13 @@ class StrategyInstance:
             "strategy_id": sig.strategy_id if sig else self.strategy_id,
             "quantity": sig.quantity if sig else self.quantity,
             "signal_id": sig.signal_id if sig else None,
+            "signal_type": sig.signal_type.value if sig else None,
+            "timestamp": sig.timestamp if sig else 0.0,
             "status": pe.status,
+            "trigger_state": md.get("trigger_state", "ARMED"),
+            "trigger_generation": md.get("trigger_generation"),
+            "trigger_source": md.get("trigger_source", "market_websocket_ltp"),
+            "exit": bool(md.get("exit")),
             "lifecycle_id": getattr(sig, "lifecycle_id", None) if sig else None,
             "parent_position_id": getattr(sig, "parent_position_id", None) if sig else None,
             "position_generation": getattr(sig, "position_generation", None) if sig else None,
@@ -1037,7 +971,10 @@ class StrategyInstance:
             "last_exit_reason": self.last_exit_reason,
             "just_entered": self.just_entered,
             "pending_entry": self._pending_entry_snapshot(),
-            "same_bar_stop": self.same_bar_stop,
+            "pending_exit_trigger": self._pending_entry_snapshot(
+                self.pending_exit_trigger, use_current=False),
+            "trigger_generation": self._trigger_generation,
+            "last_fired_trigger_signal_id": self._last_fired_trigger_signal_id,
             "stop_exit_submitted": self.stop_exit_submitted,
             "current_trade_id": self.current_trade_id,
             "current_position_id": self.current_position_id,
@@ -1079,7 +1016,6 @@ class StrategyInstance:
         self._prev_mid_value = snapshot.get("prev_mid_value")
         self.last_exit_reason = snapshot.get("last_exit_reason")
         self.just_entered = bool(snapshot.get("just_entered", False))
-        self.same_bar_stop = snapshot.get("same_bar_stop")
         self.stop_exit_submitted = bool(snapshot.get("stop_exit_submitted", False))
         self.current_trade_id = snapshot.get("current_trade_id")
         self.current_position_id = snapshot.get("current_position_id")
@@ -1087,34 +1023,43 @@ class StrategyInstance:
         self.position_quantity = snapshot.get("position_quantity")
         self._last_armed_pending_id = snapshot.get("last_armed_pending_id")
         self.enabled = bool(snapshot.get("enabled", True))
+        self._trigger_generation = int(snapshot.get("trigger_generation", 0) or 0)
+        self._last_fired_trigger_signal_id = snapshot.get("last_fired_trigger_signal_id")
 
-        pending_entry = snapshot.get("pending_entry")
-        if pending_entry:
+        def restore_trigger(pending_entry):
+            if not pending_entry:
+                return None
             signal_id, trigger, side, bars, pending_status = self._unpack_pending_entry(pending_entry)
-            # Rebuild from the serialized intent; _signals is an ephemeral
-            # diagnostic list and may contain an unrelated position's signal.
-            signal = None
-            self.pending_entry = PendingEntry(
-                signal=signal or Signal(
-                    signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,
+            signal_type_value = (pending_entry.get("signal_type")
+                                 if isinstance(pending_entry, dict) else None)
+            signal_type = (SignalType(signal_type_value)
+                           if signal_type_value in {item.value for item in SignalType}
+                           else SignalType.LONG if side == "LONG" else SignalType.SHORT)
+            restored_signal = Signal(
+                    signal_type=signal_type,
                     instrument=self.instrument, strategy_id=self.strategy_id,
-                    timestamp=0.0, trigger_price=trigger,
-                    stop_price=self.stop_price or 0.0, quantity=self.quantity,
+                    timestamp=float(pending_entry.get("timestamp", 0.0) or 0.0)
+                    if isinstance(pending_entry, dict) else 0.0,
+                    trigger_price=trigger,
+                    stop_price=(pending_entry.get("stop_price") if isinstance(
+                        pending_entry, dict) else None) or self.stop_price or 0.0,
+                    quantity=int(pending_entry.get("quantity", self.quantity) or self.quantity)
+                    if isinstance(pending_entry, dict) else self.quantity,
                     metadata=dict(pending_entry.get("metadata") or {})
                     if isinstance(pending_entry, dict) else {"pending": True},
-                ),
-                trigger_price=trigger, side=side,
+                )
+            if signal_id:
+                restored_signal.signal_id = signal_id
+            if isinstance(pending_entry, dict):
+                restored_signal.lifecycle_id = pending_entry.get("lifecycle_id")
+                restored_signal.parent_position_id = pending_entry.get("parent_position_id")
+                restored_signal.position_generation = pending_entry.get("position_generation")
+            return PendingEntry(
+                signal=restored_signal, trigger_price=trigger, side=side,
                 status=pending_status,
                 created_at=float(pending_entry.get("created_at", 0.0) or 0.0)
                 if isinstance(pending_entry, dict) else 0.0,
                 bars_pending=bars if bars is not None else 0,
             )
-            if isinstance(pending_entry, dict):
-                self.pending_entry.signal.lifecycle_id = pending_entry.get("lifecycle_id")
-                self.pending_entry.signal.parent_position_id = pending_entry.get("parent_position_id")
-                self.pending_entry.signal.position_generation = pending_entry.get("position_generation")
-            if self.pending_entry.signal.signal_id != signal_id and signal is not None:
-                self.pending_entry.signal.signal_id = signal_id
-            self.pending_entry.bars_pending = bars if bars is not None else 0
-        else:
-            self.pending_entry = None
+        self.pending_entry = restore_trigger(snapshot.get("pending_entry"))
+        self.pending_exit_trigger = restore_trigger(snapshot.get("pending_exit_trigger"))

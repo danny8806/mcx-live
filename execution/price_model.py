@@ -4,8 +4,8 @@ Contract: every LIVE execution price is derived from the immutable signal's
 trigger/stop values through pure functions, so a price is never improvised at
 the broker and PAPER/LIVE can never diverge by mistake.
 
-LIVE has one entry model: the strategy emits an immediate-limit signal and
-the engine sends a LIMIT at its trigger level. Exits are created only after
+LIVE has one entry model: a local live-LTP trigger fires before the engine
+sends a LIMIT at its trigger level. Exits are created only after
 the system stop monitor or strategy exit fires. Broker-side protective stop
 orders are disabled; the local tick monitor owns stop triggering.
 """
@@ -101,7 +101,7 @@ class ExecutionPricePlan:
     """The concrete execution intent derived from one signal.
 
     ``order_type`` is what gets sent to the broker transport:
-      * ``LIMIT``           -> immediate-limit entries and system-triggered
+      * ``LIMIT``           -> locally-triggered entries and system-triggered
                                exits, priced from the immutable signal
     ``kind`` classifies the intent for reporting and forensics.
     """
@@ -137,9 +137,8 @@ class PricePreset:
         (the strategies.types.Signal contract).  ``side`` is the resolved order
         side ("BUY"/"SELL").
 
-        Entry signals must carry ``triggered=True``. Ordinary entries use the
-        immediate-limit path; reversal entries arrive here only after their
-        trigger fires and the previous position is flat.
+        Entry signals must carry a fired local trigger. Reversal entries arrive
+        here only after their trigger fires and the previous position is flat.
         """
         metadata = signal.metadata or {}
         is_exit = bool(metadata.get("exit"))
@@ -150,6 +149,8 @@ class PricePreset:
         # detection → LIMIT at trigger price.  The order watcher handles
         # cancel→verify→MARKET remaining if the LIMIT fails to fill.
         if is_exit:
+            if str(metadata.get("trigger_state", "")).upper() != "FIRED":
+                raise ValueError("exit must be triggered before limit planning")
             # A stop-loss exit must be priced at the STOP LEVEL our own
             # monitoring watches, never at the signal's trigger price.
             # ``trigger_price`` on an exit signal is the price observed at
@@ -178,12 +179,13 @@ class PricePreset:
                 kind="system_sl_exit" if is_sl else "system_exit",
                 price=_tick_round(level, self.tick_size))
 
-        # There is no alternate initial-entry mode. Pending reversal entries
-        # reach this point only after their own trigger fires.
+        # There is one entry mode: a LIMIT after the local trigger fires.
         if not metadata.get("triggered"):
-            raise ValueError("entry must be triggered before immediate-limit submission")
+            raise ValueError("entry must be triggered before limit submission")
+        if str(metadata.get("trigger_state", "")).upper() != "FIRED":
+            raise ValueError("entry trigger must be FIRED before limit planning")
         if not signal.trigger_price:
-            raise ValueError("immediate-limit entry requires a positive trigger price")
+            raise ValueError("local-trigger entry requires a positive trigger price")
         if side_u == "BUY":
             price = self.long_entry_trigger(signal.trigger_price)
             kind = "long_entry"

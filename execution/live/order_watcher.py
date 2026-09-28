@@ -195,7 +195,7 @@ class OrderWatcher:
                 _cfg(self._cfg, "max_order_ops_per_sec", 10) or 10),
             "stale_after_ws_ms": _as_ms(
                 _cfg(self._cfg, "stale_after_ws_ms", 15000.0), 15000.0),
-            # Appendix I (I5) — LIMIT-skip policy: a resting immediate-limit
+            # Appendix I (I5) — LIMIT-skip policy: a resting triggered LIMIT
             # entry is marked for skip (cancel -> REST-verified -> MARKET for
             # the REMAINING qty) as soon as the broker truth is confirmed and
             # one of {age, deviation, trigger-crossed-unfilled} exceeds policy.
@@ -272,6 +272,11 @@ class OrderWatcher:
                 plan_sl = getattr(order, "planned_sl", None)
                 if plan_sl:
                     rec.extra["stop_price"] = float(plan_sl)
+                rec.extra.update({
+                    "trigger_state": getattr(order, "trigger_state", None),
+                    "trigger_generation": getattr(order, "trigger_generation", None),
+                    "trigger_source": getattr(order, "trigger_source", None),
+                })
                 if state_str:
                     rec.status = str(state_str).upper()
                 self._records[oid] = rec
@@ -1127,6 +1132,9 @@ class OrderWatcher:
                 "prev_order_id": rec.internal_order_id,
                 "prev_correlation_id": rec.correlation_id,
                 "original_order_id": rec.internal_order_id,
+                "trigger_state": rec.extra.get("trigger_state"),
+                "trigger_generation": rec.extra.get("trigger_generation"),
+                "trigger_source": rec.extra.get("trigger_source"),
             },
         )
         signal.signal_id = rec.signal_id or signal.signal_id

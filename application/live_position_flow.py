@@ -391,7 +391,9 @@ class LivePositionFlowMixin:
             timestamp=time.time(),
             trigger_price=(position.current_mark or position.average_entry or 0.0),
             stop_price=0.0, quantity=position.quantity,
-            metadata={"exit": True, "exit_reason": "sl_protection_failed"},
+            metadata={"exit": True, "exit_reason": "sl_protection_failed",
+                      "trigger_state": "FIRED",
+                      "trigger_source": "emergency_protection_failure"},
         )
         sig.signal_id = (getattr(position, "entry_signal_id", None)
                          or f"EMG-{uuid.uuid4().hex[:8]}")
@@ -503,7 +505,9 @@ class LivePositionFlowMixin:
                 instrument=pos.instrument, strategy_id=pos.strategy_id,
                 timestamp=time.time(), trigger_price=pos.current_mark or pos.average_entry,
                 stop_price=pos.stop_price or 0.0, quantity=pos.quantity,
-                metadata={"exit": True, "exit_reason": "operator_emergency_exit"})
+                metadata={"exit": True, "exit_reason": "operator_emergency_exit",
+                          "trigger_state": "FIRED",
+                          "trigger_source": "operator_action"})
             signal.lifecycle_id = pos.trade_id
             signal.parent_position_id = pos.position_id
             signal.position_generation = pos.position_generation

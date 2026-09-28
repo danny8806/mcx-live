@@ -123,6 +123,9 @@ class LiveExecutionEngine:
             position_generation=getattr(signal, "position_generation", None),
             trade_id=trade_id,
             order_role=resolve_order_role(signal),
+            trigger_state=(signal.metadata or {}).get("trigger_state"),
+            trigger_generation=(signal.metadata or {}).get("trigger_generation"),
+            trigger_source=(signal.metadata or {}).get("trigger_source"),
         )
         if (signal.metadata or {}).get("reversal_parent_signal_id"):
             order.reversal_parent_signal_id = signal.metadata["reversal_parent_signal_id"]
@@ -130,8 +133,8 @@ class LiveExecutionEngine:
         # signal -> order -> broker -> status -> fill carrier is stable and the
         # same id ends up in WS/REST records and the persisted order row.
         order.correlation_id = f"MCX-{uuid.uuid4().hex[:12]}"
-        # LIVE uses one immediate-limit entry plan plus system-triggered exits.
-        # PAPER is untouched: only this LIVE engine consults the price preset.
+        # LIVE uses one local-triggered LIMIT entry plan plus system-triggered
+        # exits. PAPER is untouched: only this LIVE engine consults the preset.
         if self._price_preset is not None:
             plan = self._price_preset.plan_for(signal, order_side)
             # §9.5 — immutability: the first plan for a signal_id is canonical;
@@ -140,7 +143,7 @@ class LiveExecutionEngine:
             # a reversal intentionally reuses ONE signal_id for the old trade's
             # exit leg and the new opposite-side entry leg, and those two legs
             # legitimately carry different plans (system exit vs.
-            # immediate-limit entry). Immutability is preserved per-leg.
+            # local-triggered entry). Immutability is preserved per-leg.
             plan_key = (signal.signal_id, order.order_role)
             prior = self._plan_by_signal.get(plan_key)
             if prior is not None and prior != plan:
@@ -243,6 +246,19 @@ class LiveExecutionEngine:
                         "REVERSAL_ENTRY", "FALLBACK_MARKET", "EMERGENCY_EXIT"}:
             order.state = OrderState.REJECTED
             order.reason = "ORDER_ROLE_INVALID"
+            order.updated_at = self._now()
+            return order
+        if (role in {"ENTRY", "REVERSAL_ENTRY", "EXIT", "STOP_LOSS",
+                     "REVERSAL_EXIT", "FALLBACK_MARKET"}
+                and str(getattr(order, "trigger_state", "") or "").upper() != "FIRED"):
+            order.state = OrderState.REJECTED
+            order.reason = "ORDER_TRIGGER_NOT_FIRED"
+            order.updated_at = self._now()
+            return order
+        if (not order.instrument or order.side not in {"BUY", "SELL"}
+                or int(order.quantity or 0) <= 0):
+            order.state = OrderState.REJECTED
+            order.reason = "ORDER_INTENT_INVALID"
             order.updated_at = self._now()
             return order
         if not order.trade_id or not order.lifecycle_id or not order.parent_signal_id:
