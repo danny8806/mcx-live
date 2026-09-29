@@ -622,6 +622,76 @@ def create_live_app(live_engine=None) -> FastAPI:
                         "forced_ltp": forced_ltp, "trigger_price": pending.trigger_price,
                         "note": "trigger passed through StrategyInstance.on_tick and standard exit lifecycle"}
 
+        if action == "restore_reversal_entry":
+            # Restart-safe re-arm for the exact durable opposite breakout. The
+            # original signal and pending-order rows remain authoritative; this
+            # only rebuilds StrategyInstance's in-memory trigger after a prior
+            # close/restart cleared it. No broker order is sent here.
+            reversals = _persistence.get_reversals(strategy_id, limit=100)
+            reversal = next((r for r in reversals
+                             if r.get("instrument") == instrument
+                             and str(r.get("status", "")).upper() == "EXIT_FILLED"), None)
+            if reversal is None:
+                raise HTTPException(status_code=409, detail="reversal exit must be filled first")
+            if any(p.is_open for p in env.position_manager.get_positions_by_instrument(instrument)):
+                raise HTTPException(status_code=409, detail="local position must be flat")
+            try:
+                broker_rows = env.broker.positions()
+                if any(row.get("instrument") == instrument
+                       and int(row.get("quantity") or 0) != 0
+                       for row in broker_rows or []):
+                    raise HTTPException(status_code=409, detail="broker position must be flat")
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=503,
+                                    detail=f"broker flat check unavailable: {exc}")
+            pending = next((p for p in _persistence.get_pending_orders(
+                status="armed", execution_mode="LIVE")
+                if p.get("strategy_id") == strategy_id
+                and p.get("instrument") == instrument
+                and str(p.get("side", "")).upper() == str(reversal.get("side", "")).upper()), None)
+            if pending is None:
+                raise HTTPException(status_code=409, detail="durable opposite breakout is not armed")
+            signal_row = _persistence.get_signal(pending.get("signal_id"))
+            if signal_row is None:
+                raise HTTPException(status_code=409, detail="durable opposite signal is missing")
+            generation = int(pending.get("trigger_generation") or
+                             strategy._trigger_generation or 1)
+            side = str(pending.get("side", "")).upper()
+            from strategies.types import PendingEntry, Signal, SignalType, StrategyState
+            signal = Signal(
+                signal_type=SignalType(side), instrument=instrument,
+                strategy_id=strategy_id,
+                timestamp=float(signal_row.get("signal_timestamp") or time.time()),
+                trigger_price=float(pending.get("trigger_price") or 0),
+                stop_price=float(signal_row.get("stop_price") or 0),
+                quantity=1,
+                metadata={
+                    "pending": True, "triggered": False,
+                    "trigger_state": "ARMED", "trigger_generation": generation,
+                    "trigger_source": "market_websocket_ltp",
+                    "is_reversal": True, "is_reversal_entry": True,
+                    "reversal_parent_signal_id": reversal.get("signal_id"),
+                    "test_cycle": True,
+                },
+            )
+            signal.signal_id = str(pending.get("signal_id"))
+            strategy._trigger_generation = max(strategy._trigger_generation, generation)
+            strategy.pending_entry = PendingEntry(
+                signal=signal, trigger_price=float(pending["trigger_price"]),
+                side=side, status="pending",
+                created_at=float(pending.get("signal_timestamp") or time.time()))
+            strategy.state = (StrategyState.PENDING_LONG if side == "LONG"
+                              else StrategyState.PENDING_SHORT)
+            strategy.stop_price = signal.stop_price
+            return {"restored": True, "signal_id": signal.signal_id,
+                    "side": side, "quantity": 1,
+                    "trigger_price": signal.trigger_price,
+                    "stop_price": signal.stop_price,
+                    "reversal_id": reversal.get("reversal_id"),
+                    "note": "durable test reversal trigger re-armed in strategy memory; no order sent"}
+
         if action == "fire_reversal_entry":
             pen = strategy.pending_entry
             with _live_test_cycle_lock:
@@ -640,7 +710,13 @@ def create_live_app(live_engine=None) -> FastAPI:
                 if strategy.just_entered:
                     raise HTTPException(status_code=409, detail="wait for the next completed candle before reversal entry")
                 tick = float(_engine.config.instrument(instrument).get("tick_size", 1.0) or 1.0)
-                forced_ltp = pen.trigger_price + tick if pen.side == "LONG" else max(tick, pen.trigger_price - tick)
+                with execution._price_lock:
+                    observed = float(execution._current_prices.get(instrument, 0.0) or 0.0)
+                if observed <= 0:
+                    raise HTTPException(status_code=409, detail="no live tick price for opposite entry")
+                forced_ltp = (max(observed, pen.trigger_price + tick)
+                              if pen.side == "LONG"
+                              else max(tick, min(observed, pen.trigger_price - tick)))
                 signal = strategy.on_tick(forced_ltp, time.time())
                 if signal is None:
                     raise HTTPException(status_code=409, detail="strategy opposite-entry trigger did not fire")
