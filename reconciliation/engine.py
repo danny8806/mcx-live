@@ -453,12 +453,21 @@ class ReconciliationEngine:
         db_ids = {o.get("order_id") for o in db_orders}
         mem_ids = set(mem_orders.keys())
 
-        missing_in_mem = db_ids - mem_ids
+        # The in-memory engine restores working orders, not the complete
+        # historical order book. A terminal DB row missing from memory is
+        # therefore expected after restart; active orders missing from memory
+        # remain a reconciliation warning.
+        terminal = {"filled", "rejected", "cancelled", "canceled", "expired"}
+        missing_in_mem = {
+            order.get("order_id") for order in db_orders
+            if order.get("order_id") not in mem_ids
+            and str(order.get("state") or "").strip().lower() not in terminal
+        }
         extra_in_mem = mem_ids - db_ids
 
         if missing_in_mem:
             result.add_warning(
-                f"{len(missing_in_mem)} order(s) in DB but not in memory: "
+                f"{len(missing_in_mem)} nonterminal order(s) in DB but not in memory: "
                 f"{list(missing_in_mem)[:5]}{'...' if len(missing_in_mem) > 5 else ''}"
             )
 
