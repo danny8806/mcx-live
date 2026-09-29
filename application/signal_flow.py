@@ -80,7 +80,8 @@ class SignalFlowMixin:
         # During the narrowly scoped live canary, only its loopback-triggered
         # lifecycle may create entries. Normal strategy exits remain enabled
         # so risk controls can still reduce exposure during the test.
-        test_cfg = self.config.get("live_test_order_cycle", {}) or {}
+        config = getattr(self, "config", None)
+        test_cfg = (config.get("live_test_order_cycle", {}) or {}) if config else {}
         if (env.is_live and test_cfg.get("enabled")
                 and signal.strategy_id == str(test_cfg.get("strategy_id", ""))
                 and signal.instrument == str(test_cfg.get("instrument", ""))
