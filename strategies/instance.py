@@ -572,6 +572,15 @@ class StrategyInstance:
           SHORT → LONG: entry trigger = signal HIGH + gap
         """
         gap = int(getattr(self, "reversal_entry_gap_points", 0))
+        # A newer reversal can replace an earlier one while its local exit
+        # trigger is still waiting for a tick. Remember the old opposite-entry
+        # signal so the LIVE durable pending row can be terminalized together
+        # with the in-memory trigger below.
+        superseded_pending_entry_signal_id = getattr(
+            getattr(self.pending_entry, "signal", None), "signal_id", None)
+        if superseded_pending_entry_signal_id is not None:
+            superseded_pending_entry_signal_id = str(
+                superseded_pending_entry_signal_id)
         self._cancel_trigger(self.pending_exit_trigger)
         self._cancel_trigger(self.pending_entry)
         trigger, entry_trigger, stop = reversal_levels(
@@ -650,6 +659,9 @@ class StrategyInstance:
             "reversal_entry_signal": entry_signal,
             "position_side": self.position_side,
         }
+        if superseded_pending_entry_signal_id:
+            exit_signal.metadata["superseded_pending_entry_signal_id"] = (
+                superseded_pending_entry_signal_id)
         entry_signal.metadata["reversal_parent_signal_id"] = exit_signal.signal_id
 
         freeze_signal_context(

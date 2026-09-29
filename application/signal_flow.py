@@ -115,6 +115,59 @@ class SignalFlowMixin:
         order_manager = runtime.order_manager
         position_manager = runtime.position_manager
 
+        # A newer candle can replace an untriggered reversal. The strategy
+        # cancels the old trigger in memory and includes its opposite-entry
+        # signal id on the new REVERSAL_EXIT intent. Keep the LIVE recovery
+        # journal in sync before any new reversal gates or pending rows run.
+        superseded_pending_id = metadata.get(
+            "superseded_pending_entry_signal_id")
+        if (env.mode == "LIVE" and superseded_pending_id
+                and env.persistence is not None):
+            try:
+                terminalized = env.persistence.terminalize_pending_order(
+                    str(superseded_pending_id),
+                    status="cancelled_by_reversal",
+                    reason="reversal_signal_replaced_before_exit_trigger")
+                registry = getattr(env, "pending_triggers", None)
+                if registry is not None:
+                    registry.remove_signal(str(superseded_pending_id))
+                self.publish_event("pending_reversal_entry_superseded", {
+                    "old_signal_id": str(superseded_pending_id),
+                    "new_reversal_signal_id": signal.signal_id,
+                    "strategy_id": signal.strategy_id,
+                    "instrument": signal.instrument,
+                    "terminalized": bool(terminalized),
+                    "status": "cancelled_by_reversal",
+                    "execution_mode": env.mode,
+                }, env_name=env.name)
+                if not terminalized:
+                    log.warning(
+                        "[Engine] superseded reversal pending %s had no row "
+                        "to terminalize before %s",
+                        superseded_pending_id, signal.signal_id)
+            except Exception as e:
+                # This cleanup is lifecycle hygiene; never convert it into a
+                # broker action. Surface the failure through logs and events
+                # so operators can identify a potentially stale durable row.
+                log.error(
+                    "[Engine] failed to terminalize superseded reversal "
+                    "pending %s before %s: %s",
+                    superseded_pending_id, signal.signal_id, e)
+                self.publish_event("pending_reversal_supersede_cleanup_failed", {
+                    "old_signal_id": str(superseded_pending_id),
+                    "new_reversal_signal_id": signal.signal_id,
+                    "strategy_id": signal.strategy_id,
+                    "instrument": signal.instrument,
+                    "error": str(e),
+                    "execution_mode": env.mode,
+                }, env_name=env.name)
+                # Do not arm or execute the replacement while durable state
+                # still says the old opposite entry is active. Keep the
+                # existing broker position and its stop as the sole owner.
+                self._preserve_position_after_exit_block(
+                    signal, env, cancel_reversal=True)
+                return
+
         # A bare opposite-side signal while this strategy holds an open
         # position is a REVERSAL: it closes the held position (never opens a
         # phantom/duplicate trade). Re-entry on the opposite side happens only

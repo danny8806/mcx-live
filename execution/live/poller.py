@@ -37,7 +37,7 @@ from config import as_dict
 log = logging.getLogger(__name__)
 
 _TASKS = ("orders", "positions", "account", "reconcile")
-_DEFAULT_INTERVAL = 5.0
+_DEFAULT_INTERVAL = 0.5
 
 # Exit-family order roles: an order whose whole purpose is to REDUCE or close
 # exposure.  These are the only roles a MARKET order is ever allowed to serve
@@ -123,10 +123,14 @@ class LiveBrokerPoller:
 
         live_cfg = as_dict(config).get("live", {}) or {}
         self.intervals = {
-            "orders": _interval(live_cfg, "order_poll_interval_seconds", 2.0),
+            "orders": _interval(live_cfg, "order_poll_interval_seconds", 0.5),
             "positions": _interval(live_cfg, "position_poll_interval_seconds", _DEFAULT_INTERVAL),
             "account": _interval(live_cfg, "pnl_poll_interval_seconds", _DEFAULT_INTERVAL),
-            "reconcile": _interval(live_cfg, "reconcile_interval_seconds", _DEFAULT_INTERVAL),
+            # Broker-flat reconciliation also releases a manually closed
+            # position's strategy state and any reversal waiting for flat.
+            # Keep this faster than the market/account snapshots; 0.5s stays
+            # well inside Dhan's documented non-trading REST request limit.
+            "reconcile": _interval(live_cfg, "reconcile_interval_seconds", 0.5),
         }
         self.max_retries = int(live_cfg.get("max_retries", 3) or 3)
         self.retry_backoff = float(live_cfg.get("retry_backoff_seconds", 1.0) or 1.0)
@@ -180,7 +184,10 @@ class LiveBrokerPoller:
         while self._running:
             now = self._clock()
             for task in _TASKS:
-                if now >= self._next_run.get(task, 0.0):
+                # Avoid an extra 50 ms sleep when binary float rounding puts
+                # an otherwise-due half-second poll infinitesimally ahead of
+                # the clock value.
+                if now + 1e-9 >= self._next_run.get(task, 0.0):
                     try:
                         self._run_task(task)
                     except Exception as e:  # pragma: no cover - defensive
@@ -192,7 +199,8 @@ class LiveBrokerPoller:
             # Sleep in small slices so stop() responds quickly.
             deadline = self._clock() + 0.25
             while self._running and self._clock() < deadline:
-                time.sleep(0.05)
+                remaining = deadline - self._clock()
+                time.sleep(min(0.05, remaining))
 
     def _run_task(self, task: str):
         if task == "orders":

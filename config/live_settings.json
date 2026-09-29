@@ -188,10 +188,10 @@
     "live_trading_enabled": true,
     "gate": "ON",
     "broker": "dhan",
-    "reconcile_interval_seconds": 5,
+    "reconcile_interval_seconds": 0.5,
     "order_poll_interval_seconds": 0.5,
-    "position_poll_interval_seconds": 5,
-    "pnl_poll_interval_seconds": 5,
+    "position_poll_interval_seconds": 0.5,
+    "pnl_poll_interval_seconds": 0.5,
     "max_retries": 3,
     "retry_backoff_seconds": 1.0,
     "dhan": {

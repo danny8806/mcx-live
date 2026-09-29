@@ -80,8 +80,8 @@ def test_poller_still_falls_back_to_defaults_when_the_section_is_absent():
     Config._config = {"live": {}}
     poller = LiveBrokerPoller(SimpleNamespace(name="live"), Config())
 
-    assert poller.intervals["orders"] == 2.0
-    assert poller.intervals["positions"] == 5.0
+    assert poller.intervals["orders"] == 0.5
+    assert poller.intervals["positions"] == 0.5
 
 
 # ── OrderWatcher ────────────────────────────────────────────────────────
@@ -120,4 +120,4 @@ def test_broker_sync_reads_the_order_ws_flag_from_the_live_section():
     assert sync._ws_enabled is False
     assert sync._stale_threshold == 45.0          # live.stale_threshold
     assert sync._ws_cfg["stale_threshold"] == 30.0   # live.order_ws.stale_threshold
-    assert sync._poller.intervals["orders"] == 2.0
+    assert sync._poller.intervals["orders"] == 0.5

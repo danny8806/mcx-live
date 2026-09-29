@@ -474,6 +474,41 @@ def test_startup_arms_only_broker_confirmed_positions():
     assert h.processed == []
 
 
+def test_broker_flat_external_close_releases_strategy_and_preserves_reversal():
+    """A manual/Dhan close must release the old position and unblock reversal."""
+    h = Harness()
+    position = make_position(pid="P-EXTERNAL", stop=90.0)
+    strategy = FakeStrategy("S1", "NIFTY")
+    pending = type("Pending", (), {"status": "waiting_for_flat"})()
+    strategy.pending_entry = pending
+    broker = FakeBroker([])  # user closed it directly at Dhan
+    env = h.add_env(FakeEnv("LIVE", {"S1": strategy},
+                            make_pm([position]), broker))
+    h._sl_monitor(env).arm(position)
+    reset_calls = []
+
+    def reset_strategy(strategy_id, keep_pending=False, env_name=None):
+        reset_calls.append((strategy_id, keep_pending, env_name))
+        strategy.position_side = None
+        strategy.stop_price = None
+        if keep_pending:
+            pending.status = "pending"
+        else:
+            strategy.pending_entry = None
+        h._sl_monitor(env).close(position.position_id)
+
+    h._reset_strategy_state = reset_strategy
+    summary = h.sync_sl_from_broker("LIVE")
+
+    assert [row["position_id"] for row in summary["dropped_local"]] == ["P-EXTERNAL"]
+    assert env.position_manager.get_position("P-EXTERNAL").is_open is False
+    assert env.sl_monitor.armed_ids() == []
+    assert reset_calls == [("S1", True, "LIVE")]
+    assert strategy.position_side is None
+    assert strategy.pending_entry is pending
+    assert pending.status == "pending"
+
+
 def test_startup_treats_the_transports_dhan_fan_out_as_one_net():
     """Dhan reports ONE signed netQty per securityId, with no strategy id.
 

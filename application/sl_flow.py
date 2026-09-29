@@ -646,9 +646,29 @@ class SLFlowMixin:
             if not pid:
                 continue
             try:
-                pm.abandon_stale_position(str(pid))
+                stale_position = pm.abandon_stale_position(str(pid))
             except Exception as e2:
                 log.error("[SL] could not close stale position %s: %s", pid, e2)
+                stale_position = None
+            # A broker/manual close removes the position owner without routing
+            # an exit fill through fill_flow. Release the strategy's position
+            # state at the same time, preserving an opposite reversal trigger
+            # so it can resume as a normal pending entry once the broker is
+            # confirmed flat. Otherwise position_side remains set forever and
+            # the reversal stays waiting_for_flat (and cannot expire or fire).
+            stale_sid = (entry.get("strategy_id")
+                         or getattr(stale_position, "strategy_id", None))
+            strategy = (getattr(env, "strategies", {}) or {}).get(stale_sid)
+            if strategy is not None:
+                reset_strategy = getattr(self, "_reset_strategy_state", None)
+                if callable(reset_strategy):
+                    keep_pending = getattr(strategy, "pending_entry", None) is not None
+                    try:
+                        reset_strategy(stale_sid, keep_pending=keep_pending,
+                                       env_name=getattr(env, "name", None))
+                    except Exception as e2:
+                        log.error("[SL] strategy reset after broker-flat position %s "
+                                  "failed: %s", pid, e2)
             self.publish_event("sl_stale_local_position_closed", dict(
                 entry, execution_mode=getattr(env, "mode", None)),
                 env_name=getattr(env, "name", None))
