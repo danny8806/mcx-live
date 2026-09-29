@@ -480,6 +480,9 @@ def create_live_app(live_engine=None) -> FastAPI:
                     side, observed, observed + tick, max(tick, observed - tick),
                     time.time(), prev_high=observed + tick,
                     prev_low=max(tick, observed - tick), open_=observed)
+                (signal.metadata or {})["test_cycle"] = True
+                if strategy.pending_entry is not None:
+                    (strategy.pending_entry.signal.metadata or {})["test_cycle"] = True
                 _engine._bind_signal_position(signal, strategy, "live")
                 _engine._process_signal(signal, "live")
                 pending = strategy.pending_exit_trigger

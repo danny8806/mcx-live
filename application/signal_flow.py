@@ -77,6 +77,22 @@ class SignalFlowMixin:
                 {"signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
                  "execution_mode": env.mode})
             return
+        # During the narrowly scoped live canary, only its loopback-triggered
+        # lifecycle may create entries. Normal strategy exits remain enabled
+        # so risk controls can still reduce exposure during the test.
+        test_cfg = self.config.get("live_test_order_cycle", {}) or {}
+        if (env.is_live and test_cfg.get("enabled")
+                and signal.strategy_id == str(test_cfg.get("strategy_id", ""))
+                and signal.instrument == str(test_cfg.get("instrument", ""))
+                and not is_exit and not bool(metadata.get("test_cycle"))):
+            self.publish_event("live_test_cycle_signal_blocked", {
+                "signal_id": signal.signal_id,
+                "strategy_id": signal.strategy_id,
+                "instrument": signal.instrument,
+                "reason": "canary_only_entry_mode",
+                "execution_mode": env.mode,
+            }, env_name=env.name)
+            return
         try:
             runtime = env.runtimes.require(signal.strategy_id)
         except (KeyError, ValueError):
