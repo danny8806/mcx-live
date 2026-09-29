@@ -40,6 +40,9 @@ class SignalFlowMixin:
             strategy._cancel_trigger(getattr(strategy, "pending_entry", None))
             strategy.pending_exit_trigger = None
             strategy.pending_entry = None
+            registry = getattr(env, "pending_triggers", None)
+            if registry is not None:
+                registry.sync_strategy(strategy)
             strategy._last_fired_trigger_signal_id = None
             strategy._fired_trigger_signal_ids.clear()
         strategy.state = (StrategyState.LONG_POSITION
@@ -203,6 +206,9 @@ class SignalFlowMixin:
                 except Exception as e:
                     log.warning("[Engine] cancel_inflight: failed to "
                                 "terminalize pending %s: %s", old_pending_id, e)
+                registry = getattr(env, "pending_triggers", None)
+                if registry is not None:
+                    registry.remove_signal(str(old_pending_id))
             keep_current_trigger = bool(
                 strategy is not None
                 and getattr(strategy, "pending_entry", None) is not None
@@ -492,6 +498,9 @@ class SignalFlowMixin:
                                 side=side, status="pending", created_at=time.time())
                             strategy.state = (StrategyState.PENDING_LONG if side == "LONG"
                                               else StrategyState.PENDING_SHORT)
+                            registry = getattr(env, "pending_triggers", None)
+                            if registry is not None:
+                                registry.sync_strategy(strategy)
                         self.publish_event("reversal_flat_gate_blocked", {
                             "signal_id": signal.signal_id,
                             "strategy_id": signal.strategy_id,
@@ -561,6 +570,9 @@ class SignalFlowMixin:
                                                   reason="exit_not_submitted")
                 if reversal_sig:
                     strategy.pending_entry = None
+                    registry = getattr(env, "pending_triggers", None)
+                    if registry is not None:
+                        registry.sync_strategy(strategy)
             else:
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
             return

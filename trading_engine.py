@@ -708,6 +708,9 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                     return {"success": False, "strategy_id": strategy_id, "action": action,
                             "error": "Cannot pause a strategy with an open position; close it first."}
                 strat.pending_entry = None
+                registry = getattr(env, "pending_triggers", None)
+                if registry is not None:
+                    registry.sync_strategy(strat)
                 strat.enabled = False
             gate.live_gate = "CLOSE_ONLY"
             gate.entry_enabled = False
@@ -1723,6 +1726,9 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                     strat.restore(strategies_state[name])
                 except Exception:
                     pass
+            registry = getattr(env, "pending_triggers", None)
+            if registry is not None:
+                registry.sync_strategy(strat)
         positions_state = saved_state.get("positions")
         if positions_state:
             try:
@@ -1875,6 +1881,9 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         if env.runtimes is not None:
             for rt in env.runtimes.all():
                 rt.current_trade_id = getattr(rt.strategy, "current_trade_id", None)
+        # DB recovery is a one-time startup operation (before start() enables
+        # WebSocket ticks). Never query SQLite from the per-tick callback.
+        self._restore_live_pending_triggers(env)
         try:
             self.publish_event("engine_restored", {
                 "timestamp": time.time(),

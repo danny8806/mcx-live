@@ -25,6 +25,10 @@ class MarketEventFlowMixin:
 
                 is_fast = (event.timeframe == strategy.fast_timeframe)
                 signal = strategy.on_candle(event)
+                env = self._env_for(env_name)
+                registry = getattr(env, "pending_triggers", None)
+                if registry is not None:
+                    registry.sync_strategy(strategy)
                 if signal and is_fast:
                     self._bind_signal_position(signal, strategy, env_name)
                     self._process_signal(signal, env_name)
@@ -35,11 +39,24 @@ class MarketEventFlowMixin:
                 return
             if strategy.instrument != event.instrument:
                 return
-            if not (strategy.pending_entry is not None or strategy.position_side is not None):
-                return
+            env = self._env_for(env_name)
+            registry = getattr(env, "pending_triggers", None)
             with self._lock:
+                # Restore a missing strategy reference from the O(1) hot-path
+                # registry. Tick handling never queries SQLite. Keep recovery,
+                # crossing and one-shot removal under the engine lock so two
+                # concurrent ticks cannot race the same trigger.
+                if registry is not None:
+                    if strategy.pending_entry is None:
+                        strategy.pending_entry = registry.entry_for(strategy.strategy_id)
+                    if strategy.pending_exit_trigger is None:
+                        strategy.pending_exit_trigger = registry.exit_for(strategy.strategy_id)
+                if not (strategy.pending_entry is not None or strategy.position_side is not None):
+                    return
                 try:
                     tick_signal = strategy.on_tick(event.ltp, event.timestamp)
+                    if registry is not None:
+                        registry.sync_strategy(strategy)
                     if tick_signal:
                         self._bind_signal_position(tick_signal, strategy, env_name)
                         self._process_signal(tick_signal, env_name)

@@ -480,8 +480,8 @@ class PersistenceManager:
                     signal_timestamp, trigger_price, stop_price, quantity,
                     candle_timestamp, open, high, low, close, volume,
                     htf_value, mid_value, fast_dema, fast_atr, signal_reason,
-                    candle_data, indicator_data, execution_mode
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    candle_data, indicator_data, signal_metadata, execution_mode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(signal_id) DO UPDATE SET
                     strategy_id=excluded.strategy_id,
                     instrument=excluded.instrument,
@@ -509,7 +509,9 @@ class PersistenceManager:
                     candle_data=COALESCE(excluded.candle_data,
                                          signals.candle_data),
                     indicator_data=COALESCE(excluded.indicator_data,
-                                            signals.indicator_data)
+                                            signals.indicator_data),
+                    signal_metadata=COALESCE(excluded.signal_metadata,
+                                             signals.signal_metadata)
             """, (
                 signal_data.get("signal_id"),
                 signal_data.get("strategy_id"),
@@ -533,6 +535,8 @@ class PersistenceManager:
                 signal_data.get("signal_reason"),
                 json.dumps(candle) if candle else None,
                 json.dumps(indicator) if indicator else None,
+                json.dumps(signal_data.get("signal_metadata"))
+                if signal_data.get("signal_metadata") is not None else None,
                 self.execution_mode,
             ))
 

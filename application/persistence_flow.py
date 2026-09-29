@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -24,6 +25,19 @@ class PersistenceFlowMixin:
         # every candle column NULL and the blobs absent.
         ctx = getattr(signal, "context", None)
         metadata = getattr(signal, "metadata", None) or {}
+        # Persist metadata needed to reconstruct reversal and breakout triggers.
+        # Nested Signal objects are represented by their ids; their full rows
+        # are saved separately by this same signal flow.
+        saved_metadata = {}
+        for key, value in metadata.items():
+            if hasattr(value, "signal_id"):
+                saved_metadata[f"{key}_signal_id"] = value.signal_id
+            elif isinstance(value, (str, int, float, bool)) or value is None:
+                saved_metadata[key] = value
+            elif isinstance(value, (list, tuple)) and all(
+                    isinstance(item, (str, int, float, bool)) or item is None
+                    for item in value):
+                saved_metadata[key] = list(value)
         candle_blob = None
         indicator_blob = None
         if ctx is not None:
@@ -53,6 +67,7 @@ class PersistenceFlowMixin:
             "signal_reason": metadata.get("reason") or metadata.get("trigger_reason"),
             "candle_data": candle_blob,
             "indicator_data": indicator_blob,
+            "signal_metadata": saved_metadata,
         })
     def _persist_order(self, order, signal,
                        env_name: Optional[str] = None) -> None:
@@ -91,6 +106,11 @@ class PersistenceFlowMixin:
         """The durable pending-order row for a signal (LIVE env only)."""
         if env.persistence is None:
             return None
+        registry = getattr(env, "pending_triggers", None)
+        if registry is not None:
+            # The tick-to-order path uses the in-memory ARMED row; it must not
+            # scan SQLite while handling a WebSocket tick.
+            return registry.live_row(signal.signal_id)
         rows = env.persistence.get_pending_orders(execution_mode="LIVE")
         return next((r for r in rows if r.get("pending_order_id") == signal.signal_id), None)
     def _arm_live_pending(self, signal, env) -> None:
@@ -118,6 +138,12 @@ class PersistenceFlowMixin:
             "trade_id": None,
         }
         existing = self._live_pending_row(env, signal)
+        # Arming happens on the completed-candle path, outside the WebSocket
+        # hot path, so a cache miss may consult the durable journal here.
+        if existing is None and env.persistence is not None:
+            rows = env.persistence.get_pending_orders(execution_mode="LIVE")
+            existing = next((r for r in rows
+                             if r.get("pending_order_id") == pend_id), None)
         if existing is not None:
             try:
                 transition_pending_state(
@@ -129,13 +155,21 @@ class PersistenceFlowMixin:
             row["status"] = PendingOrderState.ARMED.value
             row["armed_at"] = datetime.now(timezone.utc).isoformat()
             env.persistence.save_pending_order(row)
+            registry = getattr(env, "pending_triggers", None)
+            if registry is not None:
+                registry.cache_live_row(row)
             strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
             if strategy is not None:
                 strategy._last_armed_pending_id = pend_id
+                if registry is not None:
+                    registry.sync_strategy(strategy)
             return
         row = dict(base)
         row["status"] = PendingOrderState.PENDING.value
         env.persistence.save_pending_order(row)
+        registry = getattr(env, "pending_triggers", None)
+        if registry is not None:
+            registry.cache_live_row(row)
         self.publish_event("pending_order_created", {
             "pending_order_id": pend_id, "signal_id": pend_id,
             "state": row["status"], "execution_mode": env.mode}, env_name=env.name)
@@ -143,9 +177,13 @@ class PersistenceFlowMixin:
             row["status"], PendingOrderState.ARMED.value, pend_id)
         row["armed_at"] = datetime.now(timezone.utc).isoformat()
         env.persistence.save_pending_order(row)
+        if registry is not None:
+            registry.cache_live_row(row)
         strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
         if strategy is not None:
             strategy._last_armed_pending_id = pend_id
+            if registry is not None:
+                registry.sync_strategy(strategy)
         self.publish_event("pending_order_armed", {
             "pending_order_id": pend_id, "signal_id": pend_id,
             "state": row["status"], "execution_mode": env.mode}, env_name=env.name)
@@ -187,6 +225,146 @@ class PersistenceFlowMixin:
             "correlation_id": getattr(order, "correlation_id", None),
             "broker_order_id": getattr(order, "_broker_order_id", None),
         })
+        registry = getattr(env, "pending_triggers", None)
+        if registry is not None:
+            registry.update_live_row(pend_id, {
+                "status": status, "trade_id": trade.trade_id,
+                "correlation_id": getattr(order, "correlation_id", None),
+                "broker_order_id": getattr(order, "_broker_order_id", None),
+            })
+
+    def _restore_live_pending_triggers(self, env) -> int:
+        """Warm the in-memory trigger index from the LIVE DB before WS starts.
+
+        All durable rows are cached for replay/duplicate-state checks. Only
+        ARMED rows become executable in-memory triggers.
+        """
+        registry = getattr(env, "pending_triggers", None)
+        persistence = getattr(env, "persistence", None)
+        if registry is None or persistence is None or env.mode != "LIVE":
+            return 0
+        from strategies.types import (PendingEntry, Signal, SignalType,
+                                      StrategyState, freeze_signal_context)
+        try:
+            rows = persistence.get_pending_orders(execution_mode="LIVE")
+        except Exception as exc:
+            log.error("[Engine] pending trigger restore failed: %s", exc)
+            return 0
+        restored = 0
+        for row in rows:
+            registry.cache_live_row(row)
+            if str(row.get("status", "")).lower() != PendingOrderState.ARMED.value:
+                continue
+            sid = str(row.get("strategy_id") or "")
+            strategy = (getattr(env, "strategies", {}) or {}).get(sid)
+            signal_id = str(row.get("signal_id") or row.get("pending_order_id") or "")
+            if strategy is None or not signal_id or row.get("trigger_price") is None:
+                log.error("[Engine] armed pending %s cannot be restored; missing strategy/id/trigger",
+                          signal_id or "?")
+                continue
+            current = strategy.pending_entry
+            if current is not None and getattr(current.signal, "signal_id", None) == signal_id:
+                registry.sync_strategy(strategy)
+                restored += 1
+                continue
+            try:
+                saved = persistence.get_signal(signal_id)
+                if not saved:
+                    raise ValueError("signal row is missing")
+                side = str(row.get("direction") or row.get("side") or saved.get("side") or "").upper()
+                signal_type = SignalType(side)
+                timestamp = float(row.get("signal_timestamp") or saved.get("signal_timestamp") or 0.0)
+                metadata = {
+                    "pending": True, "triggered": False, "trigger_state": "ARMED",
+                    "trigger_generation": int(row.get("trigger_generation") or 0),
+                    "trigger_source": row.get("trigger_source") or "market_websocket_ltp",
+                    "signal_candle_start": saved.get("candle_timestamp"),
+                    "signal_candle_open": saved.get("open"),
+                    "signal_candle_high": saved.get("high"),
+                    "signal_candle_low": saved.get("low"),
+                    "signal_candle_close": saved.get("close"),
+                    "signal_htf_dema_atr": saved.get("htf_value"),
+                    "signal_mid_dema_atr": saved.get("mid_value"),
+                    "signal_fast_dema_atr": saved.get("fast_dema"),
+                }
+                try:
+                    import json
+                    metadata.update(json.loads(saved.get("signal_metadata") or "{}"))
+                except (TypeError, ValueError):
+                    pass
+                if current is not None and getattr(current.signal, "signal_id", None) == signal_id:
+                    metadata.update(current.signal.metadata or {})
+                signal = Signal(
+                    signal_type=signal_type, instrument=str(row.get("instrument") or saved.get("instrument")),
+                    strategy_id=sid, timestamp=timestamp,
+                    trigger_price=float(row["trigger_price"]),
+                    stop_price=float(saved.get("stop_price") or 0.0),
+                    quantity=int(row.get("quantity") or saved.get("quantity") or strategy.quantity),
+                    side=side, metadata=metadata,
+                )
+                signal.signal_id = signal_id
+                freeze_signal_context(
+                    signal, close=saved.get("close"), high=saved.get("high"),
+                    low=saved.get("low"), timestamp=saved.get("candle_timestamp") or timestamp,
+                    open_=saved.get("open"), dema=saved.get("fast_dema"),
+                    atr=saved.get("fast_atr"), htf_value=saved.get("htf_value"),
+                    mid_value=saved.get("mid_value"),
+                )
+                created_at = time.time()
+                try:
+                    from datetime import datetime
+                    armed_at = row.get("armed_at")
+                    if armed_at:
+                        created_at = datetime.fromisoformat(armed_at).timestamp()
+                except (TypeError, ValueError):
+                    pass
+                entry_status = ("waiting_for_flat"
+                                if metadata.get("is_reversal_entry")
+                                and strategy.position_side is not None else "pending")
+                pending = PendingEntry(signal=signal, trigger_price=float(row["trigger_price"]),
+                                       side=side, status=entry_status, created_at=created_at)
+                strategy.pending_entry = pending
+                strategy._trigger_generation = max(
+                    int(getattr(strategy, "_trigger_generation", 0)),
+                    int(row.get("trigger_generation") or 0))
+                strategy._last_armed_pending_id = signal_id
+                if strategy.position_side is None:
+                    strategy.state = (StrategyState.PENDING_LONG if side == "LONG"
+                                      else StrategyState.PENDING_SHORT)
+                # Rebuild the opposite-position exit trigger for a reversal.
+                # The entry row points back to its parent exit signal id.
+                reversal_exit_id = metadata.get("reversal_parent_signal_id")
+                if reversal_exit_id and strategy.pending_exit_trigger is None:
+                    exit_saved = persistence.get_signal(str(reversal_exit_id))
+                    if exit_saved is not None:
+                        try:
+                            exit_meta = json.loads(exit_saved.get("signal_metadata") or "{}")
+                        except (TypeError, ValueError):
+                            exit_meta = {}
+                        exit_side = str(exit_saved.get("side") or "").upper()
+                        exit_signal = Signal(
+                            signal_type=SignalType(exit_side), instrument=str(exit_saved.get("instrument") or strategy.instrument),
+                            strategy_id=sid,
+                            timestamp=float(exit_saved.get("signal_timestamp") or timestamp),
+                            trigger_price=float(exit_saved.get("trigger_price") or 0.0),
+                            stop_price=float(exit_saved.get("stop_price") or 0.0),
+                            quantity=int(exit_saved.get("quantity") or strategy.quantity),
+                            side=exit_side, metadata=exit_meta,
+                        )
+                        exit_signal.signal_id = str(reversal_exit_id)
+                        strategy.pending_exit_trigger = PendingEntry(
+                            signal=exit_signal, trigger_price=exit_signal.trigger_price,
+                            side=exit_side, status="pending", created_at=created_at)
+                if strategy.pending_exit_trigger is not None:
+                    strategy.state = StrategyState.EXIT_PENDING
+                registry.sync_strategy(strategy)
+                restored += 1
+                log.warning("[Engine] restored armed trigger %s for %s from durable state",
+                            signal_id, sid)
+            except Exception as exc:
+                log.error("[Engine] armed pending %s cannot be safely restored: %s",
+                          signal_id, exc)
+        return restored
         self.publish_event("pending_order_entry_sent", {
             "pending_order_id": pend_id, "signal_id": pend_id,
             "trade_id": trade.trade_id, "order_id": order.order_id,
@@ -342,6 +520,9 @@ class PersistenceFlowMixin:
                 strategy._cancel_trigger(strategy.pending_entry)
                 strategy.pending_entry = None
             strategy.current_trade_id = None
+            registry = getattr(env, "pending_triggers", None)
+            if registry is not None:
+                registry.sync_strategy(strategy)
         runtime = env.runtimes.get(strategy_id) if env.runtimes is not None else None
         if runtime is not None:
             runtime.current_trade_id = None

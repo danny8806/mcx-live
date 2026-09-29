@@ -845,6 +845,7 @@ _ALTER_MIGRATIONS: list[tuple[str, str, str]] = [
     ("signals", "fast_dema", "REAL"),
     ("signals", "fast_atr", "REAL"),
     ("signals", "signal_reason", "TEXT"),
+    ("signals", "signal_metadata", "TEXT"),
     ("trade_events", "event_version", "INTEGER"),
     ("trade_events", "payload_json", "TEXT"),
     ("trade_events", "sequence_no", "INTEGER"),

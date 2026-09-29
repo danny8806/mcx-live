@@ -105,6 +105,11 @@ class LiveEngine:
                 self.engine.restore(saved, env_name="live")
             except Exception as e:  # noqa: BLE001
                 log.error("[LiveEngine] restore failed: %s", e)
+        # Even without a JSON state snapshot, pending entries survive in the
+        # canonical DB. Rebuild their in-memory hot-path triggers before the
+        # caller starts the WebSocket adapter.
+        if not saved:
+            self.engine._restore_live_pending_triggers(self.env)
         return saved
 
     def start(self) -> None:

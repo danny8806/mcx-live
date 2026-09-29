@@ -30,6 +30,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from strategies.instance import StrategyInstance
+from core.pending_trigger_registry import PendingTriggerRegistry
 from strategies.runtime import StrategyRuntimeRegistry
 
 
@@ -171,6 +172,7 @@ class Environment:
     indicator_engine: Any = None                    # SharedNativeIndicatorEngine (per-env)
     market_status: Any = None                       # MarketStatus (per-env)
     safe_mode: Any = None                           # SafeModeManager (per-env)
+    pending_triggers: PendingTriggerRegistry = field(default_factory=PendingTriggerRegistry)
 
     @property
     def identity(self) -> str:

@@ -614,6 +614,9 @@ def create_live_app(live_engine=None) -> FastAPI:
                         or str(pending_row.get("status", "")).lower() != "armed"):
                     strategy._cancel_trigger(strategy.pending_entry)
                     strategy.pending_entry = None
+                    registry = getattr(env, "pending_triggers", None)
+                    if registry is not None:
+                        registry.sync_strategy(strategy)
                     strategy.state = StrategyState.FLAT
                     _live_test_entry_signal_id = None
                     raise HTTPException(
@@ -777,6 +780,9 @@ def create_live_app(live_engine=None) -> FastAPI:
             strategy.state = (StrategyState.PENDING_LONG if side == "LONG"
                               else StrategyState.PENDING_SHORT)
             strategy.stop_price = signal.stop_price
+            registry = getattr(env, "pending_triggers", None)
+            if registry is not None:
+                registry.sync_strategy(strategy)
             return {"restored": True, "signal_id": signal.signal_id,
                     "side": side, "quantity": 1,
                     "trigger_price": signal.trigger_price,

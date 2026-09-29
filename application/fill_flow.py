@@ -763,6 +763,9 @@ class FillFlowMixin:
         strat.pending_entry = None
         strat.pending_exit_trigger = None
         setattr(strat, "stop_exit_submitted", False)
+        registry = getattr(env, "pending_triggers", None)
+        if registry is not None:
+            registry.sync_strategy(strat)
     def _notify_entry_fill(self, fill, position, env, signal_id: Optional[str]) -> None:
         try:
             strat_obj = env.strategies.get(fill.strategy_id)
