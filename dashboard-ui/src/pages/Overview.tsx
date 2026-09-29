@@ -197,8 +197,12 @@ export default function Overview() {
     );
   }
 
-  const goldStrats = strategies.filter((s: any) => s.instrument === "GOLDM");
-  const silverStrats = strategies.filter((s: any) => s.instrument === "SILVERM");
+  const strategyGroups = Array.from(new Set(
+    strategies.map((s: any) => s.instrument || "UNKNOWN"),
+  )).sort().map((instrument) => ({
+    instrument,
+    strategies: strategies.filter((s: any) => (s.instrument || "UNKNOWN") === instrument),
+  }));
   const openPositions = positions.filter((p: any) => p.is_open);
 
   return (
@@ -241,20 +245,15 @@ export default function Overview() {
       </div>
 
       <div className="split-grid-2">
-        <div className="lift" style={panelStyle}>
-          <div style={panelHeader}>GOLD STRATEGIES ({goldStrats.length})</div>
-          <div style={{ maxHeight: "200px", overflow: "auto" }}>
-            {goldStrats.map((s: any) => <StrategyRow key={s.strategy_id} s={s} />)}
-            {goldStrats.length === 0 && <div style={{ padding: "16px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>No strategies</div>}
+        {strategyGroups.map(({ instrument, strategies: instrumentStrategies }) => (
+          <div key={instrument} className="lift" style={panelStyle}>
+            <div style={panelHeader}>{instrument} STRATEGIES ({instrumentStrategies.length})</div>
+            <div style={{ maxHeight: "200px", overflow: "auto" }}>
+              {instrumentStrategies.map((s: any) => <StrategyRow key={s.strategy_id} s={s} />)}
+            </div>
           </div>
-        </div>
-        <div className="lift" style={panelStyle}>
-          <div style={panelHeader}>SILVERM STRATEGIES ({silverStrats.length})</div>
-          <div style={{ maxHeight: "200px", overflow: "auto" }}>
-            {silverStrats.map((s: any) => <StrategyRow key={s.strategy_id} s={s} />)}
-            {silverStrats.length === 0 && <div style={{ padding: "16px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>No strategies</div>}
-          </div>
-        </div>
+        ))}
+        {strategyGroups.length === 0 && <div className="lift" style={{ ...panelStyle, padding: "16px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>No strategies</div>}
       </div>
 
       <div className="lift" style={panelStyle}>

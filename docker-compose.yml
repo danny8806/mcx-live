@@ -1,15 +1,19 @@
-# LIVE-MCX — single real-broker gateway behind nginx (no demo/paper services).
+# LIVE-MCX — real-broker gateway. Production uses the VPS host-level nginx;
+# enable the optional container ingress only on hosts without another proxy.
 #
-#   nginx     single ingress (TLS + WebSockets), publishes 80/443 only
+#   nginx     optional container ingress (TLS + WebSockets), opt-in profile
 #   live-mcx  real-broker gateway (live.run, live/data/db, port 8001)
 #
-# Only nginx publishes ports.  live-mcx keeps its own DB volume and env file.
+# Production VPS uses host-level nginx to proxy to loopback port 8001. The
+# optional container ingress must not be enabled on that host because it binds
+# the same public ports. live-mcx keeps its own DB volume and env file.
 # Generate env files with:  python scripts/gen_service_envs.py
-# TLS certs must exist before nginx starts: ./nginx/certs/live.crt + live.key
+# For container ingress, TLS certs must exist: ./nginx/certs/live.crt + live.key
 name: live-only
 
 services:
   nginx:
+    profiles: ["container-ingress"]
     build:
       context: .
       dockerfile: nginx/Dockerfile

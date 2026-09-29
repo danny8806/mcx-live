@@ -11,11 +11,29 @@ export default function LiveTrading() {
   const fills = useDataSelector<any[]>((s) => s.fills);
   const goldOverview = useDataSelector<any>((s) => s.goldOverview);
   const silverOverview = useDataSelector<any>((s) => s.silverOverview);
+  const marketData = useDataSelector<any>((s) => s.marketData);
   if (!overview) return <div style={{ padding: "20px", color: "var(--text-muted)" }}>Loading...</div>;
 
   const openPositions = positions.filter((p: any) => p.is_open);
-  const goldStrats = strategies.filter((s: any) => s.instrument === "GOLDM");
-  const silverStrats = strategies.filter((s: any) => s.instrument === "SILVERM");
+  const ltpFor = (instrument: string) => Number(
+    marketData?.instruments?.[instrument]?.ltp
+      ?? (instrument === "GOLDM" ? goldOverview?.ltp : undefined)
+      ?? (instrument === "SILVERM" ? silverOverview?.ltp : undefined)
+      ?? 0,
+  );
+  // Show instruments supplied by the feed as well as instruments currently
+  // used by strategies/positions. This keeps non-mini contracts (e.g.
+  // GOLDPETAL) visible instead of silently assigning them SILVERM's quote.
+  const instrumentNames = Array.from(new Set([
+    ...Object.keys(marketData?.instruments ?? {}),
+    ...strategies.map((s: any) => s.instrument).filter(Boolean),
+    ...openPositions.map((p: any) => p.instrument).filter(Boolean),
+  ])).sort();
+  const instrumentCards = instrumentNames.map((name) => ({
+    name,
+    ltp: ltpFor(name),
+    strats: strategies.filter((s: any) => s.instrument === name),
+  }));
 
   // Show the next live trigger: reversal exits first, then the opposite entry.
   const pendingEntries = strategies
@@ -23,14 +41,14 @@ export default function LiveTrading() {
     .map((s: any) => ({
       strategy_id: s.strategy_id,
       instrument: s.instrument,
-      ltp: s.instrument === "GOLDM" ? (goldOverview?.ltp ?? 0) : (silverOverview?.ltp ?? 0),
+      ltp: ltpFor(s.instrument),
       ...(s.pending_exit_trigger || s.pending_entry),
     }));
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
       <div className="split-grid-2">
-        {[{ name: "GOLDM", ltp: goldOverview?.ltp ?? 0, strats: goldStrats }, { name: "SILVERM", ltp: silverOverview?.ltp ?? 0, strats: silverStrats }].map(({ name, ltp, strats }) => (
+        {instrumentCards.map(({ name, ltp, strats }) => (
           <div key={name} className="lift animate-fade-in-up" style={{ ...panelStyle, padding: "12px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
               <span style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>
@@ -52,6 +70,7 @@ export default function LiveTrading() {
             </div>
           </div>
         ))}
+        {instrumentCards.length === 0 && <div style={{ ...panelStyle, padding: "12px", color: "var(--text-muted)", fontSize: "10px" }}>No configured instruments</div>}
       </div>
 
       <div className="lift" style={panelStyle}>

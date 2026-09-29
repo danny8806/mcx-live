@@ -107,7 +107,7 @@ export default function Reversals() {
             LIVE REVERSALS — {data?.execution_mode?.toUpperCase() ?? "LIVE"}
           </div>
           <div style={{ fontSize: "9px", color: "var(--text-muted)", marginTop: "2px" }}>
-            Full 10-step lifecycle: SIGNAL → TRIGGER → OLD EXIT → OLD SL CANCEL → OLD FLAT → NEW ENTRY → NEW FILL → NEW POSITION → NEW SL. Broker-linked IDs only; never collapsed into one status.
+            Full 9-step lifecycle: SIGNAL → TRIGGER → OLD EXIT → OLD POSITION FLAT → OLD LOCAL SL CLEARED → NEW ENTRY → NEW FILL → NEW POSITION → NEW LOCAL SL. Broker-linked IDs only; never collapsed into one status.
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
