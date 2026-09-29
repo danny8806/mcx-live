@@ -551,9 +551,11 @@ class LiveExecutionEngine:
                 order.reason = f"BROKER_CANCEL_FAILED: {exc}"
                 order.updated_at = self._now()
                 return False
-            if not outcome.get("ok") and outcome.get("status") not in (None, "unsupported"):
+            status = str(outcome.get("status") or "").lower()
+            if not outcome.get("ok") or status not in (
+                    "cancelled", "canceled", "rejected", "expired"):
                 order.reason = (
-                    f"BROKER_CANCEL_REJECTED: {outcome.get('status')} "
+                    f"BROKER_CANCEL_UNCONFIRMED: {outcome.get('status')} "
                     f"{outcome.get('raw_status', '')}".strip())
                 order.updated_at = self._now()
                 return False

@@ -473,18 +473,30 @@ class LivePositionFlowMixin:
         is needed any more (there is no broker SL), but the broker flat check
         stays authoritative.  Not verifiable -> fail-closed."""
         broker = getattr(env, "broker", None)
-        if broker is None or not hasattr(broker, "positions"):
-            return True, {}
-        net_qty = 0
+        positions_fn = getattr(broker, "positions", None)
+        if not callable(positions_fn):
+            return False, {"reason": "positions_api_unavailable"}
         try:
-            held = [p for p in (broker.positions() or [])
-                    if (p.get("instrument") or "") == signal.instrument]
+            rows = positions_fn()
         except Exception:
             return False, {"reason": "positions_api_failed"}
-        for p in held:
+        if not isinstance(rows, (list, tuple)):
+            return False, {"reason": "positions_api_invalid"}
+        for p in rows:
+            if not isinstance(p, dict):
+                return False, {"reason": "positions_row_invalid"}
+            if (p.get("instrument") or "") != signal.instrument:
+                continue
             side = str(p.get("side") or "").upper()
-            qty = int(p.get("quantity") or 0)
-            net_qty += qty if side in ("BUY", "LONG") else -qty
-        if net_qty != 0:
-            return False, {"reason": "broker_position_open", "net_qty": net_qty}
+            if side not in ("BUY", "LONG", "SELL", "SHORT"):
+                return False, {"reason": "broker_position_side_invalid"}
+            try:
+                qty = int(p.get("quantity") or 0)
+            except (TypeError, ValueError):
+                return False, {"reason": "broker_position_quantity_invalid"}
+            if qty != 0:
+                # A broker row may be fanned out for multiple strategies.
+                # Never net opposite rows to zero and mistake exposure for flat.
+                return False, {"reason": "broker_position_open",
+                               "side": side, "quantity": qty}
         return True, {}

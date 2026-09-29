@@ -320,14 +320,16 @@ class StrategyInstance:
 
         # 1. Pending triggers are evaluated only from live LTP ticks. Candle
         # OHLC values are never used to fire an order.
+        expired_pending = None
         if self.pending_entry is not None and self.pending_entry.status == "pending":
             if self.pending_entry.bars_pending >= self.pending_timeout_bars:
+                expired_pending = self.pending_entry.signal
                 self._cancel_trigger(self.pending_entry)
                 self.pending_entry = None
                 self.state = StrategyState.FLAT
                 self.position_side = None
-                return None
-            self.pending_entry.bars_pending += 1
+            else:
+                self.pending_entry.bars_pending += 1
 
         # 2. OPPOSITE CROSSOVER OVERRIDE: cancel old pending/in-flight and
         # take the new signal on the same bar.  Applies when:
@@ -349,7 +351,9 @@ class StrategyInstance:
                                          mid_val, prev_mid_val):
                 cancel_and_reenter = "SHORT"
             if cancel_and_reenter is not None:
-                old_pending_id = self._last_armed_pending_id
+                old_pending_id = (self._last_armed_pending_id
+                                  or getattr(getattr(self.pending_entry, "signal", None),
+                                             "signal_id", None))
                 self._cancel_trigger(self.pending_entry)
                 self.state = StrategyState.FLAT
                 self.pending_entry = None
@@ -422,6 +426,28 @@ class StrategyInstance:
                                                       open_=bar.open)
 
         self.just_entered = False
+        if expired_pending is not None:
+            # The old LIVE pending row must become terminal even when this
+            # candle produces no replacement signal. Route a cancel-only
+            # event through SignalFlow; it never reaches order submission.
+            if signal is None:
+                signal = Signal(
+                    signal_type=expired_pending.signal_type,
+                    instrument=self.instrument,
+                    strategy_id=self.strategy_id,
+                    timestamp=bar.start_ts or time.time(),
+                    trigger_price=expired_pending.trigger_price,
+                    stop_price=expired_pending.stop_price,
+                    quantity=self.quantity,
+                )
+                signal.metadata = {"cancel_only": True, "pending": False,
+                                   "triggered": False}
+            signal.metadata = dict(signal.metadata or {})
+            signal.metadata.update(
+                cancel_inflight=True,
+                old_pending_id=expired_pending.signal_id,
+                pending_termination="expired",
+            )
         return signal
 
     # ═══════════════════════════════════════════════════════════════════════

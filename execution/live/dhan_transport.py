@@ -465,14 +465,27 @@ class DhanRestTransport(LiveBrokerClient):
             self._audit("CANCEL", f"/orders/{bid}", "DELETE", response=resp,
                         http_status=200,
                         correlation_id=(rec or {}).get("correlation_id"))
-            raw_status = resp.get("orderStatus") or resp.get("order_status") or "CANCELLED"
+            # DELETE acknowledgement is not proof that the order stopped
+            # working. Re-read broker state before releasing its replacement.
+            try:
+                status_body = _coerce_status_body(self._http._get(f"/orders/{bid}"))
+            except Exception as exc:
+                self._audit("CANCEL_VERIFY", f"/orders/{bid}", "GET", error=exc,
+                            correlation_id=(rec or {}).get("correlation_id"))
+                raise RuntimeError("Dhan cancel status could not be verified") from exc
+            self._audit("CANCEL_VERIFY", f"/orders/{bid}", "GET",
+                        response=status_body, http_status=200,
+                        correlation_id=(rec or {}).get("correlation_id"))
+            raw_status = status_body.get("orderStatus") or status_body.get("order_status")
+            if not raw_status:
+                raise RuntimeError("Dhan cancel status missing from verification")
             new_status = _normalize_status(raw_status)
             if rec is not None:
                 rec["status"] = new_status
                 rec["raw_status"] = str(raw_status).upper()
             return {
                 "broker_order_id": resp.get("orderId") or bid,
-                "ok": new_status in ("cancelled", "rejected", "filled", "expired"),
+                "ok": new_status in ("cancelled", "rejected", "expired"),
                 "status": new_status,
                 "raw_status": str(raw_status).upper(),
             }
@@ -1080,14 +1093,14 @@ class DhanRestTransport(LiveBrokerClient):
         """
         with self._lock:
             try:
-                rows = self._http._get("/positions") or []
+                rows = self._http._get("/positions")
             except Exception as exc:
                 self._audit("POSITIONS", "/positions", "GET", error=exc)
-                return []
+                raise RuntimeError("Dhan positions query failed") from exc
             self._audit("POSITIONS", "/positions", "GET", response=rows,
                         http_status=200)
             if not isinstance(rows, list):
-                return []
+                raise ValueError("Dhan positions response is not a list")
             out: list[dict] = []
             for row in rows:
                 sec_id = str(row.get("securityId") or "")

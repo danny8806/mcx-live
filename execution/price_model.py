@@ -11,6 +11,7 @@ orders are disabled; the local tick monitor owns stop triggering.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -151,20 +152,22 @@ class PricePreset:
         if is_exit:
             if str(metadata.get("trigger_state", "")).upper() != "FIRED":
                 raise ValueError("exit must be triggered before limit planning")
-            # A stop-loss exit must be priced at the STOP LEVEL our own
-            # monitoring watches, never at the signal's trigger price.
-            # ``trigger_price`` on an exit signal is the price observed at
-            # detection time (bar.close / ltp), which is a moving market
-            # value: pricing the protective exit from it sent a gold SELL
-            # LIMIT at 147746 while the stop was 147220, so the exit order
-            # could rest on the wrong side of the market and never protect
-            # the position.  The stop is the level that was actually
-            # crossed, so that is the level the LIMIT must rest at.
+            # A gap can cross a stop before the order is built. A SELL limit
+            # above the observed price (or BUY limit below it) would rest
+            # unfilled, so use the worse of the stop and observed price.
             reason = str(metadata.get("exit_reason") or "").lower()
             is_sl = reason in ("stop_loss_hit", "stop_loss")
             level = None
             if is_sl and signal.stop_price:
-                level = signal.stop_price
+                observed = metadata.get("trigger_ltp", signal.trigger_price)
+                if observed is None:
+                    observed = signal.trigger_price
+                observed = float(observed)
+                if not math.isfinite(observed) or observed <= 0:
+                    raise ValueError("stop exit observed price is invalid")
+                level = (min(float(signal.stop_price), observed)
+                         if side_u == "SELL" else
+                         max(float(signal.stop_price), observed))
             if not level:
                 # Never improvise a protective price: without a stop there is
                 # nothing to protect against, so fall back to the detected
@@ -174,10 +177,16 @@ class PricePreset:
                 raise ValueError(
                     "exit signal carries neither stop_price nor trigger_price: "
                     "cannot build an exit plan")
+            if is_sl:
+                tick = float(self.tick_size)
+                if tick <= 0:
+                    raise ValueError("stop exit tick size must be positive")
+                level = (math.floor(level / tick) * tick if side_u == "SELL"
+                         else math.ceil(level / tick) * tick)
             return ExecutionPricePlan(
                 order_type="LIMIT",
                 kind="system_sl_exit" if is_sl else "system_exit",
-                price=_tick_round(level, self.tick_size))
+                price=float(level) if is_sl else _tick_round(level, self.tick_size))
 
         # There is one entry mode: a LIMIT after the local trigger fires.
         if not metadata.get("triggered"):
@@ -186,12 +195,26 @@ class PricePreset:
             raise ValueError("entry trigger must be FIRED before limit planning")
         if not signal.trigger_price:
             raise ValueError("local-trigger entry requires a positive trigger price")
+        observed = metadata.get("trigger_ltp")
+        try:
+            observed = float(observed) if observed is not None else float(signal.trigger_price)
+        except (TypeError, ValueError):
+            raise ValueError("entry trigger LTP is invalid") from None
+        if not math.isfinite(observed) or observed <= 0:
+            raise ValueError("entry trigger LTP must be finite and positive")
+        tick = float(self.tick_size)
+        if tick <= 0:
+            raise ValueError("entry tick size must be positive")
         if side_u == "BUY":
-            price = self.long_entry_trigger(signal.trigger_price)
+            if observed < float(signal.trigger_price):
+                raise ValueError("long entry price has not crossed the trigger")
+            price = math.ceil((observed + self.entry_offset) / tick) * tick
             kind = "long_entry"
         else:
-            price = self.short_entry_trigger(signal.trigger_price)
+            if observed > float(signal.trigger_price):
+                raise ValueError("short entry price has not crossed the trigger")
+            price = math.floor((observed - self.entry_offset) / tick) * tick
             kind = "short_entry"
         return ExecutionPricePlan(
             order_type="LIMIT", kind=kind,
-            price=_tick_round(price, self.tick_size))
+            price=float(price))

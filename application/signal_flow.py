@@ -143,7 +143,7 @@ class SignalFlowMixin:
                 and strategy is not None):
             old_trade_id = getattr(strategy, "current_trade_id", None)
             if old_trade_id is not None:
-                exe = self.execution_engine
+                exe = env.execution_engine
                 for o in list(getattr(exe, "_orders", {}).values()):
                     if (o.strategy_id == signal.strategy_id
                             and o.trade_id == old_trade_id
@@ -154,7 +154,19 @@ class SignalFlowMixin:
                                      "for %s (opposite signal %s)",
                                      o.order_id, signal.strategy_id,
                                      signal.signal_id)
-                            exe.cancel_order(o.order_id)
+                            if not exe.cancel_order(o.order_id):
+                                # The old order may have filled during cancel
+                                # or its broker state may be unknown. Drop the
+                                # replacement trigger until reconciliation.
+                                self._reset_strategy_state(
+                                    signal.strategy_id, env_name=env.name)
+                                self.publish_event("pending_replacement_blocked", {
+                                    "signal_id": signal.signal_id,
+                                    "old_order_id": o.order_id,
+                                    "reason": "old_order_cancel_unconfirmed",
+                                    "execution_mode": env.mode,
+                                }, env_name=env.name)
+                                return
                             break
             # Terminalize the old durable pending row (Phase 9.6) so the
             # superseded pending order doesn't stay ARMED forever in the DB.
@@ -164,9 +176,12 @@ class SignalFlowMixin:
                               or getattr(strategy, "_last_armed_pending_id", None))
             if old_pending_id is not None and env.persistence is not None:
                 try:
+                    expired = metadata.get("pending_termination") == "expired"
                     env.persistence.terminalize_pending_order(
-                        old_pending_id, status="cancelled_by_reversal",
-                        reason="opposite_crossover_superseded")
+                        old_pending_id,
+                        status="expired" if expired else "cancelled_by_reversal",
+                        reason="pending_trigger_timed_out" if expired
+                        else "opposite_crossover_superseded")
                 except Exception as e:
                     log.warning("[Engine] cancel_inflight: failed to "
                                 "terminalize pending %s: %s", old_pending_id, e)

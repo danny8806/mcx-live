@@ -97,6 +97,10 @@ class CandleFetcher:
                     self._sleep_until_stop(30.0)
                     continue
                 self._check_and_fetch()
+                # The newly closed 5m bar can appear in Dhan REST a few
+                # seconds after its close. Retry that same bar briefly rather
+                # than waiting until the next 5m close.
+                self._retry_recent_5m()
                 self._sleep_until_stop(self._seconds_until_next_close())
             except Exception as e:
                 print(f"[CandleFetcher] Error: {e}", flush=True)
@@ -109,6 +113,38 @@ class CandleFetcher:
         deadline = time.time() + seconds
         while self._running and time.time() < deadline:
             time.sleep(0.1)
+
+    def _retry_recent_5m(self) -> None:
+        now = datetime.now(IST)
+        if now.minute % 5 or now.second >= 30:
+            return
+        for _ in range(15):
+            if not self._running:
+                return
+            now = datetime.now(IST)
+            if now.minute % 5 or now.second >= 30:
+                return
+            self._sleep_until_stop(2.0)
+            now = datetime.now(IST)
+            if now.minute % 5 or now.second >= 30:
+                return
+            missing = False
+            for name, cfg in self.instruments.items():
+                hour, minute = map(int, self.session_open.split(":"))
+                session_start = now.replace(hour=hour, minute=minute,
+                                            second=0, microsecond=0)
+                if now < session_start:
+                    continue
+                completed = int((now - session_start).total_seconds() // 300)
+                if completed <= 0:
+                    continue
+                candle_start = session_start + timedelta(minutes=(completed - 1) * 5)
+                key = f"{name}:5m:{candle_start.timestamp()}"
+                if key not in self._last_fetched:
+                    self._check_timeframe(name, cfg, "5m", now)
+                    missing = True
+            if not missing:
+                return
 
     def _native_close_due(self, name: str, timeframe: str, now: datetime) -> bool:
         """True only when a native HTF window has just closed (or the offset
@@ -136,8 +172,8 @@ class CandleFetcher:
         rem = (cur - offset) % tf_minutes
         add = 0 if rem == 0 else (tf_minutes - rem)
         target = cur + add
-        hour, minute = divmod(target, 60)
-        return now.replace(hour=hour % 24, minute=minute, second=0, microsecond=0)
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start_of_day + timedelta(minutes=target)
 
     def _seconds_until_next_close(self, now: Optional[datetime] = None) -> float:
         """Seconds until the soonest candle close across every watched
