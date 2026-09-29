@@ -126,6 +126,31 @@ def test_successful_lookup_adopts_a_filled_order():
     assert res["raw_status"] == "TRADED"
 
 
+@pytest.mark.parametrize(
+    ("raw_status", "expected"),
+    [("PENDING", "submitted"), ("TRANSIT", "submitted"),
+     ("REJECTED", "rejected"), ("CANCELLED", "cancelled"),
+     ("EXPIRED", "expired")],
+)
+def test_initial_dhan_placement_response_drives_transport_status(raw_status, expected):
+    http = Http(post_resp={"orderId": "B-STATUS", "orderStatus": raw_status,
+                           "omsErrorDescription": "broker final reason"})
+    rec = _place(_transport(http))
+    assert rec["status"] == expected
+    assert rec["raw_status"] == raw_status
+
+
+def test_correlation_adoption_preserves_terminal_dhan_status():
+    http = Http(post_exc=TimeoutError("response lost"), lookup_body={
+        "orderId": "B-REJECTED", "orderStatus": "REJECTED",
+        "omsErrorDescription": "RMS rejected",
+    })
+    rec = _place(_transport(http))
+    assert rec["broker_order_id"] == "B-REJECTED"
+    assert rec["status"] == "rejected"
+    assert rec["reason"] == "RMS rejected"
+
+
 def test_exactly_one_adoption_for_a_duplicate_lookup():
     http = Http(post_exc=TimeoutError("t"),
                 lookup_body={"orderId": "B79", "orderStatus": "NEW"})
@@ -251,6 +276,44 @@ def test_engine_still_rejects_a_definitive_broker_rejection():
     out = eng.submit_order(order)
     assert out.state == OrderState.REJECTED
     assert "insufficient funds" in (out.reason or "")
+
+
+@pytest.mark.parametrize(
+    ("broker_result", "expected_state"),
+    [
+        ({"broker_order_id": "B-OK", "status": "submitted",
+          "raw_status": "PENDING"}, "submitted"),
+        ({"broker_order_id": "B-NO", "status": "rejected",
+          "raw_status": "REJECTED", "reason": "RMS rejected"}, "rejected"),
+        ({"broker_order_id": "B-CANCEL", "status": "cancelled",
+          "raw_status": "CANCELLED"}, "canceled"),
+    ],
+)
+def test_engine_order_state_follows_dhan_placement_result(broker_result, expected_state):
+    from execution.live.engine import LiveExecutionEngine
+    from execution.models import Order, OrderState
+
+    class RespondingBroker:
+        def place_market_order(self, **_kwargs):
+            return dict(broker_result)
+
+    eng = LiveExecutionEngine.__new__(LiveExecutionEngine)
+    eng._lock = __import__("threading").RLock()
+    eng._orders = {}
+    eng.broker = RespondingBroker()
+    eng.broker_router = None
+    eng.submission_guard = None
+    eng._now = lambda: 1000.0
+    order = Order(order_id="O-RESPONSE", strategy_id="gold_01", instrument="GOLDM",
+                  side="BUY", quantity=1, order_type="LIMIT", price=100.0,
+                  order_role="ENTRY", trade_id="T-RESPONSE",
+                  lifecycle_id="T-RESPONSE", parent_signal_id="S-RESPONSE",
+                  trigger_state="FIRED")
+    out = eng.submit_order(order)
+    assert out.state == OrderState(expected_state)
+    assert getattr(out, "_broker_order_id", None) == broker_result["broker_order_id"]
+    if expected_state == "rejected":
+        assert out.reason == "RMS rejected"
 
 
 # ── 5. the durable row stays ENTRY_SENT so it remains reconcilable ─────────

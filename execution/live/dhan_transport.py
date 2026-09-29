@@ -72,6 +72,20 @@ def _normalize_status(raw_status: str) -> str:
         return "cancelled"
     if upper in ("EXPIRED",):
         return "expired"
+    if upper in ("PENDING", "TRANSIT", "NEW", "OPEN", "PART_TRADED"):
+        return "submitted"
+    return "submitted"
+
+
+def _placement_state(status: object) -> str:
+    """Map placement/correlation truth to an immediate engine state.
+
+    A fill is still reconciled from the order-status poll; only broker-side
+    terminal failures may bypass SUBMITTED at placement time.
+    """
+    normalized = str(status or "").strip().lower()
+    if normalized in ("rejected", "cancelled", "canceled", "expired"):
+        return "cancelled" if normalized == "canceled" else normalized
     return "submitted"
 
 
@@ -324,21 +338,51 @@ class DhanRestTransport(LiveBrokerClient):
         self._audit(_AUDIT_ACTION.get(order_type_u, "PLACE_ORDER"),
                     "/orders", "POST", payload, response=resp, http_status=200,
                     correlation_id=correlation_id)
+        if not isinstance(resp, (dict, list)):
+            return self._resolve_unknown_placement(
+                correlation_id, side_u, quantity, instrument,
+                order_type_u, limit_price, trigger,
+                RuntimeError(f"Dhan returned malformed placement body: {resp!r}"))
+        resp = _coerce_status_body(resp)
+        broker_order_id = resp.get("orderId") or resp.get("order_id")
+        raw_status = resp.get("orderStatus") or resp.get("order_status") or "PENDING"
+        reason = (resp.get("omsErrorDescription")
+                  or resp.get("errorMessage")
+                  or resp.get("reason") or None)
+        normalized_status = _normalize_status(raw_status)
+        if (not broker_order_id
+                and normalized_status in ("rejected", "cancelled", "expired")):
+            # Dhan can report a terminal error without an order id. This
+            # is still explicit placement truth and must settle locally.
+            return {
+                "broker_order_id": None, "status": _placement_state(normalized_status),
+                "raw_status": str(raw_status).upper(),
+                "reason": reason or f"Dhan placement status: {raw_status}",
+                "side": side_u, "quantity": quantity,
+                "instrument": instrument,
+                "requested_order_type": order_type_u,
+                "requested_price": limit_price,
+                "requested_trigger_price": trigger,
+                "correlation_id": correlation_id, "timestamp": self._clock(),
+                "filled_quantity": 0, "average_fill_price": 0.0,
+                "last_accounted_qty": 0,
+            }
+        if not broker_order_id:
+            # HTTP success without an order id is not proof of rejection:
+            # recover by correlation id instead of making the engine mark
+            # a possibly live broker order rejected.
+            return self._resolve_unknown_placement(
+                correlation_id, side_u, quantity, instrument,
+                order_type_u, limit_price, trigger,
+                RuntimeError(f"Dhan placement response has no order id: {resp}"))
         with self._lock:
-            broker_order_id = resp.get("orderId") or resp.get("order_id")
-            if not broker_order_id:
-                raise RuntimeError(f"Dhan place order returned no order id: {resp}")
-            existing = self._orders.get(broker_order_id)
+            existing = self._orders.get(str(broker_order_id))
             if existing is not None:
-                return dict(existing)
-            raw_status = resp.get("orderStatus") or resp.get("order_status") or "PENDING"
-            reason = (resp.get("omsErrorDescription")
-                      or resp.get("errorMessage")
-                      or resp.get("reason") or None)
+                return dict(existing, status=_placement_state(existing.get("status")))
             now = self._clock()
             rec = {
-                "broker_order_id": broker_order_id,
-                "status": _normalize_status(raw_status),
+                "broker_order_id": str(broker_order_id),
+                "status": normalized_status,
                 "raw_status": str(raw_status).upper(),
                 "reason": reason,
                 "side": side_u,
@@ -406,7 +450,7 @@ class DhanRestTransport(LiveBrokerClient):
                 oid = str(oid)
                 known = self._orders.get(oid)
                 if known is not None:
-                    return dict(known, status="submitted",
+                    return dict(known, status=_placement_state(known.get("status")),
                                 note="resolved_via_correlation_lookup")
                 raw_status = (body.get("orderStatus")
                               or body.get("order_status") or "PENDING")
@@ -430,7 +474,7 @@ class DhanRestTransport(LiveBrokerClient):
                     "last_accounted_qty": 0,
                 }
                 self._orders[oid] = rec
-                return dict(rec, status="submitted",
+                return dict(rec, status=_placement_state(rec.get("status")),
                             note="resolved_via_correlation_lookup")
         if not lookup_ok:
             # A failed lookup is UNRESOLVED, never "rejected". Raising the
