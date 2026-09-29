@@ -439,6 +439,26 @@ def create_live_app(live_engine=None) -> FastAPI:
             fill.broker_trade_id = persisted_fill.get("broker_trade_id")
             fill.cumulative_filled_quantity = persisted_fill.get(
                 "cumulative_filled_quantity")
+            if not _engine._is_replayable_stale_exit(env, fill):
+                order = env.execution_engine.get_order(fill.order_id)
+                state_obj = getattr(order, "state", None) if order else None
+                owner_id = ((getattr(order, "parent_position_id", None)
+                             or getattr(order, "position_id", None))
+                            if order else None) or reversal.get("old_position_id")
+                raise HTTPException(status_code=409, detail={
+                    "reason": "strict stale-exit ownership validation failed",
+                    "order_found": order is not None,
+                    "order_state": str(getattr(state_obj, "value", state_obj)),
+                    "order_role": getattr(order, "order_role", None),
+                    "owner_position_id": owner_id,
+                    "db_open_owner_found": any(
+                        p.get("position_id") == owner_id
+                        and p.get("exit_order_id") == fill.order_id
+                        for p in _persistence.get_open_positions(strategy_id)),
+                    "persisted_fill_found": bool(_persistence.fill_by_broker_fill_id(
+                        fill.broker_fill_id)),
+                    "broker_position_count": len(env.broker.positions() or []),
+                })
             _engine._handle_fill(fill, reversal.get("signal_id"),
                                  is_exit=True, env_name="live")
             closed_trade = next((t for t in _persistence.get_trades(strategy_id)
