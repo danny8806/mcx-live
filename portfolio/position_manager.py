@@ -559,6 +559,11 @@ class PositionManagerFacade:
             return None
         return mgr.abandon_stale_position(position_id)
 
+    def restore_open_position(self, position: Position) -> Position:
+        """Restore an exact owner through the strategy-scoped manager."""
+        return self._owner(getattr(position, "strategy_id", None)).restore_open_position(
+            position)
+
     def get_position(self, position_id: str) -> Optional[Position]:
         _, pos = self._find_owner(position_id)
         return pos

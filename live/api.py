@@ -441,13 +441,23 @@ def create_live_app(live_engine=None) -> FastAPI:
                 "cumulative_filled_quantity")
             _engine._handle_fill(fill, reversal.get("signal_id"),
                                  is_exit=True, env_name="live")
+            closed_trade = next((t for t in _persistence.get_trades(strategy_id)
+                                 if t.get("trade_id") == reversal.get("old_trade_id")), None)
+            updated_reversal = next((r for r in _persistence.get_reversals(
+                strategy_id, limit=100)
+                if r.get("reversal_id") == reversal.get("reversal_id")), None)
+            if (not closed_trade
+                    or str(closed_trade.get("status", "")).upper() != "CLOSED"
+                    or not updated_reversal
+                    or str(updated_reversal.get("status", "")).upper() == "PENDING_EXIT"):
+                raise HTTPException(status_code=409,
+                                    detail="fill recovery was not applied; lifecycle remains unresolved")
             return {
                 "replayed": True,
                 "order_id": fill.order_id,
                 "broker_fill_id": fill.broker_fill_id,
                 "trade_id": reversal.get("old_trade_id"),
-                "reversal": next((r for r in _persistence.get_reversals(strategy_id, limit=100)
-                                  if r.get("reversal_id") == reversal.get("reversal_id")), None),
+                "reversal": updated_reversal,
                 "broker_flat_verified": True,
                 "note": "persisted exit fill routed through normal FillFlow; no order sent",
             }
