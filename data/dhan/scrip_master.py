@@ -43,7 +43,7 @@ HDR_SM_SYMBOL = "SM_SYMBOL_NAME"
 
 EXPIRY_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-_KNOWN_ASSETS = ("GOLDM", "SILVERM")
+_KNOWN_ASSETS = ("GOLDM", "SILVERM", "GOLDPETAL")
 
 
 class FutureContract:

@@ -71,6 +71,24 @@
         "intercept": 142900.0,
         "source": "Dhan API /margincalculator (INTRADAY, qty=1, SLIVERM, retrieved 2026-08-27)"
       }
+    },
+    "GOLDPETAL": {
+      "symbol": "MCX:GOLDPETAL202610",
+      "security_id": "571306",
+      "exchange_segment": "MCX_COMM",
+      "instrument": "FUTCOM",
+      "multiplier": 1.0,
+      "tick_size": 1.0,
+      "lot_size": 1,
+      "session_open": "09:00",
+      "session_close": "23:30",
+      "session_minutes": 870,
+      "keep_partial": true,
+      "margin_model": {
+        "slope": 0.0925,
+        "intercept": 0.0,
+        "source": "Dhan API /margincalculator (MARGIN, qty=1, retrieved 2026-09-29)"
+      }
     }
   },
   "indicators": {
@@ -150,6 +168,14 @@
       "stamp_duty_pct": 0.0
     },
     "SILVERM": {
+      "brokerage_per_side": 20.0,
+      "stt_sell_pct": 0.01,
+      "exchange_pct": 0.0026,
+      "sebi_pct": 0.0001,
+      "gst_pct": 18.0,
+      "stamp_duty_pct": 0.0
+    },
+    "GOLDPETAL": {
       "brokerage_per_side": 20.0,
       "stt_sell_pct": 0.01,
       "exchange_pct": 0.0026,
@@ -244,6 +270,12 @@
       },
       "holidays": []
     }
+  },
+  "live_test_order_cycle": {
+    "enabled": false,
+    "strategy_id": "gold_01",
+    "instrument": "GOLDPETAL",
+    "quantity": 1
   },
   "risk": {
     "max_open_positions_per_strategy": 1,

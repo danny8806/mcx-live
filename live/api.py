@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hmac
+import ipaddress
 import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -55,6 +58,8 @@ _live_engine = None       # LiveEngine wrapper
 _ws_manager = ConnectionManager()
 _push_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _events_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_live_test_cycle_lock = threading.Lock()
+_live_test_entry_signal_id: Optional[str] = None
 
 _frontend_dist = Path(__file__).resolve().parent.parent / "dashboard-ui" / "dist"
 _frontend_available = _frontend_dist.exists()
@@ -335,6 +340,151 @@ def create_live_app(live_engine=None) -> FastAPI:
             "event_bus": _bus.get_stats() if _bus is not None else None,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    @app.post("/api/live/test-order-cycle")
+    async def live_test_order_cycle(request: Request, body: dict):
+        """Loopback-only, fail-closed canary hook for the real LIVE lifecycle.
+
+        Disabled unless the operator explicitly enables
+        ``live_test_order_cycle.enabled`` in live config and provides a
+        one-time environment token. The test can submit only the configured
+        strategy/instrument/quantity and can force only that position's own
+        local stop monitor. It is not a general order endpoint.
+        """
+        if not _engine:
+            raise HTTPException(status_code=503, detail="live engine unavailable")
+        try:
+            peer = ipaddress.ip_address(request.client.host if request.client else "")
+        except ValueError:
+            raise HTTPException(status_code=403, detail="loopback caller required")
+        if not peer.is_loopback:
+            raise HTTPException(status_code=403, detail="loopback caller required")
+        test_cfg = _engine.config.get("live_test_order_cycle", {}) or {}
+        if not test_cfg.get("enabled"):
+            raise HTTPException(status_code=404, detail="test cycle is disabled")
+        expected = os.environ.get("LIVE_TEST_SIGNAL_TOKEN", "")
+        supplied = request.headers.get("x-live-test-token", "")
+        if not expected or not hmac.compare_digest(expected, supplied):
+            raise HTTPException(status_code=403, detail="test token required")
+
+        action = str(body.get("action", "")).lower()
+        env = _engine._env_for("live")
+        strategy_id = str(test_cfg.get("strategy_id", ""))
+        instrument = str(test_cfg.get("instrument", ""))
+        strategy = env.strategies.get(strategy_id)
+        if (not strategy or not instrument
+                or strategy.instrument != instrument
+                or int(strategy.quantity) != int(test_cfg.get("quantity", 0))):
+            raise HTTPException(status_code=409, detail="configured test strategy mismatch")
+
+        if action == "entry":
+            global _live_test_entry_signal_id
+            with _live_test_cycle_lock:
+                if _live_test_entry_signal_id:
+                    raise HTTPException(status_code=409, detail="one-shot test already started")
+                # A canary entry is permitted only when every other strategy is
+                # prevented from entering, even if an operator forgot to pause it.
+                gates = getattr(_engine, "_strategy_gates", {}) or {}
+                for sid, other in env.strategies.items():
+                    if sid == strategy_id:
+                        continue
+                    gate = gates.get(sid)
+                    if getattr(other, "enabled", True) and (gate is None or gate.entries_allowed):
+                        raise HTTPException(status_code=409, detail=f"other strategy {sid} can enter")
+                gate = _engine._gate_for(strategy_id)
+                if not getattr(env, "gate_enabled", False) or not gate.entries_allowed:
+                    raise HTTPException(status_code=409, detail="test strategy live entry gate is closed")
+                if any(p.is_open for p in env.position_manager.get_positions_by_instrument(instrument)):
+                    raise HTTPException(status_code=409, detail="test instrument already has a local position")
+                health = getattr(_engine, "market_data_health", None)
+                if health is None or not health.is_healthy(instrument):
+                    raise HTTPException(status_code=409, detail="test instrument feed is not fresh")
+                execution = env.execution_engine
+                with execution._price_lock:
+                    observed = float(execution._current_prices.get(instrument, 0.0) or 0.0)
+                if observed <= 0:
+                    raise HTTPException(status_code=409, detail="no live tick price for test instrument")
+
+                from strategies.types import Signal, SignalType
+                tick = float(_engine.config.instrument(instrument).get("tick_size", 1.0) or 1.0)
+                quantity = int(test_cfg["quantity"])
+                generation = int(getattr(strategy, "_trigger_generation", 0)) + 1
+                strategy._trigger_generation = generation
+                signal = Signal(
+                    signal_type=SignalType.LONG, instrument=instrument,
+                    strategy_id=strategy_id, timestamp=time.time(),
+                    trigger_price=observed, stop_price=max(tick, observed - tick),
+                    quantity=quantity,
+                    metadata={
+                        "triggered": True, "trigger_state": "FIRED",
+                        "trigger_source": "loopback_live_canary",
+                        "trigger_ltp": observed + tick,
+                        "trigger_generation": generation,
+                        "test_cycle": True,
+                    },
+                )
+                strategy._last_fired_trigger_signal_id = signal.signal_id
+                strategy._fired_trigger_signal_ids[signal.signal_id] = None
+                _live_test_entry_signal_id = signal.signal_id
+                _engine._process_signal(signal, "live")
+                order = next((o for o in reversed(list(execution._orders.values()))
+                              if getattr(o, "parent_signal_id", None) == signal.signal_id
+                              or getattr(o, "entry_signal_id", None) == signal.signal_id), None)
+                return {
+                    "accepted_by_app": order is not None,
+                    "signal_id": signal.signal_id,
+                    "strategy_id": strategy_id,
+                    "instrument": instrument,
+                    "quantity": quantity,
+                    "reference_ltp": observed,
+                    "limit_cap": observed + tick,
+                    "stop_price": signal.stop_price,
+                    "order": order.to_dict() if order and hasattr(order, "to_dict") else str(order),
+                }
+
+        if action == "status":
+            with _live_test_cycle_lock:
+                signal_id = _live_test_entry_signal_id
+            if not signal_id:
+                raise HTTPException(status_code=409, detail="test entry has not been started")
+            execution = env.execution_engine
+            orders = [o.to_dict() if hasattr(o, "to_dict") else str(o)
+                      for o in execution._orders.values()
+                      if (getattr(o, "parent_signal_id", None) == signal_id
+                          or getattr(o, "entry_signal_id", None) == signal_id
+                          or (getattr(o, "trade_id", None) == getattr(strategy, "current_trade_id", None)
+                              and getattr(o, "order_role", "") in ("EXIT", "EMERGENCY_EXIT")))]
+            positions = [{
+                "position_id": p.position_id, "trade_id": p.trade_id,
+                "quantity": p.quantity, "is_open": p.is_open,
+                "sl_state": p.sl_state, "stop_price": p.stop_price,
+            } for p in env.position_manager.get_positions_by_strategy(strategy_id)
+              if p.instrument == instrument]
+            return {"signal_id": signal_id, "orders": orders, "positions": positions}
+
+        if action == "fire_test_stop":
+            with _live_test_cycle_lock:
+                signal_id = _live_test_entry_signal_id
+            if not signal_id:
+                raise HTTPException(status_code=409, detail="test entry has not been started")
+            position = next((p for p in env.position_manager.get_positions_by_strategy(strategy_id)
+                             if p.instrument == instrument and p.is_open), None)
+            if position is None or str(getattr(position, "sl_state", "")).upper() != "ARMED":
+                raise HTTPException(status_code=409, detail="filled position with armed local stop required")
+            tick = float(_engine.config.instrument(instrument).get("tick_size", 1.0) or 1.0)
+            forced_ltp = max(tick, float(position.stop_price) - tick)
+            exit_signal = _engine._evaluate_position_sl(
+                env, position, forced_ltp, env_name="live")
+            return {
+                "stop_triggered": exit_signal is not None,
+                "test_tick_ltp": forced_ltp,
+                "position_id": position.position_id,
+                "stop_price": position.stop_price,
+                "exit_signal_id": getattr(exit_signal, "signal_id", None),
+                "note": "stop evaluation was deliberately triggered by the loopback test hook",
+            }
+
+        raise HTTPException(status_code=400, detail="action must be entry, status, or fire_test_stop")
 
     for r in ROUTE_MODULES:
         app.include_router(r.router)
