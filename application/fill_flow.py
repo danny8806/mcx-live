@@ -21,18 +21,27 @@ class FillFlowMixin:
         versa.
         """
         env = self._env_for(env_name)
+        # A broker exit can be quarantined during the brief interval after the
+        # position monitor has already removed its in-memory owner, while the
+        # durable position/trade are still open.  If the exact broker fill is
+        # persisted, its exact owned order is FILLED, and the still-open
+        # position is EXITING, safely replay only that full-closing fill.
+        replay_stale_exit = (env.mode == "LIVE"
+                             and self._is_replayable_stale_exit(env, fill))
         # C1 — atomic in-process claim (check + hold in one critical section).
         # is_duplicate()+note_processed() was two separate lock acquisitions and
         # two racing callers could both pass the check before either claimed.
-        if env.fill_dedup.is_duplicate(fill.fill_id):
+        if env.fill_dedup.is_duplicate(fill.fill_id) and not replay_stale_exit:
             return
+        if replay_stale_exit:
+            env.fill_dedup.unmark_processed(fill.fill_id)
         if not env.fill_dedup.claim(fill.fill_id):
             return
         # Phase 9.7 — broker-authoritative fill admission for LIVE: a fill
         # whose broker execution identity is already persisted, or whose broker
         # cumulative quantity is already fully accounted, is never applied a
         # second time (restart re-poll, WS+REST duplicate, replay).
-        if env.mode == "LIVE":
+        if env.mode == "LIVE" and not replay_stale_exit:
             verdict = self._reconcile_live_fill(env, fill)
             if verdict in ("duplicate", "already_synced", "divergence"):
                 env.fill_dedup.mark_processed(fill.fill_id)
@@ -396,6 +405,53 @@ class FillFlowMixin:
             self._reset_strategy_state(fill.strategy_id, keep_pending=pending_armed,
                                        env_name=env.name)
         env.fill_dedup.mark_processed(fill.fill_id)
+
+    def _is_replayable_stale_exit(self, env, fill) -> bool:
+        """Prove a previously quarantined broker exit is still unapplied."""
+        try:
+            if not getattr(fill, "broker_fill_id", None):
+                return False
+            pm = getattr(env, "position_manager", None)
+            engine = getattr(env, "execution_engine", None)
+            persistence = getattr(env, "persistence", None)
+            if pm is None or engine is None or persistence is None:
+                return False
+            persisted = persistence.fill_by_broker_fill_id(fill.broker_fill_id)
+            if not persisted:
+                return False
+            order = engine.get_order(fill.order_id)
+            if order is None:
+                return False
+            role = str(getattr(order, "order_role", "") or "").upper()
+            state_obj = getattr(order, "state", "")
+            state = str(getattr(state_obj, "value", state_obj)).lower()
+            if role not in {"EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"} \
+                    or state != "filled":
+                return False
+            if int(getattr(fill, "quantity", 0) or 0) < int(
+                    getattr(order, "quantity", 0) or 0):
+                return False
+            positions = pm.get_positions_by_strategy(fill.strategy_id) or []
+            current = next((p for p in positions
+                            if p.instrument == fill.instrument and p.is_open), None)
+            if current is None or str(getattr(current, "sl_state", "")).upper() \
+                    != "EXITING":
+                return False
+            if (getattr(order, "parent_position_id", None) != current.position_id
+                    or (getattr(order, "lifecycle_id", None)
+                        or getattr(order, "trade_id", None)) != current.trade_id
+                    or getattr(order, "position_generation", None)
+                        != current.position_generation):
+                return False
+            trade = env.runtimes.require(fill.strategy_id).lifecycle.get_trade(
+                current.trade_id)
+            if trade is None or str(getattr(trade, "status", "")).upper() not in (
+                    "OPEN", "ACTIVE"):
+                return False
+            return True
+        except Exception:
+            log.exception("[Engine] stale exit fill recovery validation failed")
+            return False
     def _exit_order_still_working(self, env, position) -> bool:
         """True when a live exit order still has unfilled quantity for this
         position.  Used to decide between "SL stays EXITING" and "SL re-arms"

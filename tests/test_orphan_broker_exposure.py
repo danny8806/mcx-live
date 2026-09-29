@@ -20,17 +20,20 @@ from __future__ import annotations
 
 import sys
 import os
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_position_owned_sl import (  # noqa: E402
     FakeBroker,
+    FakeExecutionEngine,
     FakeEnv,
     FakeStrategy,
     Harness,
     make_pm,
     make_position,
 )
+from execution.models import OrderState  # noqa: E402
 
 
 def _live_env_with(broker_positions, positions=(), strategies=None):
@@ -69,6 +72,35 @@ def test_no_orphan_when_the_broker_agrees_with_the_local_book():
 def test_a_flat_broker_is_not_an_orphan():
     h, env = _live_env_with([], positions=[])
     assert h.sync_sl_from_broker("LIVE")["orphan_exposure"] is False
+
+
+def test_broker_flat_during_owned_filled_exit_does_not_drop_position_before_fill_routing():
+    """The order fill must retain the old position identity for fill_flow.
+
+    Dhan positions can turn flat before the REST/WS order fill is routed.  A
+    periodic SL sync must leave the owned EXITING position in place for that
+    short interval instead of abandoning it as stale.
+    """
+    pos = make_position(pid="P-EXIT", instrument="GOLDPETAL", stop=90.0)
+    pos.exit_started = True
+    pos.exit_order_id = "EXIT-1"
+    pos.sl_state = "EXITING"
+    order = SimpleNamespace(
+        order_role="REVERSAL_EXIT", state=OrderState.FILLED)
+    h = Harness()
+    env = h.add_env(FakeEnv(
+        "LIVE", {"S1": FakeStrategy("S1", "GOLDPETAL")},
+        make_pm([pos]), FakeBroker([]),
+        FakeExecutionEngine({"EXIT-1": order})))
+
+    summary = h.sync_sl_from_broker("LIVE")
+
+    assert summary["dropped_local"] == []
+    assert env.position_manager.get_position("P-EXIT").is_open is True
+    deferred = next(d for t, d, _ in h.events
+                    if t == "sl_broker_flat_exit_fill_pending")
+    assert deferred["exit_order_id"] == "EXIT-1"
+    assert deferred["trade_id"] == "T1"
 
 
 # ── 2. it must be LOUD ─────────────────────────────────────────────────────

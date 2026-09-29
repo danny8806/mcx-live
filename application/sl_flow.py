@@ -540,6 +540,46 @@ class SLFlowMixin:
                 broker_net[inst] = {"instrument": inst, "signed": 0,
                                     "quantity": 0, "side": "FLAT"}
 
+        # A filled broker exit makes GET /positions flat before the order
+        # poller/order-update path necessarily routes its fill.  Do not let
+        # this SL resync race turn that still-owned position into a stale
+        # local row: fill_flow needs the original position identity to close
+        # its trade and reversal lifecycle.  Keep it in EXITING until the
+        # correlated close fill is routed (or its exit order is terminally
+        # rejected/cancelled, at which point the normal sync can decide).
+        execution = getattr(env, "execution_engine", None)
+        deferred_exit_positions = []
+        if execution is not None and callable(getattr(execution, "get_order", None)):
+            for lp in local_positions:
+                net = broker_net.get(str(getattr(lp, "instrument", "")))
+                broker_flat_or_conflicting = not net or net["signed"] == 0 or (
+                    (net["signed"] > 0) != bool(getattr(lp, "is_long", False)))
+                if not broker_flat_or_conflicting:
+                    continue
+                oid = getattr(lp, "exit_order_id", None)
+                order = execution.get_order(oid) if oid else None
+                role = str(getattr(order, "order_role", "") or "").upper()
+                state_obj = getattr(order, "state", "") if order is not None else ""
+                state = str(getattr(state_obj, "value", state_obj)).lower()
+                if (order is not None
+                        and role in {"EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"}
+                        and state in {"created", "submitted", "acknowledged",
+                                      "partially_filled", "filled"}):
+                    deferred_exit_positions.append(lp)
+
+        if deferred_exit_positions:
+            deferred_ids = {id(p) for p in deferred_exit_positions}
+            local_positions = [p for p in local_positions if id(p) not in deferred_ids]
+            for lp in deferred_exit_positions:
+                self.publish_event("sl_broker_flat_exit_fill_pending", {
+                    "position_id": getattr(lp, "position_id", None),
+                    "trade_id": getattr(lp, "trade_id", None),
+                    "exit_order_id": getattr(lp, "exit_order_id", None),
+                    "instrument": getattr(lp, "instrument", None),
+                    "reason": "broker_flat_with_owned_exit_order",
+                    "execution_mode": getattr(env, "mode", None),
+                }, env_name=getattr(env, "name", None))
+
         # Hand the monitor one clean row per instrument per local position.
         resolved = []
         for lp in local_positions:
