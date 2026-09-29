@@ -184,9 +184,27 @@ class SLFlowMixin:
         # strategy's latest one; register it as such before routing.
         try:
             strategy._last_fired_trigger_signal_id = signal.signal_id
+            # A position-owned stop wins over any not-yet-fired reversal. The
+            # opposite entry is meaningful only after its reversal exit has
+            # fired and the old position has been closed; a stop closes that
+            # position independently, so retire the parked entry durably too.
+            pending = getattr(strategy, "pending_entry", None)
+            pending_signal = getattr(pending, "signal", None)
+            pending_signal_id = getattr(pending_signal, "signal_id", None)
             strategy.notify_local_sl_exit("stop_loss_hit")
+            registry = getattr(env, "pending_triggers", None)
+            if registry is not None:
+                registry.sync_strategy(strategy)
+                if pending_signal_id:
+                    registry.remove_signal(str(pending_signal_id))
+            persistence = getattr(env, "persistence", None)
+            if pending_signal_id and persistence is not None:
+                persistence.terminalize_pending_order(
+                    str(pending_signal_id), status="resolved",
+                    reason="position_closed_by_stop_loss_before_reversal_trigger",
+                )
         except Exception as e:
-            log.error("[SL] strategy notification failed for %s/%s: %s",
+            log.error("[SL] strategy/pending cleanup failed for %s/%s: %s",
                       position.strategy_id, position.instrument, e)
         return signal
 

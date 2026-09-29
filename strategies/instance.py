@@ -658,6 +658,20 @@ class StrategyInstance:
             "reversal_exit_trigger": trigger,
             "reversal_entry_signal": entry_signal,
             "position_side": self.position_side,
+            # Freeze the exact signal candle and indicator levels on BOTH
+            # records in the reversal pair. The exit trigger and its parked
+            # opposite entry must never read a later 1H DEMA value.
+            "htf_value": htf_val,
+            "mid_value": mid_val,
+            "fast_dema_atr": fast_dema_atr,
+            "signal_htf_dema_atr": htf_val,
+            "signal_mid_dema_atr": mid_val,
+            "signal_fast_dema_atr": fast_dema_atr,
+            "signal_candle_start": timestamp,
+            "signal_candle_open": open_,
+            "signal_candle_high": high,
+            "signal_candle_low": low,
+            "signal_candle_close": close,
         }
         if superseded_pending_entry_signal_id:
             exit_signal.metadata["superseded_pending_entry_signal_id"] = (

@@ -422,7 +422,17 @@ class FillFlowMixin:
                 self._update_reversal_exit_fill(env, signal_id, fill)
             # Reversal exits arm an OPPOSITE pending breakout entry which must
             # survive the close: keep it if the strategy has one armed.
-            pending_armed = env.strategies[fill.strategy_id].pending_entry is not None
+            pending_entry = env.strategies[fill.strategy_id].pending_entry
+            pending_signal = getattr(pending_entry, "signal", None)
+            pending_metadata = (getattr(pending_signal, "metadata", None) or {})
+            pending_armed = bool(
+                pending_entry is not None
+                and getattr(pending_entry, "status", None)
+                    in ("pending", "waiting_for_flat")
+                and pending_signal is not None
+                and str(pending_metadata.get("trigger_state", "ARMED")).upper()
+                    == "ARMED"
+            )
             self._reset_strategy_state(fill.strategy_id, keep_pending=pending_armed,
                                        env_name=env.name)
         env.fill_dedup.mark_processed(fill.fill_id)

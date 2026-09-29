@@ -267,6 +267,13 @@ class SignalFlowMixin:
                 and getattr(strategy, "pending_entry", None) is not None
                 and getattr(strategy.pending_entry.signal, "signal_id", None)
                     == signal.signal_id)
+            # This signal object is reused when its pending breakout later
+            # fires.  The cancellation is a one-shot candle-time action; if
+            # these markers survive on the signal, its second pass through
+            # _process_signal resets the strategy again and clears the fired
+            # trigger ownership immediately before live order validation.
+            metadata["cancel_inflight"] = False
+            metadata["cancel_inflight_consumed"] = True
             self._reset_strategy_state(signal.strategy_id,
                                        keep_pending=keep_current_trigger,
                                        env_name=env.name)

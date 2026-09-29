@@ -3,12 +3,14 @@ from types import SimpleNamespace
 from strategies.instance import StrategyInstance
 from strategies.types import StrategyState
 from trading_engine import TradingEngine
+from application.sl_flow import SLFlowMixin
 
 
-def _reversal(strategy, *, high, low, timestamp):
+def _reversal(strategy, *, high, low, timestamp, htf_val=None):
     return strategy._create_reversal_signal(
         "SHORT", close=(high + low) / 2, high=high, low=low,
-        timestamp=timestamp, prev_high=high - 1, prev_low=low + 1)
+        timestamp=timestamp, prev_high=high - 1, prev_low=low + 1,
+        htf_val=htf_val)
 
 
 def test_new_reversal_cancels_old_trigger_generation_and_carries_old_pending_id():
@@ -35,6 +37,80 @@ def test_new_reversal_cancels_old_trigger_generation_and_carries_old_pending_id(
     assert strategy.pending_exit_trigger.signal is second_exit
     # A tick at the old level must not fire the cancelled exit generation.
     assert strategy.on_tick(first_exit.trigger_price, timestamp=3) is None
+
+
+def test_replacement_reversal_freezes_its_own_hourly_dema_and_candle_trigger():
+    strategy = StrategyInstance("s1", "GOLDM", "123", "15m")
+    strategy.position_side = "LONG"
+    strategy.position_quantity = 1
+    strategy.current_position_id = "position-1"
+    strategy.stop_price = 80
+    strategy.reversal_entry_gap_points = 2
+
+    _reversal(strategy, high=105, low=90, timestamp=1, htf_val=101.25)
+    first = strategy.pending_entry.signal
+    second_exit = _reversal(strategy, high=110, low=85, timestamp=2,
+                            htf_val=102.75)
+    second = strategy.pending_entry.signal
+
+    assert first.metadata["signal_htf_dema_atr"] == 101.25
+    assert first.context.htf_value == 101.25
+    assert second.metadata["signal_htf_dema_atr"] == 102.75
+    assert second.context.htf_value == 102.75
+    assert second.metadata["signal_candle_high"] == 110
+    assert second_exit.metadata["signal_htf_dema_atr"] == 102.75
+    assert second_exit.metadata["signal_candle_high"] == 110
+    assert second_exit.trigger_price == 85
+    assert second.trigger_price == 83
+
+
+def test_stop_loss_cancels_waiting_reversal_entry_in_memory_registry_and_db():
+    strategy = StrategyInstance("s1", "GOLDM", "123", "15m")
+    strategy.position_side = "LONG"
+    strategy.position_quantity = 1
+    strategy.current_position_id = "position-1"
+    strategy.stop_price = 80
+    strategy.reversal_entry_gap_points = 2
+    _reversal(strategy, high=105, low=90, timestamp=1, htf_val=101.25)
+    pending_id = strategy.pending_entry.signal.signal_id
+    terminalized, synced, removed = [], [], []
+
+    class Registry:
+        def sync_strategy(self, item):
+            synced.append((item.pending_entry, item.pending_exit_trigger))
+        def remove_signal(self, signal_id):
+            removed.append(signal_id)
+
+    class Flow(SLFlowMixin):
+        def publish_event(self, *_a, **_kw):
+            pass
+        def _persist_position(self, *_a, **_kw):
+            pass
+
+    env = SimpleNamespace(
+        strategies={"s1": strategy}, pending_triggers=Registry(),
+        persistence=SimpleNamespace(terminalize_pending_order=lambda *a, **k:
+                                    terminalized.append((a, k))),
+    )
+    position = SimpleNamespace(
+        strategy_id="s1", instrument="GOLDM", is_long=True,
+        trade_id="trade-1", position_id="position-1",
+        position_generation=1,
+    )
+    decision = SimpleNamespace(stop_price=80, quantity=1,
+                               position_id="position-1")
+
+    signal = Flow()._build_sl_exit_signal(env, position, decision, 79)
+
+    assert signal.metadata["exit_reason"] == "stop_loss_hit"
+    assert strategy.pending_entry is None
+    assert strategy.pending_exit_trigger is None
+    assert synced == [(None, None)]
+    assert removed == [pending_id]
+    assert terminalized == [((pending_id,), {
+        "status": "resolved",
+        "reason": "position_closed_by_stop_loss_before_reversal_trigger",
+    })]
 
 
 def test_live_reversal_supersession_terminalizes_old_durable_pending_row():

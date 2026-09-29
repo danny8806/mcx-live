@@ -162,6 +162,15 @@ def test_live_opposite_pending_signal_terminalizes_old_without_broker_order():
     })]
     assert armed == [new.signal_id]
     assert strategy.pending_entry.signal is new
+    # The supersession is consumed on the candle pass. The same signal object
+    # is reused when its later WebSocket tick fires the breakout; retaining
+    # cancel_inflight would reset strategy state a second time and make the
+    # live ownership gate reject the valid fired signal as stale.
+    assert new.metadata["cancel_inflight"] is False
+    assert new.metadata["cancel_inflight_consumed"] is True
+    assert new.metadata["old_pending_id"] == old.signal_id
+    assert strategy.on_tick(new.trigger_price, 5.0) is new
+    assert strategy.is_fired_trigger_signal(new.signal_id)
 
 
 @pytest.mark.parametrize("status,should_cancel", [
