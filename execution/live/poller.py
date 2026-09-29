@@ -304,6 +304,11 @@ class LiveBrokerPoller:
                             strat.pending_entry = None
                             strat.stop_exit_submitted = False
                 if role.startswith("ENTRY") or role == "REVERSAL_ENTRY":
+                    # The POST may have been accepted as PENDING and rejected
+                    # only on a later broker status poll. Settle the canonical
+                    # trade here too; SignalFlow's synchronous rejection path
+                    # cannot handle this delayed terminal response.
+                    self._settle_terminal_entry_lifecycle(order)
                     # C5 — a terminal entry reset must fire ONCE and only for
                     # the strategy's CURRENT, pre-position entry.  Previously
                     # every terminal ENTRY order left in the book (up to 500)
@@ -365,6 +370,36 @@ class LiveBrokerPoller:
                 log.error("[LivePoller:%s] order watcher scan failed: %s",
                           self.env.name, e)
         return applied
+
+    def _settle_terminal_entry_lifecycle(self, order) -> bool:
+        """Settle a broker-terminal entry whose fill quantity is still zero."""
+        if int(getattr(order, "filled_quantity", 0) or 0) > 0:
+            return False
+        state = str(getattr(getattr(order, "state", None), "value",
+                            getattr(order, "state", ""))).lower()
+        if state not in ("rejected", "canceled", "cancelled", "expired"):
+            return False
+        runtimes = getattr(self.env, "runtimes", None)
+        runtime = runtimes.get(getattr(order, "strategy_id", None)) if runtimes else None
+        lifecycle = getattr(runtime, "lifecycle", None)
+        if lifecycle is None:
+            return False
+        trade_id = getattr(order, "trade_id", None)
+        trade = lifecycle.get_trade(trade_id) if trade_id else None
+        if trade is None:
+            signal_id = (getattr(order, "entry_signal_id", None)
+                         or getattr(order, "parent_signal_id", None))
+            trade = lifecycle.resolve_trade_from_signal(signal_id) if signal_id else None
+        if trade is None:
+            return False
+        return lifecycle.reject_unfilled_entry(
+            trade.trade_id,
+            reason=getattr(order, "reason", None)
+            or f"broker entry terminal status: {state}",
+            order_id=getattr(order, "order_id", ""),
+            status=("CANCELLED" if state in ("canceled", "cancelled", "expired")
+                    else "REJECTED"),
+        )
 
 
     def _route_fill(self, fill, signal_id, is_exit=None) -> None:

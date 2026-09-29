@@ -99,3 +99,57 @@ def test_poller_not_found_heals_order_trade_pending_row_and_strategy():
     assert persistence.terminalized
     assert persistence.orders[-1]["state"] == "rejected"
     assert reset == ["gold_02"]
+
+
+def test_poller_later_broker_rejection_settles_pending_trade():
+    from types import SimpleNamespace
+    from execution.live.poller import LiveBrokerPoller
+
+    lifecycle = TradeLifecycleManager(strategy_id="silver_01")
+    trade = TradeContext(
+        trade_id="T-LATE-REJECT", strategy_id="silver_01",
+        entry_signal_id="S-LATE-REJECT", status=TradeStatus.PENDING.value,
+    )
+    lifecycle._trades[trade.trade_id] = trade
+    lifecycle._signal_to_trade[trade.entry_signal_id] = trade.trade_id
+    poller = LiveBrokerPoller.__new__(LiveBrokerPoller)
+    poller.env = SimpleNamespace(runtimes={
+        "silver_01": SimpleNamespace(lifecycle=lifecycle),
+    })
+    order = SimpleNamespace(
+        state="rejected", filled_quantity=0, strategy_id="silver_01",
+        trade_id=trade.trade_id, entry_signal_id=trade.entry_signal_id,
+        order_id="O-LATE-REJECT", reason="RMS insufficient funds",
+    )
+
+    assert poller._settle_terminal_entry_lifecycle(order)
+    assert trade.status == TradeStatus.REJECTED.value
+    assert trade.pending_status == "resolved"
+    assert trade.entry_order_id == "O-LATE-REJECT"
+    assert "RMS insufficient funds" in trade.signal_reason
+
+
+def test_poller_does_not_settle_terminal_entry_with_any_fill():
+    from types import SimpleNamespace
+    from execution.live.poller import LiveBrokerPoller
+
+    lifecycle = TradeLifecycleManager(strategy_id="silver_01")
+    trade = TradeContext(
+        trade_id="T-PARTIAL", strategy_id="silver_01",
+        entry_signal_id="S-PARTIAL", status=TradeStatus.OPEN.value,
+        entry_fill_id="F-PARTIAL", entry_price=100.0,
+    )
+    lifecycle._trades[trade.trade_id] = trade
+    lifecycle._signal_to_trade[trade.entry_signal_id] = trade.trade_id
+    poller = LiveBrokerPoller.__new__(LiveBrokerPoller)
+    poller.env = SimpleNamespace(runtimes={
+        "silver_01": SimpleNamespace(lifecycle=lifecycle),
+    })
+    order = SimpleNamespace(
+        state="rejected", filled_quantity=1, strategy_id="silver_01",
+        trade_id=trade.trade_id, entry_signal_id=trade.entry_signal_id,
+        order_id="O-PARTIAL", reason="remaining qty rejected",
+    )
+
+    assert not poller._settle_terminal_entry_lifecycle(order)
+    assert trade.status == TradeStatus.OPEN.value
