@@ -77,10 +77,31 @@ class FillFlowMixin:
                 owner_pos = getattr(source_order, "parent_position_id", None)
                 owner_trade = getattr(source_order, "lifecycle_id", None) or getattr(source_order, "trade_id", None)
                 owner_gen = getattr(source_order, "position_generation", None)
-                if (current is None or not owner_pos
-                        or current.position_id != owner_pos
-                        or current.trade_id != owner_trade
-                        or current.position_generation != owner_gen):
+                missing_lineage_recovered = False
+                if replay_stale_exit and current is not None:
+                    # Older persisted execution snapshots may omit position id
+                    # and generation even though the canonical open position,
+                    # pending reversal, exact exit order and broker fill all
+                    # bind this fill to the same lifecycle.  The recovery
+                    # validator has already checked those durable identities.
+                    reversal = env.persistence.get_reversal_by_signal_id(
+                        signal_id or "") if env.persistence is not None else None
+                    missing_lineage_recovered = bool(
+                        reversal
+                        and reversal.get("old_exit_order_id") == fill.order_id
+                        and reversal.get("old_position_id") == current.position_id
+                        and reversal.get("old_trade_id") == current.trade_id
+                        and str(reversal.get("status", "")).upper() == "PENDING_EXIT"
+                        and (not owner_pos or owner_pos == current.position_id)
+                        and (not owner_trade or owner_trade == current.trade_id)
+                        and (owner_gen is None
+                             or owner_gen == current.position_generation))
+                if (current is None
+                        or (not missing_lineage_recovered
+                            and (not owner_pos
+                                 or current.position_id != owner_pos
+                                 or current.trade_id != owner_trade
+                                 or current.position_generation != owner_gen))):
                     self._quarantine_event("stale_lifecycle_fill_rejected", {
                         "fill_id": fill.fill_id, "order_id": fill.order_id,
                         "strategy_id": fill.strategy_id,
