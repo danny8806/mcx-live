@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Phase 6 — verify source in container + Dhan REST + live endpoints."""
 import paramiko
+from vps_credentials import load_vps_password
 import time
 import urllib.request
 import json
 
 VPS_HOST = "200.234.44.93"
 VPS_USER = "root"
-VPS_PASS = "Deltacapitals@123"
-
+VPS_PASS = load_vps_password()
 def ssh(cmd, timeout=20):
     t = paramiko.Transport((VPS_HOST, 22))
     t.connect(username=VPS_USER, password=VPS_PASS)

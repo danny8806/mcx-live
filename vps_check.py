@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """VPS Phase 6 verification script."""
 import paramiko
+from vps_credentials import load_vps_password
 import sys
 import time
 
 VPS_HOST = "200.234.44.93"
 VPS_USER = "root"
-VPS_PASS = "Deltacapitals@123"
-
+VPS_PASS = load_vps_password()
 def run(cmd, timeout=15):
     """Run a command on VPS and return output."""
     transport = paramiko.Transport((VPS_HOST, 22))
