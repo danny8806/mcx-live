@@ -60,6 +60,11 @@ class CandleFetcher:
         # Learned native HTF offset (candle start minute % timeframe) per
         # timeframe, so close instants are scheduled exactly instead of polled.
         self._native_offsets: dict[str, int] = {}
+        self._native_primed: set[str] = set()
+        # A process restart must not replay today's already-closed REST bars
+        # through the live strategy callbacks.  The engine's indicator warmup
+        # handles history; this worker only owns bars closing after it starts.
+        self._startup_priming = True
         
     def start(self):
         """Start the candle fetcher thread."""
@@ -195,6 +200,11 @@ class CandleFetcher:
         # Prune old entries (>24h) to prevent unbounded growth
         cutoff = time.time() - 86400
         self._last_fetched = {k: v for k, v in self._last_fetched.items() if v > cutoff}
+
+        if self._startup_priming:
+            self._prime_startup_watermarks(now)
+            self._startup_priming = False
+            return
         
         for name, cfg in self.instruments.items():
             # Advance higher-timeframe context FIRST so a fast-bar signal that
@@ -206,6 +216,49 @@ class CandleFetcher:
             self._check_timeframe(name, cfg, "15m", now)
             # Check 5m candles LAST.
             self._check_timeframe(name, cfg, "5m", now)
+
+    def _prime_startup_watermarks(self, now: datetime) -> None:
+        """Mark completed bars already available at startup as seen.
+
+        Historical REST candles are used for indicator warmup. Emitting them
+        again as live closes can create duplicate/stale signals after a restart.
+        Prime the worker's dedupe keys without calling ``on_candle_closed``.
+        """
+        hour, minute = map(int, self.session_open.split(":"))
+        session_start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now >= session_start:
+            completed = int((now - session_start).total_seconds() // 300)
+            if completed > 0:
+                last_5m = session_start + timedelta(minutes=(completed - 1) * 5)
+                for name in self.instruments:
+                    self._last_fetched[f"{name}:5m:{last_5m.timestamp()}"] = time.time()
+
+        # For native bars, use the exchange's latest completed start as the
+        # watermark and learn its actual offset. No callback fires here.
+        for name in self.instruments:
+            for timeframe in ("15m", "1h"):
+                self._prime_native_watermark(name, timeframe, now)
+
+    def _prime_native_watermark(self, name: str, timeframe: str, now: datetime) -> None:
+        tf_minutes = TIMEFRAME_MINUTES[timeframe]
+        interval = {"15m": "15", "1h": "60"}[timeframe]
+        try:
+            candles = self.data_adapter.fetch_historical_candles(
+                name, interval, now.date(), now.date())
+        except Exception as exc:
+            print(f"[CandleFetcher] Startup watermark fetch failed for {name} {timeframe}: {exc}", flush=True)
+            return
+        if not candles:
+            return
+        self._native_primed.add(f"{name}:{timeframe}")
+        newest = max(candles, key=lambda candle: candle[0])
+        st_dt = datetime.fromtimestamp(newest[0], IST)
+        self._native_offsets[timeframe] = (st_dt.hour * 60 + st_dt.minute) % tf_minutes
+        now_epoch = int(now.timestamp())
+        for candle in candles:
+            if candle[0] + tf_minutes * 60 <= now_epoch:
+                key = f"{name}:{timeframe}:{candle[0]}"
+                self._last_fetched[key] = time.time()
             
     def _check_timeframe(self, name: str, cfg: dict, timeframe: str, now: datetime):
         """Check if a candle of this timeframe just closed and fetch it."""
@@ -289,6 +342,8 @@ class CandleFetcher:
             return
 
         now_epoch = int(now.timestamp())
+        stream_key = f"{name}:{timeframe}"
+        stream_uninitialized = stream_key not in self._native_primed
         if candles:
             # Learn/refresh the exchange's native start offset from the newest
             # native candle (forming or closed): the close instants are then
@@ -297,6 +352,7 @@ class CandleFetcher:
             st_dt = datetime.fromtimestamp(newest[0], IST)
             self._native_offsets[timeframe] = \
                 (st_dt.hour * 60 + st_dt.minute) % tf_minutes
+            self._native_primed.add(stream_key)
         # Every CLOSED native candle not yet emitted, newest-last: a transient
         # fetch failure between windows self-heals at the next close instead of
         # silently skipping that candle (deduped by the native start ts).
@@ -305,6 +361,13 @@ class CandleFetcher:
             key=lambda c: c[0],
         )
         if not closed:
+            return
+        if stream_uninitialized:
+            # If startup priming had a temporary REST failure, this first
+            # successful response still establishes a baseline only. Never
+            # turn bars that predate the live worker into fresh signals.
+            for candle in closed:
+                self._last_fetched[f"{name}:{timeframe}:{candle[0]}"] = time.time()
             return
         for candle in closed:
             key = f"{name}:{timeframe}:{candle[0]}"

@@ -220,3 +220,28 @@ def test_next_candle_close_rolls_into_next_day():
 
     assert next_close == datetime(2026, 9, 30, 0, 0, tzinfo=IST)
     assert fetcher._seconds_until_next_close(now) == 30.0
+
+
+def test_startup_candle_watermark_does_not_replay_completed_bars():
+    class Adapter:
+        def fetch_historical_candles(self, instrument, interval, start, end):
+            mins = int(interval)
+            start_dt = datetime(2026, 9, 29, 9, 0, tzinfo=IST)
+            return [
+                [start_dt.timestamp(), 100, 102, 99, 101, 10],
+                [(start_dt + __import__('datetime').timedelta(minutes=mins)).timestamp(),
+                 101, 103, 100, 102, 11],
+            ]
+
+    emitted = []
+    fetcher = CandleFetcher(Adapter(), {"GOLDM": {}}, emitted.append)
+    now = datetime(2026, 9, 29, 10, 22, tzinfo=IST)
+
+    fetcher._prime_startup_watermarks(now)
+
+    assert emitted == []
+    assert "GOLDM:15m:" in next(k for k in fetcher._last_fetched if ":15m:" in k)
+    assert "GOLDM:1h:" in next(k for k in fetcher._last_fetched if ":1h:" in k)
+    assert "GOLDM:5m:" in next(k for k in fetcher._last_fetched if ":5m:" in k)
+    assert fetcher._native_offsets["15m"] == 0
+    assert fetcher._native_offsets["1h"] == 0

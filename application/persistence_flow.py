@@ -251,6 +251,27 @@ class PersistenceFlowMixin:
             log.error("[Engine] pending trigger restore failed: %s", exc)
             return 0
         restored = 0
+        rows_by_signal = {
+            str(row.get("signal_id") or row.get("pending_order_id") or ""): row
+            for row in rows
+        }
+        # A persisted engine snapshot can still contain an entry trigger that
+        # has since been terminalized in the canonical DB. Do not resurrect it
+        # from RAM on restart (for example after an operator expires stale
+        # signals before a fresh live session).
+        terminal = {"expired", "cancelled_by_reversal", "resolved"}
+        for sid, strategy in (getattr(env, "strategies", {}) or {}).items():
+            current = getattr(strategy, "pending_entry", None)
+            signal_id = getattr(getattr(current, "signal", None), "signal_id", None)
+            row = rows_by_signal.get(str(signal_id or ""))
+            if row and str(row.get("status", "")).lower() in terminal:
+                strategy._cancel_trigger(current)
+                strategy.pending_entry = None
+                if not getattr(strategy, "position_side", None):
+                    strategy.state = StrategyState.FLAT
+                registry.sync_strategy(strategy)
+                log.info("[Engine] discarded terminal startup trigger %s for %s",
+                         signal_id, sid)
         for row in rows:
             registry.cache_live_row(row)
             if str(row.get("status", "")).lower() != PendingOrderState.ARMED.value:

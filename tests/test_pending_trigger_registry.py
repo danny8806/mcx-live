@@ -153,6 +153,29 @@ def test_startup_restore_rebuilds_armed_trigger_from_database():
     assert env.pending_triggers.live_row(signal_id)["status"] == "armed"
 
 
+def test_startup_restore_does_not_resurrect_terminal_snapshot_trigger():
+    signal_id = "signal-expired-1"
+    signal = Signal(
+        signal_type=SignalType.LONG, instrument="GOLDM", strategy_id="gold_02",
+        timestamp=10.0, trigger_price=147100.0, stop_price=146719.0, quantity=100)
+    signal.signal_id = signal_id
+    strategy = create_gold_15m(strategy_id="gold_02", instrument="GOLDM", quantity=100)
+    strategy.pending_entry = PendingEntry(
+        signal=signal, trigger_price=147100.0, side="LONG", status="pending")
+
+    class _Persistence:
+        def get_pending_orders(self, **_kwargs):
+            return [{"pending_order_id": signal_id, "signal_id": signal_id,
+                     "strategy_id": "gold_02", "status": "expired"}]
+
+    env = Environment(name="live", mode="LIVE", is_live=True,
+                      strategies={"gold_02": strategy}, persistence=_Persistence())
+
+    assert PersistenceFlowMixin()._restore_live_pending_triggers(env) == 0
+    assert strategy.pending_entry is None
+    assert env.pending_triggers.entry_for("gold_02") is None
+
+
 def test_startup_restore_rebuilds_both_reversal_triggers():
     entry_id, exit_id = "reversal-entry", "reversal-exit"
     armed = {
