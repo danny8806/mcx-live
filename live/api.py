@@ -180,7 +180,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
     _live_engine.restore()
-    _live_engine.start()
+    if os.environ.get("LIVE_RECOVERY_ONLY") == "1":
+        # Temporary operator recovery boot: restore owned lifecycle state and
+        # expose the loopback-only recovery API without waiting for startup
+        # warmup/reconciliation.  This mode must be removed after flattening.
+        logger.critical("LIVE_RECOVERY_ONLY is set; normal engine startup is paused")
+    else:
+        _live_engine.start()
     for mod in ROUTE_MODULES:
         if mod is analytics_routes:
             db_path = str(_persistence.db_path) if _persistence is not None else "trading.db"
@@ -465,32 +471,110 @@ def create_live_app(live_engine=None) -> FastAPI:
         if action == "fire_test_stop":
             with _live_test_cycle_lock:
                 signal_id = _live_test_entry_signal_id
-            if not signal_id:
+            recovery_boot = os.environ.get("LIVE_RECOVERY_ONLY") == "1"
+            if not signal_id and not recovery_boot:
                 raise HTTPException(status_code=409, detail="test entry has not been started")
             position = next((p for p in env.position_manager.get_positions_by_strategy(strategy_id)
                              if p.instrument == instrument and p.is_open), None)
-            if position is None or str(getattr(position, "sl_state", "")).upper() != "ARMED":
-                raise HTTPException(status_code=409, detail="filled position with armed local stop required")
-            tick = float(_engine.config.instrument(instrument).get("tick_size", 1.0) or 1.0)
+            if position is None:
+                raise HTTPException(status_code=409, detail="open canary position required")
+            # A tick may already have fired the SL while its normal submit
+            # path stalled before reaching Dhan. For this isolated test, also
+            # allow a lifecycle-owned emergency flatten after restart when
+            # the saved position is still open. Never duplicate a broker-backed
+            # exit, and cancel only a provably local CREATED exit intent.
             execution = env.execution_engine
-            with execution._price_lock:
-                live_ltp = float(execution._current_prices.get(instrument, 0.0) or 0.0)
-            if live_ltp <= 0:
-                raise HTTPException(status_code=409, detail="live test instrument price is unavailable")
-            # Put the test exit's LIMIT below the current market so this single
-            # unit can flatten promptly; the exchange still chooses the actual
-            # fill price. The test tick itself is clearly reported as synthetic.
-            forced_ltp = max(tick, min(
-                float(position.stop_price) - tick, live_ltp - 5.0 * tick))
-            exit_signal = _engine._evaluate_position_sl(
-                env, position, forced_ltp, env_name="live")
+            exits = [o for o in execution._orders.values()
+                     if (getattr(o, "parent_position_id", None) == position.position_id
+                         or (recovery_boot
+                             and getattr(o, "trade_id", None) == position.trade_id
+                             and getattr(o, "strategy_id", None) == strategy_id
+                             and getattr(o, "instrument", None) == instrument
+                             and str(getattr(o, "side", "")).upper()
+                                 == ("SELL" if position.is_long else "BUY")))
+                     and str(getattr(o, "order_role", "")).upper()
+                     in ("EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT")
+                     and str(getattr(getattr(o, "state", None), "value",
+                                     getattr(o, "state", ""))).lower()
+                     in ("created", "submitted", "acknowledged", "partially_filled")]
+            if any(getattr(o, "_broker_order_id", None)
+                   or str(getattr(getattr(o, "state", None), "value",
+                                  getattr(o, "state", ""))).lower() != "created"
+                   for o in exits):
+                raise HTTPException(status_code=409,
+                                    detail="broker-backed canary exit is active; refusing duplicate flatten")
+            if len(exits) > 1:
+                raise HTTPException(status_code=409,
+                                    detail="multiple local canary exits require reconciliation")
+            stale = exits[0] if exits else None
+            if stale is not None:
+                if not execution.cancel_order(stale.order_id):
+                    raise HTTPException(status_code=409,
+                                        detail="unsubmitted canary exit could not be retired")
+            if str(getattr(position, "sl_state", "")).upper() == "EXITING":
+                _engine._release_sl_after_failed_exit(
+                    env, position, reason="test_recovery_unsubmitted_exit")
+            result = _engine.emergency_exit_all("live", instrument=instrument)
+            # In recovery-only mode the standard poller is intentionally not
+            # running.  Poll just the newly submitted canary exit through the
+            # ordinary transport/fill router so the same lifecycle can close.
+            if os.environ.get("LIVE_RECOVERY_ONLY") == "1":
+                try:
+                    from core.trade_close import TradeCloseManager
+                    if env.trade_close_manager is None:
+                        close_manager = TradeCloseManager(
+                            position_manager=env.position_manager,
+                            pnl_engines=env.pnl_engines,
+                            account_engines=env.account_engines,
+                            global_account=env.account_engine,
+                            risk_engine=env.risk_engine,
+                            persistence=env.persistence,
+                            event_store=env.event_store,
+                            telegram=_engine.telegram,
+                            event_callback=_engine._event_callback,
+                            trade_ledger=env.trade_ledger,
+                        )
+                        env.trade_close_manager = close_manager
+                        _engine._trade_close_manager = close_manager
+                    for _ in range(8):
+                        statuses = env.broker.order_statuses() or {}
+                        fills = env.execution_engine.apply_broker_statuses(statuses)
+                        for fill in fills:
+                            order = env.execution_engine.get_order(fill.order_id)
+                            if order is not None and env.persistence is not None:
+                                try:
+                                    from types import SimpleNamespace
+                                    _engine._persist_order(
+                                        order,
+                                        SimpleNamespace(
+                                            signal_id=(getattr(order, "parent_signal_id", None)
+                                                       or getattr(order, "entry_signal_id", None)),
+                                            trigger_price=getattr(order, "price", 0.0),
+                                        ),
+                                        env_name="live",
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "canary recovery order persistence failed: %s",
+                                        order.order_id,
+                                    )
+                            env.broker_router.route_fill(
+                                fill,
+                                lambda f, sid, is_exit: _engine._handle_fill(
+                                    f, sid, is_exit=is_exit, env_name="live"),
+                                entry_signal_id=getattr(fill, "entry_signal_id", None),
+                                is_exit=True,
+                            )
+                        if not position.is_open:
+                            break
+                        time.sleep(1.0)
+                except Exception as exc:
+                    logger.exception("canary recovery fill poll failed: %s", exc)
             return {
-                "stop_triggered": exit_signal is not None,
-                "test_tick_ltp": forced_ltp,
-                "position_id": position.position_id,
-                "stop_price": position.stop_price,
-                "exit_signal_id": getattr(exit_signal, "signal_id", None),
-                "note": "stop evaluation was deliberately triggered by the loopback test hook",
+                "recovered_unsubmitted_exit_id": stale.order_id if stale else None,
+                "emergency_exit": result,
+                "position_closed": not position.is_open,
+                "note": "lifecycle-owned emergency flatten requested for the single canary position",
             }
 
         raise HTTPException(status_code=400, detail="action must be entry, status, or fire_test_stop")

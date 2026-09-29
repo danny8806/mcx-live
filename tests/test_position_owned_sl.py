@@ -658,6 +658,43 @@ def test_transport_parses_the_real_dhan_positions_payload():
     assert rows[0]["ltp"] == 3498.0
 
 
+def test_positions_releases_order_book_lock_before_quote_fallback():
+    """A missing Dhan LTP must not deadlock positions -> circuit_quote."""
+    from execution.live.dhan_transport import DhanRestTransport
+
+    tr = DhanRestTransport.__new__(DhanRestTransport)
+    tr._lock = threading.Lock()
+    tr.instruments = {"GOLDM": {"security_id": "54321",
+                                "exchange_segment": "MCX_COMM"}}
+    tr.instrument_strategies = {"GOLDM": ["s1"]}
+
+    class _Http:
+        def _get(self, path, *a, **k):
+            assert path == "/positions"
+            return [dict(DHAN_LONG_ROW)]
+
+    tr._http = _Http()
+    tr._audit = lambda *a, **k: None
+
+    def _quote(instrument):
+        # circuit_quote uses this same lock to update/read its cache.
+        with tr._lock:
+            return {"ltp": 3498.0}
+
+    tr.circuit_quote = _quote
+    done = threading.Event()
+    result = []
+
+    def _read_positions():
+        result.extend(tr.positions())
+        done.set()
+
+    worker = threading.Thread(target=_read_positions, daemon=True)
+    worker.start()
+    assert done.wait(1.0), "positions deadlocked while fetching fallback quote"
+    assert result[0]["ltp"] == 3498.0
+
+
 def test_transport_skips_flat_and_unmapped_dhan_rows():
     from execution.live.dhan_transport import DhanRestTransport
 

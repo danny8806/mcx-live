@@ -1156,74 +1156,74 @@ class DhanRestTransport(LiveBrokerClient):
         strategy configured on that instrument so the poller can surface
         internal-vs-broker mismatches per strategy.
         """
-        with self._lock:
+        # Do not hold the in-memory order-book lock across a blocking broker
+        # request.  order_statuses() and other poll paths also use this lock;
+        # holding it during HTTP I/O can stall emergency exits behind an
+        # unrelated Dhan request even though order placement itself is safe.
+        try:
+            rows = self._http._get("/positions")
+        except Exception as exc:
+            self._audit("POSITIONS", "/positions", "GET", error=exc)
+            raise RuntimeError("Dhan positions query failed") from exc
+        self._audit("POSITIONS", "/positions", "GET", response=rows,
+                    http_status=200)
+        if not isinstance(rows, list):
+            raise ValueError("Dhan positions response is not a list")
+        out: list[dict] = []
+        for row in rows:
+            sec_id = str(row.get("securityId") or "")
+            instrument = None
+            for inst, cfg in self.instruments.items():
+                if sec_id and str(cfg.get("security_id", "")) == sec_id:
+                    instrument = inst
+                    break
+            if instrument is None:
+                continue
+            net = int(row.get("netQty") or row.get("netQuantity") or 0)
+            if net == 0:
+                continue
+            side = "LONG" if net > 0 else "SHORT"
+            qty = abs(net)
+            avg = float(row.get("buyAvg" if side == "LONG" else "sellAvg") or 0.0)
+            # Broker-reported P&L (live field names verified capture) — kept
+            # so the live dashboard can render broker truth, not re-derived.
+            realized = float(row.get("realizedProfit")
+                             or row.get("realized_profit") or 0.0)
+            unrealized = float(row.get("unrealizedProfit")
+                               or row.get("unrealized_profit")
+                               or row.get("unRealizedProfit") or 0.0)
+            # Dhan's GET /positions carries NO last-traded price.  Use the
+            # authoritative LTP from the market-quote cache when the instrument
+            # has one; leave it None rather than inventing 0.0.
+            ltp_raw = (row.get("ltp") or row.get("LTP")
+                       or row.get("last_price") or row.get("lastTradedPrice"))
             try:
-                rows = self._http._get("/positions")
-            except Exception as exc:
-                self._audit("POSITIONS", "/positions", "GET", error=exc)
-                raise RuntimeError("Dhan positions query failed") from exc
-            self._audit("POSITIONS", "/positions", "GET", response=rows,
-                        http_status=200)
-            if not isinstance(rows, list):
-                raise ValueError("Dhan positions response is not a list")
-            out: list[dict] = []
-            for row in rows:
-                sec_id = str(row.get("securityId") or "")
-                instrument = None
-                for inst, cfg in self.instruments.items():
-                    if sec_id and str(cfg.get("security_id", "")) == sec_id:
-                        instrument = inst
-                        break
-                if instrument is None:
-                    continue
-                net = int(row.get("netQty") or row.get("netQuantity") or 0)
-                if net == 0:
-                    continue
-                side = "LONG" if net > 0 else "SHORT"
-                qty = abs(net)
-                avg = float(row.get("buyAvg" if side == "LONG" else "sellAvg") or 0.0)
-                # Broker-reported P&L (live field names verified capture) — kept
-                # so the live dashboard can render broker truth, not re-derived.
-                realized = float(row.get("realizedProfit")
-                                 or row.get("realized_profit") or 0.0)
-                unrealized = float(row.get("unrealizedProfit")
-                                   or row.get("unrealized_profit")
-                                   or row.get("unRealizedProfit") or 0.0)
-                # Dhan's GET /positions carries NO last-traded price.  Use the
-                # authoritative LTP from the market-quote cache when the
-                # instrument has one; leave it None rather than inventing 0.0,
-                # which would render as a real (wrong) price downstream.
-                ltp_raw = (row.get("ltp") or row.get("LTP")
-                           or row.get("last_price") or row.get("lastTradedPrice"))
+                ltp = float(ltp_raw) if ltp_raw not in (None, "") else None
+            except (TypeError, ValueError):
+                ltp = None
+            if ltp is None:
                 try:
-                    ltp = float(ltp_raw) if ltp_raw not in (None, "") else None
+                    cached = self.circuit_quote(instrument) or {}
+                except Exception:
+                    cached = {}
+                try:
+                    ltp = float(cached.get("ltp")) if cached.get("ltp") else None
                 except (TypeError, ValueError):
                     ltp = None
-                if ltp is None:
-                    # Fall back to the live market quote the transport already
-                    # keeps for the circuit gate.
-                    try:
-                        cached = self.circuit_quote(instrument) or {}
-                    except Exception:
-                        cached = {}
-                    try:
-                        ltp = float(cached.get("ltp")) if cached.get("ltp") else None
-                    except (TypeError, ValueError):
-                        ltp = None
-                sids = self.instrument_strategies.get(instrument) or [""]
-                for sid in sids:
-                    out.append({
-                        "strategy_id": sid,
-                        "instrument": instrument,
-                        "side": side,
-                        "quantity": qty,
-                        "average_entry_price": avg,
-                        "realized_profit": realized,
-                        "unrealized_profit": unrealized,
-                        "net_profit": realized + unrealized,
-                        "ltp": ltp,
-                    })
-            return out
+            sids = self.instrument_strategies.get(instrument) or [""]
+            for sid in sids:
+                out.append({
+                    "strategy_id": sid,
+                    "instrument": instrument,
+                    "side": side,
+                    "quantity": qty,
+                    "average_entry_price": avg,
+                    "realized_profit": realized,
+                    "unrealized_profit": unrealized,
+                    "net_profit": realized + unrealized,
+                    "ltp": ltp,
+                })
+        return out
 
     def ingest_status(self, record: dict) -> bool:
         """Accelerator-only WS ingest: update the transport book from a parsed

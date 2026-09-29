@@ -98,19 +98,19 @@
   },
   "strategies": {
     "gold_01": {
-      "instrument": "GOLDM",
+      "instrument": "GOLDPETAL",
       "fast_timeframe": "5m",
       "mid_timeframe": "15m",
       "htf_timeframe": "1h",
       "capital": 300000,
       "enabled": true,
       "lots": 1,
-      "live_gate": "ON",
-      "entry_enabled": true,
+      "live_gate": "CLOSE_ONLY",
+      "entry_enabled": false,
       "exit_enabled": true,
-      "reversal_enabled": true,
+      "reversal_enabled": false,
       "sl_enabled": true,
-      "quantity": 100
+      "quantity": 1
     },
     "gold_02": {
       "instrument": "GOLDM",
@@ -118,14 +118,14 @@
       "mid_timeframe": "15m",
       "htf_timeframe": "1h",
       "capital": 300000,
-      "enabled": true,
+      "enabled": false,
       "lots": 1,
-      "live_gate": "ON",
-      "entry_enabled": true,
+      "live_gate": "CLOSE_ONLY",
+      "entry_enabled": false,
       "exit_enabled": true,
-      "reversal_enabled": true,
+      "reversal_enabled": false,
       "sl_enabled": true,
-      "quantity": 100
+      "quantity": 1
     },
     "silver_01": {
       "instrument": "SILVERM",
@@ -133,14 +133,14 @@
       "mid_timeframe": "15m",
       "htf_timeframe": "1h",
       "capital": 300000,
-      "enabled": true,
+      "enabled": false,
       "lots": 1,
-      "live_gate": "ON",
-      "entry_enabled": true,
+      "live_gate": "CLOSE_ONLY",
+      "entry_enabled": false,
       "exit_enabled": true,
-      "reversal_enabled": true,
+      "reversal_enabled": false,
       "sl_enabled": true,
-      "quantity": 100
+      "quantity": 1
     },
     "silver_02": {
       "instrument": "SILVERM",
@@ -148,14 +148,14 @@
       "mid_timeframe": "15m",
       "htf_timeframe": "1h",
       "capital": 300000,
-      "enabled": true,
+      "enabled": false,
       "lots": 1,
-      "live_gate": "ON",
-      "entry_enabled": true,
+      "live_gate": "CLOSE_ONLY",
+      "entry_enabled": false,
       "exit_enabled": true,
-      "reversal_enabled": true,
+      "reversal_enabled": false,
       "sl_enabled": true,
-      "quantity": 100
+      "quantity": 1
     }
   },
   "charges": {

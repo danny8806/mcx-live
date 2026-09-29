@@ -291,13 +291,23 @@ class LivePositionFlowMixin:
                 order.order_type = "MARKET"
                 order.price = 0.0
                 order.trigger_price = None
+                try:
+                    runtime = env.runtimes.require(pos.strategy_id)
+                    if runtime is not None and runtime.lifecycle is not None:
+                        runtime.lifecycle.register_order(
+                            pos.trade_id, order.order_id, "EMERGENCY_EXIT")
+                except (KeyError, ValueError):
+                    # The broker flatten remains available during degraded
+                    # recovery even if the strategy runtime cache is absent.
+                    pass
                 self._persist_order(order, signal, env.name)
                 engine.update_price(pos.instrument, pos.current_mark or pos.average_entry)
                 engine.submit_order(order)
                 self._persist_order(order, signal, env.name)
                 if order.state.value in ("submitted", "acknowledged", "partially_filled", "filled"):
-                    pos.exit_started = True
-                    self._persist_position(pos, env.name)
+                    self._mark_sl_exiting(
+                        env, pos, order.order_id,
+                        getattr(order, "_broker_order_id", None))
                     closed.append({"position_id": pos.position_id,
                                    "trade_id": pos.trade_id,
                                    "order_id": order.order_id,

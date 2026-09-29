@@ -71,6 +71,7 @@ class PersistenceFlowMixin:
                                or resolve_order_role(signal)),
                 "protected_order_id": getattr(order, "protected_order_id", None),
                 "correlation_id": getattr(order, "correlation_id", None),
+                "broker_order_id": getattr(order, "_broker_order_id", None),
                 "state": order.state.value, "filled_quantity": order.filled_quantity,
                 "average_fill_price": order.average_fill_price,
                 "created_at": datetime.fromtimestamp(order.created_at, tz=timezone.utc).isoformat(),
