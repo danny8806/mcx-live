@@ -472,7 +472,16 @@ def create_live_app(live_engine=None) -> FastAPI:
             if position is None or str(getattr(position, "sl_state", "")).upper() != "ARMED":
                 raise HTTPException(status_code=409, detail="filled position with armed local stop required")
             tick = float(_engine.config.instrument(instrument).get("tick_size", 1.0) or 1.0)
-            forced_ltp = max(tick, float(position.stop_price) - tick)
+            execution = env.execution_engine
+            with execution._price_lock:
+                live_ltp = float(execution._current_prices.get(instrument, 0.0) or 0.0)
+            if live_ltp <= 0:
+                raise HTTPException(status_code=409, detail="live test instrument price is unavailable")
+            # Put the test exit's LIMIT below the current market so this single
+            # unit can flatten promptly; the exchange still chooses the actual
+            # fill price. The test tick itself is clearly reported as synthetic.
+            forced_ltp = max(tick, min(
+                float(position.stop_price) - tick, live_ltp - 5.0 * tick))
             exit_signal = _engine._evaluate_position_sl(
                 env, position, forced_ltp, env_name="live")
             return {
