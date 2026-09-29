@@ -41,6 +41,10 @@ services:
       context: .
       dockerfile: services/live-mcx/Dockerfile
     container_name: live-mcx
+    # The VPS also runs host-level Nginx, which proxies to localhost:8001.
+    # Bind only loopback so the gateway remains behind that reverse proxy.
+    ports:
+      - "127.0.0.1:8001:8001"
     env_file:
       - .env.live
     volumes:
