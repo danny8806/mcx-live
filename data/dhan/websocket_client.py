@@ -196,7 +196,9 @@ class DhanWebSocketClient:
     def _on_open(self, ws: Any) -> None:
         """Handle WebSocket open - subscribe to instruments."""
         self._connected = True
-        self._seen_ltt.clear()  # reset dedup on fresh connection
+        # Keep recent tick keys over reconnects: Dhan may replay its last quote
+        # after a socket resumes. Clearing here would process that quote twice.
+        # The cache remains bounded in _on_message.
         if self.on_status:
             self.on_status("connected")
         subs = [
@@ -238,9 +240,9 @@ class DhanWebSocketClient:
                     return  # duplicate tick after reconnect
                 if ltt:
                     self._seen_ltt[dedup_key] = ltt
-                    # Cap dict size to prevent memory leak (LTT is monotonically increasing)
-                    if len(self._seen_ltt) > 10000:
-                        self._seen_ltt.clear()
+                    # Cap dict size while retaining the newest replay keys.
+                    while len(self._seen_ltt) > 10000:
+                        self._seen_ltt.pop(next(iter(self._seen_ltt)))
                 self._stats["tick"] += 1
                 self.on_tick(tick)
         except Exception as e:
