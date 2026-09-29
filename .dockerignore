@@ -33,3 +33,13 @@ data/db/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Local VPS probes and audit scripts are not runtime code. Some historical
+# diagnostics contain credentials, so never copy them into a build context.
+/tools/
+/scripts/
+/p6_*.py
+/live_verify*.py
+/vps_*.py
+/verify_*.py
+/check_*.py
+/deploy_restart.py
