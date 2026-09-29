@@ -96,18 +96,23 @@ class StrategyGate:
     """
 
     __slots__ = ("live_gate", "entry_enabled", "exit_enabled",
-                 "reversal_enabled", "sl_enabled", "close_only")
+                 "reversal_enabled", "sl_enabled", "close_only",
+                 "operator_override")
 
     def __init__(self, live_gate: str = "ON",
                  entry_enabled: bool = True, exit_enabled: bool = True,
                  reversal_enabled: bool = True, sl_enabled: bool = True,
-                 close_only: bool = False):
+                 close_only: bool = False, operator_override: bool = False):
         self.live_gate = str(live_gate).upper()
         self.entry_enabled = bool(entry_enabled)
         self.exit_enabled = bool(exit_enabled)
         self.reversal_enabled = bool(reversal_enabled)
         self.sl_enabled = bool(sl_enabled)
         self.close_only = bool(close_only)
+        # Only an explicit runtime control action may override the configured
+        # restart default. Legacy snapshots have no marker and must not shadow
+        # a newer deployment's strategy gate settings.
+        self.operator_override = bool(operator_override)
 
     @property
     def entries_allowed(self) -> bool:
@@ -123,6 +128,7 @@ class StrategyGate:
             "reversal_enabled": self.reversal_enabled,
             "sl_enabled": self.sl_enabled,
             "close_only": self.close_only,
+            "operator_override": self.operator_override,
         }
 
     @classmethod
@@ -136,7 +142,24 @@ class StrategyGate:
             reversal_enabled=bool(data.get("reversal_enabled", True)),
             sl_enabled=bool(data.get("sl_enabled", True)),
             close_only=bool(data.get("close_only", False)),
+            operator_override=bool(data.get("operator_override", False)),
         )
+
+
+def restore_strategy_gates(configured: dict,
+                           saved: Optional[dict]) -> dict:
+    """Restore explicit operator overrides over the current configured gates.
+
+    A snapshot written before ``operator_override`` was introduced is treated
+    as a legacy runtime copy, not as operator intent. This lets a deployment
+    change a strategy from CLOSE_ONLY to ON without an old snapshot silently
+    undoing it, while newly recorded operator controls still survive restart.
+    """
+    restored = dict(configured or {})
+    for sid, data in (saved or {}).items():
+        if isinstance(data, dict) and data.get("operator_override"):
+            restored[sid] = StrategyGate.from_dict(data)
+    return restored
 
 
 # Strategy-control actions understood by TradingEngine.control_strategy().
@@ -614,6 +637,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             gate.sl_enabled = bool(fields["sl_enabled"])
         if "close_only" in fields:
             gate.close_only = bool(fields["close_only"])
+        if fields:
+            gate.operator_override = True
         self.publish_event("strategy_gate_changed", {
             "strategy_id": strategy_id,
             "gate": gate.to_dict(),
@@ -692,6 +717,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                     "error": f"Unknown action '{action}' "
                              "(expected start, stop, close_only, emergency_stop, lock, "
                              "pause or resume)"}
+        gate.operator_override = True
         self.publish_event("strategy_control", {
             "strategy_id": strategy_id, "action": a, "gate": gate.to_dict(),
             "timestamp": time.time(),
@@ -1802,8 +1828,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         gates_state = saved_state.get("strategy_gates")
         if gates_state:
             try:
-                for sid, gdict in gates_state.items():
-                    self._strategy_gates[sid] = StrategyGate.from_dict(gdict)
+                self._strategy_gates = restore_strategy_gates(
+                    self._strategy_gates, gates_state)
             except Exception:
                 pass
         # ### OBSERVATION (ledger rebuild on restore)
