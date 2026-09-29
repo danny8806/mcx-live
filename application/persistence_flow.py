@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from core.lifecycle import PendingOrderState, transition_pending_state
-from strategies.types import StrategyState
+from strategies.types import StrategyState, resolve_order_role
 
 log = logging.getLogger("trading_engine")
 

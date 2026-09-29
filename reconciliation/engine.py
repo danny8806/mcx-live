@@ -103,11 +103,18 @@ class ReconciliationEngine:
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
-        # Use the shared Database connection for the read-only check
+        # Use the shared Database connection for the read-only check.  This
+        # instance's reference is released as soon as the rows are materialised:
+        # Database shares ONE process-wide connection and only closes it when the
+        # LAST reference is released, so leaking a ref here pins the connection
+        # open for the life of the process.
         db = Database(self.persistence.db_path)
-        db_orders = self._load_db_orders(db)
-        db_fills = self._load_db_fills(db)
-        db_trades = self._load_db_trades(db)
+        try:
+            db_orders = self._load_db_orders(db)
+            db_fills = self._load_db_fills(db)
+            db_trades = self._load_db_trades(db)
+        finally:
+            db.close()
 
         # Collect in-memory state
         mem_orders = self._load_mem_orders()
