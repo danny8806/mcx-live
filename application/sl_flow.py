@@ -350,6 +350,16 @@ class SLFlowMixin:
         if low <= 0 or high <= 0 or high < low:
             return 0
 
+        try:
+            candle_start = float(getattr(bar, "start_ts"))
+            candle_end = float(getattr(bar, "end_ts"))
+            candle_close = float(getattr(bar, "close"))
+        except (TypeError, ValueError, AttributeError):
+            return 0
+        if (candle_start >= candle_end or candle_close <= 0
+                or not (low <= candle_close <= high)):
+            return 0
+
         fired = 0
         for env_iter in self._envs.values():
             try:
@@ -362,7 +372,20 @@ class SLFlowMixin:
                     continue
                 if getattr(pos, "exit_started", False):
                     continue
-                reference = low if getattr(pos, "is_long", False) else high
+                try:
+                    entry_time = float(getattr(pos, "entry_timestamp"))
+                except (TypeError, ValueError, AttributeError):
+                    # Without a fill time, the candle range cannot be tied to
+                    # this position's lifetime. Live ticks remain authoritative.
+                    continue
+                if entry_time >= candle_end:
+                    continue
+                # A position opened during this candle was not exposed to its
+                # earlier extreme. The close is the only known post-fill price.
+                if entry_time > candle_start:
+                    reference = candle_close
+                else:
+                    reference = low if getattr(pos, "is_long", False) else high
                 try:
                     signal = self._evaluate_position_sl(
                         env_iter, pos, reference,

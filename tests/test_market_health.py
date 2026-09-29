@@ -9,6 +9,7 @@ order book to show for it.  These tests pin the three defences:
   3. A position that cannot be evaluated is reported, not silently ignored.
 """
 from types import SimpleNamespace
+import threading
 import pytest
 
 from core.timeframe_engine import Bar
@@ -64,6 +65,22 @@ def test_record_tick_clears_a_previously_unhealthy_instrument():
     assert health.unhealthy_since("GOLDM") is None
 
 
+def test_disconnect_overrides_a_recent_tick_until_feed_recovers():
+    now = [100.0]
+    health = MarketDataHealthMonitor(clock=lambda: now[0], stale_after=90.0)
+    health.record_tick("GOLDM")
+    assert health.is_healthy("GOLDM") is True
+
+    health.mark_unhealthy("GOLDM")
+    assert health.is_healthy("GOLDM") is False
+    assert health.unhealthy_since("GOLDM") == 100.0
+
+    now[0] = 101.0
+    health.record_tick("GOLDM")
+    assert health.is_healthy("GOLDM") is True
+    assert health.unhealthy_since("GOLDM") is None
+
+
 def test_a_bad_ltp_never_refreshes_health():
     """The monitor only accepts real prices; a 0/NaN sentinel must not count."""
     now = [100.0]
@@ -72,6 +89,54 @@ def test_a_bad_ltp_never_refreshes_health():
     now[0] = 100.0 + 500.0
     # A sentinel tick is simply not recorded - health is NOT refreshed.
     assert health.is_healthy("GOLDM") is False
+
+
+def test_rest_candle_does_not_claim_the_websocket_feed_recovered():
+    from application.market_flow import MarketEventFlowMixin
+
+    now = [100.0]
+    health = MarketDataHealthMonitor(clock=lambda: now[0], stale_after=90.0)
+    health.record_tick("GOLDM")
+    now[0] = 300.0
+    engine = object.__new__(type("E", (MarketEventFlowMixin,), {}))
+    engine._running = True
+    engine.health = SimpleNamespace(record_bar=lambda: None)
+    engine.market_status = SimpleNamespace(mark_rest_data_fresh=lambda: None)
+    engine.market_data_health = health
+    engine._evaluate_positions_from_candle = lambda *args: 0
+    engine._report_sl_protection_gaps = lambda: None
+    engine.candle_router = SimpleNamespace(on_candle=lambda *args, **kw: None)
+
+    engine._on_bar_closed(_bar())
+    assert health.is_healthy("GOLDM") is False
+
+
+@pytest.mark.parametrize("connected,tick_time", [(True, 1.0), (False, 100.0)])
+def test_stale_or_disconnected_tick_cannot_reach_strategy(connected, tick_time):
+    from application.market_flow import MarketEventFlowMixin
+
+    market_health = MarketDataHealthMonitor(clock=lambda: 100.0,
+                                            stale_after=90.0)
+    ws = SimpleNamespace(connected=connected, _last_tick_time=100.0,
+                         _stats={"tick": 1}, is_stale=lambda: False)
+    published = []
+    engine = object.__new__(type("E", (MarketEventFlowMixin,), {}))
+    engine.data_adapter = SimpleNamespace(ws=ws)
+    engine.market_data_health = market_health
+    engine.market_status = SimpleNamespace(update_data_status=lambda **kw: None)
+    engine.health = SimpleNamespace(update_component=lambda *a: None,
+                                    record_tick=lambda: None)
+    engine._maybe_enable_trading = lambda: None
+    engine._lock = threading.RLock()
+    engine._envs = {}
+    engine.event_bus = SimpleNamespace(
+        publish=lambda topic, event: published.append((topic, event)))
+
+    engine._on_tick({"instrument": "GOLDM", "ltp": 94.0,
+                     "event_timestamp": tick_time})
+
+    assert published[0][1].ltp == 0.0
+    assert market_health.is_healthy("GOLDM") is False
 
 
 def test_blind_positions_lists_only_open_positions_on_stale_instruments():
@@ -465,6 +530,32 @@ def test_a_candle_stop_also_wins_over_a_reversal_in_the_same_candle():
     assert engine._evaluate_positions_from_candle(
         None, _bar(low=94.0, high=101.0)) == 0
     assert len(submitted) == 1
+
+
+def test_candle_extreme_before_entry_cannot_trigger_new_position_stop():
+    pm = PositionManager()
+    pos = _position(pm, side="LONG", stop=95.0)
+    pos.entry_timestamp = 1.5
+    submitted = []
+    engine, env = _sl_engine(pm, pos, ltp_calls=submitted)
+
+    assert engine._evaluate_positions_from_candle(
+        None, _bar(low=90.0, high=101.0)) == 0
+    assert submitted == []
+    assert pos.sl_state == SLState.ARMED.value
+
+
+def test_candle_ending_before_entry_cannot_trigger_stop():
+    pm = PositionManager()
+    pos = _position(pm, side="LONG", stop=95.0)
+    pos.entry_timestamp = 3.0
+    submitted = []
+    engine, env = _sl_engine(pm, pos, ltp_calls=submitted)
+
+    assert engine._evaluate_positions_from_candle(
+        None, _bar(low=90.0, high=101.0)) == 0
+    assert submitted == []
+    assert pos.sl_state == SLState.ARMED.value
 
 
 def test_a_position_with_exit_started_is_never_stopped_again():

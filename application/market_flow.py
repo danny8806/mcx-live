@@ -102,10 +102,16 @@ class MarketEventFlowMixin:
         # is reachable; only the LOSS of both is a genuine outage.
         health = getattr(self, "market_data_health", None)
         if health is not None:
-            if valid_ltp:
+            if valid_ltp and (ws is None or ws_connected):
                 health.record_tick(instrument, timestamp)
-            elif not ws_connected:
+            elif ws is not None and not ws_connected:
                 health.mark_unhealthy(instrument)
+            # An old exchange timestamp, or a callback arriving after the
+            # socket closed, cannot drive a local stop or strategy trigger.
+            if not health.is_healthy(instrument):
+                valid_ltp = False
+        if ws is not None and not ws_connected:
+            valid_ltp = False
 
         self.market_status.update_data_status(
             connected=ws_connected,
@@ -191,12 +197,6 @@ class MarketEventFlowMixin:
             return
         self.health.record_bar()
         self.market_status.mark_rest_data_fresh()
-
-        # A fresh REST candle is independent evidence the market is reachable,
-        # so it clears the tick-feed staleness window for this instrument.
-        health = getattr(self, "market_data_health", None)
-        if health is not None and getattr(bar, "instrument", None):
-            health.record_tick(bar.instrument)
 
         # The stop is evaluated on EVERY completed candle as well as on every
         # tick.  The MCX tick feed is allowed to go silent while REST keeps

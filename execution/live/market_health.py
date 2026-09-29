@@ -83,6 +83,9 @@ class MarketDataHealthMonitor:
 
         An instrument we have never seen a tick for is NOT healthy.
         """
+        with self._lock:
+            if instrument in self._unhealthy_since:
+                return False
         age = self.age(instrument)
         return age is not None and age <= self._stale_after
 
