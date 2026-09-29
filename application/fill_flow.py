@@ -425,8 +425,7 @@ class FillFlowMixin:
             role = str(getattr(order, "order_role", "") or "").upper()
             state_obj = getattr(order, "state", "")
             state = str(getattr(state_obj, "value", state_obj)).lower()
-            if role not in {"EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"} \
-                    or state != "filled":
+            if state != "filled":
                 return False
             if int(getattr(fill, "quantity", 0) or 0) < int(
                     getattr(order, "quantity", 0) or 0):
@@ -434,13 +433,98 @@ class FillFlowMixin:
             positions = pm.get_positions_by_strategy(fill.strategy_id) or []
             current = next((p for p in positions
                             if p.instrument == fill.instrument and p.is_open), None)
-            if current is None or str(getattr(current, "sl_state", "")).upper() \
-                    != "EXITING":
+            if current is None:
+                # After restart, the saved engine snapshot may already contain
+                # the stale CLOSED/zero-quantity snapshot even though the
+                # canonical DB position/trade stayed OPEN.  Reconstruct only
+                # when the exact persisted reversal exit and broker-flat state
+                # jointly prove this is an unbooked close.
+                db_positions = persistence.get_open_positions(fill.strategy_id)
+                reversals = persistence.get_reversals(fill.strategy_id, limit=100)
+                reversal = next((r for r in reversals
+                                 if r.get("old_exit_order_id") == fill.order_id
+                                 and str(r.get("status", "")).upper()
+                                     == "PENDING_EXIT"), None)
+                owner_id = (getattr(order, "parent_position_id", None)
+                            or getattr(order, "position_id", None)
+                            or (reversal or {}).get("old_position_id"))
+                owner_row = next((p for p in db_positions
+                                  if p.get("position_id") == owner_id
+                                  and p.get("instrument") == fill.instrument
+                                  and p.get("exit_order_id") == fill.order_id), None)
+                if owner_row is None:
+                    return False
+                reversal = next((r for r in reversals
+                                 if r.get("old_position_id") == owner_id
+                                 and r.get("old_trade_id") == owner_row.get("trade_id")
+                                 and r.get("old_exit_order_id") == fill.order_id
+                                 and str(r.get("status", "")).upper()
+                                     == "PENDING_EXIT"), None)
+                if reversal is None or (role not in {
+                        "EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"}
+                        and role):
+                    return False
+                broker_rows = env.broker.positions()
+                for row in broker_rows or []:
+                    if row.get("instrument") != fill.instrument:
+                        continue
+                    qty = int(row.get("quantity") or 0)
+                    side = str(row.get("side") or "").upper()
+                    signed = qty if side in ("BUY", "LONG") else -qty
+                    if signed:
+                        return False
+                from datetime import datetime
+                from portfolio.position_manager import Position, PositionSide
+                entry_time = owner_row.get("entry_time")
+                if isinstance(entry_time, str):
+                    entry_time = datetime.fromisoformat(
+                        entry_time.replace("Z", "+00:00")).timestamp()
+                trade_row = next((t for t in persistence.get_trades()
+                                  if t.get("trade_id") == owner_row.get("trade_id")
+                                  and str(t.get("status", "")).upper() == "OPEN"), None)
+                if trade_row is None:
+                    return False
+                entry_fill_id = trade_row.get("entry_fill_id")
+                from portfolio.position_manager import PositionStatus
+                current = Position(
+                    position_id=owner_id,
+                    strategy_id=fill.strategy_id,
+                    instrument=fill.instrument,
+                    side=PositionSide(str(owner_row.get("side", "LONG")).upper()),
+                    quantity=int(owner_row.get("quantity") or 0),
+                    average_entry=float(owner_row.get("average_entry_price") or 0),
+                    entry_timestamp=float(entry_time or 0),
+                    entry_fill_ids=[entry_fill_id] if entry_fill_id else [],
+                    stop_price=owner_row.get("stop_price"),
+                    trade_id=owner_row.get("trade_id"),
+                    status=PositionStatus.OPEN,
+                    sl_state="EXITING",
+                    sl_protected_at=(float(owner_row["sl_protected_at"])
+                                     if owner_row.get("sl_protected_at") else None),
+                    entry_order_id=owner_row.get("entry_order_id"),
+                    exit_order_id=fill.order_id,
+                    position_generation=int(owner_row.get("position_generation") or 0),
+                    exit_started=True,
+                    lifecycle_id=owner_row.get("lifecycle_id")
+                        or owner_row.get("trade_id"),
+                )
+                if (current.quantity != int(fill.quantity or 0)
+                        or (current.is_long and fill.side != "SELL")
+                        or (not current.is_long and fill.side != "BUY")):
+                    return False
+                pm.restore_open_position(current)
+            if str(getattr(current, "sl_state", "")).upper() != "EXITING":
                 return False
-            if (getattr(order, "parent_position_id", None) != current.position_id
-                    or (getattr(order, "lifecycle_id", None)
-                        or getattr(order, "trade_id", None)) != current.trade_id
-                    or getattr(order, "position_generation", None)
+            if (getattr(order, "parent_position_id", None)
+                    and getattr(order, "parent_position_id") != current.position_id):
+                return False
+            if ((getattr(order, "lifecycle_id", None)
+                    or getattr(order, "trade_id", None))
+                    and (getattr(order, "lifecycle_id", None)
+                         or getattr(order, "trade_id", None)) != current.trade_id):
+                return False
+            if (getattr(order, "position_generation", None) is not None
+                    and getattr(order, "position_generation")
                         != current.position_generation):
                 return False
             trade = env.runtimes.require(fill.strategy_id).lifecycle.get_trade(

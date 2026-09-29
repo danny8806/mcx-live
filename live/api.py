@@ -383,6 +383,75 @@ def create_live_app(live_engine=None) -> FastAPI:
                 or int(strategy.quantity) != int(test_cfg.get("quantity", 0))):
             raise HTTPException(status_code=409, detail="configured test strategy mismatch")
 
+        if action == "recover_reversal_exit":
+            # Recover one broker-confirmed reversal exit that is already
+            # persisted but was rejected before lifecycle booking. This route
+            # never places an order; FillFlow revalidates the exact order,
+            # fill, open DB owner and broker-flat state before applying it.
+            reversals = _persistence.get_reversals(strategy_id, limit=100)
+            reversal = next((r for r in reversals
+                             if r.get("instrument") == instrument
+                             and str(r.get("status", "")).upper() == "PENDING_EXIT"), None)
+            if reversal is None:
+                raise HTTPException(status_code=409, detail="no pending canary reversal exit")
+            fills = [f for f in _persistence.get_fills()
+                     if f.get("order_id") == reversal.get("old_exit_order_id")
+                     and f.get("broker_fill_id")]
+            if len(fills) != 1:
+                raise HTTPException(status_code=409, detail={
+                    "reason": "expected exactly one persisted broker fill for the reversal exit",
+                    "fill_count": len(fills)})
+            persisted_fill = fills[0]
+            try:
+                broker_rows = env.broker.positions()
+                for row in broker_rows or []:
+                    if row.get("instrument") == instrument and int(row.get("quantity") or 0):
+                        raise HTTPException(status_code=409,
+                                            detail="broker still reports a non-flat canary position")
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=503,
+                                    detail=f"broker flat check unavailable: {exc}")
+            from datetime import datetime
+            from execution.models import Fill
+            fill_time = persisted_fill.get("timestamp")
+            if isinstance(fill_time, str):
+                fill_time = datetime.fromisoformat(
+                    fill_time.replace("Z", "+00:00")).timestamp()
+            fill = Fill(
+                fill_id=str(persisted_fill["fill_id"]),
+                order_id=str(persisted_fill["order_id"]),
+                instrument=str(persisted_fill["instrument"]),
+                side=str(persisted_fill["side"]).upper(),
+                quantity=int(persisted_fill["quantity"]),
+                price=float(persisted_fill["price"]),
+                timestamp=float(fill_time),
+                strategy_id=str(persisted_fill["strategy_id"]),
+                multiplier=float(persisted_fill.get("multiplier") or 1.0),
+                trade_id=persisted_fill.get("trade_id"),
+                lifecycle_id=persisted_fill.get("lifecycle_id"),
+                position_id=persisted_fill.get("position_id"),
+                position_generation=persisted_fill.get("position_generation"),
+            )
+            fill.broker_fill_id = persisted_fill["broker_fill_id"]
+            fill.broker_order_id = persisted_fill.get("broker_order_id")
+            fill.broker_trade_id = persisted_fill.get("broker_trade_id")
+            fill.cumulative_filled_quantity = persisted_fill.get(
+                "cumulative_filled_quantity")
+            _engine._handle_fill(fill, reversal.get("signal_id"),
+                                 is_exit=True, env_name="live")
+            return {
+                "replayed": True,
+                "order_id": fill.order_id,
+                "broker_fill_id": fill.broker_fill_id,
+                "trade_id": reversal.get("old_trade_id"),
+                "reversal": next((r for r in _persistence.get_reversals(strategy_id, limit=100)
+                                  if r.get("reversal_id") == reversal.get("reversal_id")), None),
+                "broker_flat_verified": True,
+                "note": "persisted exit fill routed through normal FillFlow; no order sent",
+            }
+
         if action == "entry":
             global _live_test_entry_signal_id
             with _live_test_cycle_lock:
@@ -524,12 +593,15 @@ def create_live_app(live_engine=None) -> FastAPI:
                         "note": "trigger passed through StrategyInstance.on_tick and standard exit lifecycle"}
 
         if action == "fire_reversal_entry":
+            pen = strategy.pending_entry
             with _live_test_cycle_lock:
-                if not _live_test_entry_signal_id:
+                cycle_survived_restart = bool(
+                    pen is not None
+                    and (pen.signal.metadata or {}).get("test_cycle"))
+                if not _live_test_entry_signal_id and not cycle_survived_restart:
                     raise HTTPException(status_code=409, detail="test entry has not been started")
                 if any(p.is_open for p in env.position_manager.get_positions_by_instrument(instrument)):
                     raise HTTPException(status_code=409, detail="old position is not locally flat")
-                pen = strategy.pending_entry
                 if pen is None or pen.status != "pending" or not (pen.signal.metadata or {}).get("is_reversal_entry"):
                     raise HTTPException(status_code=409, detail="armed opposite entry required")
                 flat, detail = _engine._broker_flat_for_entry(env, pen.signal)
@@ -575,12 +647,18 @@ def create_live_app(live_engine=None) -> FastAPI:
             with _live_test_cycle_lock:
                 signal_id = _live_test_entry_signal_id
             recovery_boot = os.environ.get("LIVE_RECOVERY_ONLY") == "1"
-            if not signal_id and not recovery_boot:
-                raise HTTPException(status_code=409, detail="test entry has not been started")
             position = next((p for p in env.position_manager.get_positions_by_strategy(strategy_id)
                              if p.instrument == instrument and p.is_open), None)
             if position is None:
                 raise HTTPException(status_code=409, detail="open canary position required")
+            owned_test_position = any(
+                r.get("new_position_id") == position.position_id
+                and r.get("strategy_id") == strategy_id
+                and r.get("instrument") == instrument
+                and str(r.get("status", "")).upper() == "COMPLETE"
+                for r in _persistence.get_reversals(strategy_id, limit=100))
+            if not signal_id and not recovery_boot and not owned_test_position:
+                raise HTTPException(status_code=409, detail="test entry has not been started")
             # A tick may already have fired the SL while its normal submit
             # path stalled before reaching Dhan. For this isolated test, also
             # allow a lifecycle-owned emergency flatten after restart when

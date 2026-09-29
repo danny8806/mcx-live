@@ -109,11 +109,11 @@ class FillDeduplicator:
         effects are still absent.  This is intentionally not a general retry
         mechanism: it exists for narrowly validated recovery paths only.
         """
+        with self._db.transaction() as conn:
+            conn.execute("DELETE FROM processed_fills WHERE fill_id = ?",
+                         (fill_id,))
         with self._lock:
             self._processed_fills.discard(fill_id)
-            with self._db.transaction() as conn:
-                conn.execute("DELETE FROM processed_fills WHERE fill_id = ?",
-                             (fill_id,))
 
     def claim(self, fill_id: str) -> bool:
         """Atomically check-and-claim a fill in the in-memory set.

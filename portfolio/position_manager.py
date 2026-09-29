@@ -258,6 +258,34 @@ class PositionManager:
             del self._positions[position_id]
             return position
 
+    def restore_open_position(self, position: Position) -> Position:
+        """Reinstate a canonical open row for narrowly validated fill recovery.
+
+        A stale broker-flat reconciliation can remove the in-memory owner
+        before its already-filled exit is routed.  Recovery code supplies the
+        position reconstructed from the durable open-position row; this method
+        replaces any stale closed snapshot with that exact identity.
+        """
+        if not position or not position.position_id or not position.is_open:
+            raise ValueError("restore_open_position requires an OPEN position")
+        with self._lock:
+            conflict = next((p for p in self._positions.values()
+                             if p.instrument == position.instrument
+                             and p.is_open
+                             and p.position_id != position.position_id), None)
+            if conflict is not None:
+                raise ValueError("another open position already owns this instrument")
+            self._closed_positions = [
+                p for p in self._closed_positions
+                if p.position_id != position.position_id
+            ]
+            self._positions[position.position_id] = position
+            key = (position.strategy_id, position.instrument)
+            self._generation_counters[key] = max(
+                self._generation_counters.get(key, 0),
+                int(position.position_generation or 0))
+            return position
+
     def reduce_position(
         self,
         position_id: str,

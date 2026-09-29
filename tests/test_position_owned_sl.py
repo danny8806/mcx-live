@@ -141,6 +141,7 @@ class Harness(SLFlowMixin):
         env.broker.submit(order)
         return order
 
+
     # helpers
     def events_of(self, event_type):
         return [d for t, d, _ in self.events if t == event_type]
@@ -148,6 +149,32 @@ class Harness(SLFlowMixin):
     def add_env(self, env):
         self.envs[env.name] = env
         return env
+
+
+def test_position_manager_recovery_reopens_exact_owner_after_stale_snapshot():
+    pm = PositionManager()
+    original = Position(
+        position_id="position-1", strategy_id="S1", instrument="GOLDPETAL",
+        side=PositionSide.LONG, quantity=1, average_entry=100.0,
+        entry_timestamp=1.0, trade_id="trade-1", stop_price=95.0,
+        sl_state="EXITING", exit_order_id="exit-1", exit_started=True,
+        position_generation=3,
+    )
+    pm.restore_open_position(original)
+    abandoned = pm.abandon_stale_position("position-1")
+    assert abandoned is not None and not abandoned.is_open
+
+    recovered = Position(
+        position_id="position-1", strategy_id="S1", instrument="GOLDPETAL",
+        side=PositionSide.LONG, quantity=1, average_entry=100.0,
+        entry_timestamp=1.0, trade_id="trade-1", stop_price=95.0,
+        sl_state="EXITING", exit_order_id="exit-1", exit_started=True,
+        position_generation=3,
+    )
+    pm.restore_open_position(recovered)
+    assert pm.get_position("position-1") is recovered
+    assert pm.get_positions_by_strategy("S1") == [recovered]
+    assert pm.closed_positions == []
 
 
 def make_position(pid="P1", strategy_id="S1", instrument="NIFTY",
