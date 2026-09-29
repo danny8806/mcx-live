@@ -158,11 +158,7 @@ class PersistenceFlowMixin:
             registry = getattr(env, "pending_triggers", None)
             if registry is not None:
                 registry.cache_live_row(row)
-            strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
-            if strategy is not None:
-                strategy._last_armed_pending_id = pend_id
-                if registry is not None:
-                    registry.sync_strategy(strategy)
+            self._sync_live_pending_strategy(signal, env, registry)
             return
         row = dict(base)
         row["status"] = PendingOrderState.PENDING.value
@@ -179,14 +175,55 @@ class PersistenceFlowMixin:
         env.persistence.save_pending_order(row)
         if registry is not None:
             registry.cache_live_row(row)
-        strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
-        if strategy is not None:
-            strategy._last_armed_pending_id = pend_id
-            if registry is not None:
-                registry.sync_strategy(strategy)
+        self._sync_live_pending_strategy(signal, env, registry)
         self.publish_event("pending_order_armed", {
             "pending_order_id": pend_id, "signal_id": pend_id,
             "state": row["status"], "execution_mode": env.mode}, env_name=env.name)
+
+    def _sync_live_pending_strategy(self, signal, env, registry=None) -> None:
+        """Keep fresh signal, durable row, strategy RAM, and tick index aligned.
+
+        The strategy normally set ``pending_entry`` before emitting the
+        pending signal. Rebuild it from that same immutable signal if a
+        callback/race cleared the reference between candle evaluation and DB
+        arming; otherwise the DB says ARMED while the WebSocket path has no
+        executable trigger.
+        """
+        strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
+        if strategy is None:
+            return
+        pend_id = str(signal.signal_id)
+        current = getattr(strategy, "pending_entry", None)
+        current_id = getattr(getattr(current, "signal", None), "signal_id", None)
+        metadata = signal.metadata or {}
+        side = str(signal.side or getattr(signal.signal_type, "value", "LONG")).upper()
+        if current_id != pend_id:
+            from strategies.types import PendingEntry, StrategyState
+            status = ("waiting_for_flat"
+                      if metadata.get("is_reversal_entry")
+                      and getattr(strategy, "position_side", None) else "pending")
+            strategy.pending_entry = PendingEntry(
+                signal=signal, trigger_price=float(signal.trigger_price),
+                side=side, created_at=time.time(), status=status)
+            if not getattr(strategy, "position_side", None):
+                strategy.state = (StrategyState.PENDING_LONG if side == "LONG"
+                                  else StrategyState.PENDING_SHORT)
+            generation = metadata.get("trigger_generation")
+            if generation is not None:
+                strategy._trigger_generation = max(
+                    int(getattr(strategy, "_trigger_generation", 0) or 0),
+                    int(generation))
+            log.warning("[Engine] rebuilt missing in-memory trigger %s for %s "
+                        "while arming its LIVE DB row", pend_id,
+                        signal.strategy_id)
+        strategy._last_armed_pending_id = pend_id
+        if registry is not None:
+            registry.sync_strategy(strategy)
+            indexed = registry.entry_for(signal.strategy_id)
+            if getattr(getattr(indexed, "signal", None), "signal_id", None) != pend_id:
+                log.error("[Engine] LIVE DB trigger %s did not enter the "
+                          "WebSocket registry for %s", pend_id,
+                          signal.strategy_id)
     def _mark_live_pending_entry_sent(self, env, signal, trade, order) -> None:
         """Record ENTRY_SENT on the durable pending order once the entry was
         placed at the broker, tying the broker correlation back to the row."""

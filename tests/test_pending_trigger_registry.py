@@ -176,6 +176,48 @@ def test_startup_restore_does_not_resurrect_terminal_snapshot_trigger():
     assert env.pending_triggers.entry_for("gold_02") is None
 
 
+def test_live_arming_rebuilds_missing_memory_trigger_and_registry():
+    signal = Signal(
+        signal_type=SignalType.LONG, instrument="GOLDM", strategy_id="gold_02",
+        timestamp=10.0, trigger_price=146985.0, stop_price=146854.0,
+        quantity=100,
+        metadata={"pending": True, "trigger_state": "ARMED",
+                  "trigger_generation": 6, "trigger_source": "market_websocket_ltp"},
+    )
+    strategy = create_gold_15m(strategy_id="gold_02", instrument="GOLDM", quantity=100)
+
+    class _Persistence:
+        def __init__(self):
+            self.rows = []
+
+        def get_pending_orders(self, **_kwargs):
+            return list(self.rows)
+
+        def save_pending_order(self, row):
+            existing = next((r for r in self.rows
+                             if r["pending_order_id"] == row["pending_order_id"]), None)
+            if existing:
+                existing.update(row)
+            else:
+                self.rows.append(dict(row))
+
+    class _Harness(PersistenceFlowMixin):
+        def publish_event(self, *_args, **_kwargs):
+            pass
+
+    env = Environment(name="live", mode="LIVE", is_live=True,
+                      strategies={"gold_02": strategy}, persistence=_Persistence())
+
+    _Harness()._arm_live_pending(signal, env)
+
+    assert strategy.pending_entry is not None
+    assert strategy.pending_entry.signal.signal_id == signal.signal_id
+    assert strategy.pending_entry.trigger_price == 146985.0
+    assert strategy._trigger_generation == 6
+    assert env.pending_triggers.entry_for("gold_02") is strategy.pending_entry
+    assert env.pending_triggers.live_row(signal.signal_id)["status"] == "armed"
+
+
 def test_startup_restore_rebuilds_both_reversal_triggers():
     entry_id, exit_id = "reversal-entry", "reversal-exit"
     armed = {
