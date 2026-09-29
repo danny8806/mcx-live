@@ -224,20 +224,23 @@ class SignalFlowMixin:
 
         # §66 — IDEMPOTENT REPLAY: a signal whose own trade already executed
         # its entry (entry_fill recorded => a real position exists) must never
-        # be executed again.  Replaying the same entry signal upstream (crash
+        # be executed again. Replaying the same entry signal upstream (crash
         # replay, WS+REST double delivery, operator retry, backfill) must not
-        # mint a second trade, a second order, a second fill or an additional
-        # position on the FIRST trade.  A trade that exists but has NOT
-        # executed its entry (placement was rejected / retry pending) still
-        # re-places through the existing trade — never a fresh one.
+        # mint another economic attempt. A definitive rejection/cancellation
+        # is also terminal for that immutable signal; a fresh signal is needed
+        # to submit a new order.
         if not is_exit and not is_pending:
             prior_trade = lifecycle.resolve_trade_from_signal(signal.signal_id)
-            if prior_trade is not None and getattr(prior_trade, "entry_fill_id", None):
+            prior_status = str(getattr(prior_trade, "status", "") or "").upper()
+            if (prior_trade is not None
+                    and (getattr(prior_trade, "entry_fill_id", None)
+                         or prior_status in ("REJECTED", "CANCELLED"))):
                 self.publish_event("signal_replayed_ignored", {
                     "signal_id": signal.signal_id,
                     "trade_id": prior_trade.trade_id,
                     "strategy_id": signal.strategy_id,
-                    "already_filled": prior_trade.entry_fill_id,
+                    "already_filled": getattr(prior_trade, "entry_fill_id", None),
+                    "terminal_status": prior_status,
                     "execution_mode": env.mode}, env_name=env.name)
                 return
 
@@ -620,6 +623,41 @@ class SignalFlowMixin:
         # the broker: record ENTRY_SENT with the broker correlation tie-back.
         if live_pending is not None:
             self._mark_live_pending_entry_sent(env, signal, trade, order)
+        # A broker placement rejection is terminal even when Dhan returned no
+        # broker order id. Settle the canonical trade and pending trigger now;
+        # otherwise the signal remains PENDING/ENTRY_SENT and permanently
+        # occupies the strategy after a definitive no-fill response.
+        terminal_entry = (order_role in ("ENTRY", "REVERSAL_ENTRY")
+                          and str(getattr(order.state, "value", order.state)).lower()
+                          in ("rejected", "cancelled", "canceled", "expired")
+                          and int(getattr(order, "filled_quantity", 0) or 0) == 0)
+        if terminal_entry:
+            reason = getattr(order, "reason", None) or "broker rejected entry without fill"
+            lifecycle.reject_unfilled_entry(
+                trade.trade_id, reason=reason, order_id=order.order_id,
+                status=("CANCELLED" if str(getattr(order.state, "value", order.state)).lower()
+                        in ("cancelled", "canceled", "expired") else "REJECTED"))
+            if env.persistence is not None:
+                try:
+                    env.persistence.terminalize_pending_order(
+                        signal.signal_id, reason=str(reason))
+                except Exception as exc:
+                    log.error("[Engine] failed to terminalize rejected entry %s: %s",
+                              signal.signal_id, exc)
+            if order_role == "REVERSAL_ENTRY" and env.mode == "LIVE":
+                self._update_reversal_entry_rejected(
+                    env, (signal.metadata or {}).get("reversal_parent_signal_id")
+                    or signal.signal_id, reason)
+            pending = getattr(strategy, "pending_entry", None)
+            pending_sid = getattr(getattr(pending, "signal", None), "signal_id", None)
+            if pending is None or str(pending_sid) == str(signal.signal_id):
+                self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+            self.publish_event("entry_order_terminal_without_fill", {
+                "trade_id": trade.trade_id, "order_id": order.order_id,
+                "signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
+                "instrument": signal.instrument, "state": str(getattr(order.state, "value", order.state)),
+                "reason": str(reason), "execution_mode": env.mode,
+            }, env_name=env.name)
         for fill in order_manager.drain_fills():
             # §39 — every broker fill routes by explicit broker_order_id ->
             # strategy mapping (never symbol/side/latest order). Unmappable or

@@ -110,6 +110,23 @@ class LivePositionFlowMixin:
         except Exception as e:
             log.warning("[Engine] reversal entry-created stamp failed for %s: %s",
                         rev["reversal_id"], e)
+
+    def _update_reversal_entry_rejected(self, env, signal_id: Optional[str],
+                                        reason: str) -> None:
+        """Record that the opposite entry definitively failed without a fill."""
+        rev = self._find_reversal(env, signal_id)
+        if rev is None:
+            return
+        try:
+            env.persistence.update_reversal(rev["reversal_id"], {
+                "new_entry_broker_status": "REJECTED",
+                "status": "ENTRY_REJECTED",
+                "failure_reason": str(reason),
+            })
+        except Exception as e:
+            log.warning("[Engine] reversal entry-reject stamp failed for %s: %s",
+                        rev["reversal_id"], e)
+
     def _update_reversal_entry_fill(self, env, signal_id: Optional[str],
                                     fill, position) -> None:
         """Stamp the broker-confirmed NEW entry fill ONLY on a new position.

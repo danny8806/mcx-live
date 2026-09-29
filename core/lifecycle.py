@@ -658,6 +658,42 @@ class TradeLifecycleManager:
             self._persist_trade(trade)
             return trade
 
+    def reject_unfilled_entry(self, trade_id: str, reason: str = "",
+                              order_id: str = "", status: str = "REJECTED") -> bool:
+        """Settle an entry that definitively ended without any fill.
+
+        The broker may reject a placement before returning an order id. Keep
+        this transition explicit so a zero-price PENDING trade cannot remain
+        open in lifecycle state after its durable trigger is terminalized.
+        Late fills are quarantined by ``register_entry_fill`` once settled.
+        """
+        settled_status = str(status or TradeStatus.REJECTED.value).upper()
+        if settled_status not in (TradeStatus.REJECTED.value,
+                                  TradeStatus.CANCELLED.value):
+            raise ValueError(f"unsupported unfilled-entry status: {status}")
+        with self._lock:
+            trade = self._trade_in_scope(trade_id)
+            if trade is None:
+                return False
+            if trade.entry_fill_id or trade.entry_price > 0 or trade.status == TradeStatus.OPEN.value:
+                return False
+            if trade.status in (TradeStatus.CLOSED.value,
+                                TradeStatus.REJECTED.value,
+                                TradeStatus.CANCELLED.value):
+                return False
+            trade.status = settled_status
+            trade.pending_status = "resolved"
+            if order_id:
+                trade.entry_order_id = order_id
+                self._order_to_trade[order_id] = trade.trade_id
+            trade.signal_reason = (f"{trade.signal_reason}; " if trade.signal_reason else "") + str(reason)
+            trade.updated_at = time.time()
+            self._record_event(trade.trade_id, "ENTRY_REJECTED" if settled_status == TradeStatus.REJECTED.value else "ENTRY_CANCELLED",
+                               order_id=order_id or None,
+                               payload={"reason": str(reason), "status": settled_status})
+            self._persist_trade(trade)
+            return True
+
     # ═══════════════════════════════════════════
     # ORDER
     # ═══════════════════════════════════════════

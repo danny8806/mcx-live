@@ -559,11 +559,17 @@ class ReconciliationEngine:
 
         bad_trades = []
         for t in db_trades:
-            for key in ("entry_price", "exit_price"):
+            status = str(t.get("status", "")).lower()
+            # A zero entry price is expected for an unfilled pending,
+            # rejected, or cancelled entry. Only trades with confirmed
+            # exposure (or a completed lifecycle) must have a valid entry.
+            entry_required = (status in ("open", "exit_pending", "closed")
+                              or bool(t.get("entry_fill_id")))
+            keys = ["entry_price"] if entry_required else []
+            if status == "closed":
+                keys.append("exit_price")
+            for key in keys:
                 price = t.get(key)
-                # Skip exit_price check for open trades (exit_price=0.0 is correct)
-                if key == "exit_price" and t.get("status", "").lower() not in ("closed",):
-                    continue
                 if price is None or price <= 0.0 or (
                     isinstance(price, float) and (price != price or abs(price) == float("inf"))
                 ):

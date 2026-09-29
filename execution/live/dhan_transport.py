@@ -293,6 +293,31 @@ class DhanRestTransport(LiveBrokerClient):
                         "/orders", "POST", payload, error=exc,
                         http_status=place_status,
                         correlation_id=correlation_id)
+            # Dhan's structured 4xx Order_Error is an explicit broker
+            # rejection. A correlation lookup after this response is both
+            # unnecessary and harmful: Dhan may return 404 for an order that
+            # it already rejected, leaving local state unresolved forever.
+            if (place_status is not None and 400 <= int(place_status) < 500
+                    and getattr(exc, "dhan_error_type", None) == "Order_Error"):
+                reason = (getattr(exc, "text", None)
+                          or getattr(exc, "body", None) or str(exc))
+                return {
+                    "broker_order_id": None,
+                    "status": "rejected",
+                    "raw_status": "REJECTED",
+                    "reason": str(reason),
+                    "side": side_u,
+                    "quantity": quantity,
+                    "instrument": instrument,
+                    "requested_order_type": order_type_u,
+                    "requested_price": limit_price,
+                    "requested_trigger_price": trigger,
+                    "correlation_id": correlation_id,
+                    "timestamp": self._clock(),
+                    "filled_quantity": 0,
+                    "average_fill_price": 0.0,
+                    "last_accounted_qty": 0,
+                }
             return self._resolve_unknown_placement(
                 correlation_id, side_u, quantity, instrument,
                 order_type_u, limit_price, trigger, exc)
@@ -367,8 +392,10 @@ class DhanRestTransport(LiveBrokerClient):
                             http_status=getattr(exc, "status", None) or 400,
                             correlation_id=correlation_id)
                 body = {}
-                # The lookup ITSELF failed. This is not proof of non-execution.
-                lookup_ok = False
+                # Dhan's explicit 404 on the external-order endpoint is
+                # authoritative absence. Other lookup errors do not prove
+                # whether a timed-out POST reached the broker.
+                lookup_ok = getattr(exc, "status", None) == 404
             else:
                 self._audit("ORDER_BY_CORRELATION",
                             f"/orders/external/{correlation_id}", "GET",
@@ -444,6 +471,9 @@ class DhanRestTransport(LiveBrokerClient):
                         "GET", error=exc,
                         http_status=getattr(exc, "status", None) or 400,
                         correlation_id=cid)
+            if getattr(exc, "status", None) == 404:
+                return {"status": "not_found", "correlation_id": cid,
+                        "reason": f"broker_no_such_order: {exc}"}
             return {"status": "unresolved",
                     "reason": f"correlation_lookup_failed: {exc}",
                     "correlation_id": cid}

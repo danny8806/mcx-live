@@ -151,6 +151,41 @@ def test_resolver_distinguishes_not_found_from_unresolved():
     assert _transport(http2).order_by_correlation_id("C")["status"] == "unresolved"
 
 
+def test_explicit_dhan_order_error_is_rejected_without_correlation_lookup():
+    from data.dhan.rest_client import DhanHTTPError
+
+    err = DhanHTTPError(400, "Order rejected", {
+        "errorType": "Order_Error", "errorCode": "DH-906",
+        "errorMessage": "transactions blocked by RMS",
+    })
+    http = Http(post_exc=err, lookup_exc=ConnectionError("should not be called"))
+    rec = _place(_transport(http))
+    assert rec["status"] == "rejected"
+    assert rec["raw_status"] == "REJECTED"
+    assert "Order rejected" in rec["reason"]
+    assert http.gets == []
+
+
+def test_correlation_http_404_is_authoritative_not_found():
+    class NotFound(RuntimeError):
+        status = 404
+
+    http = Http(lookup_exc=NotFound("no such correlation"))
+    rec = _transport(http).order_by_correlation_id("MISSING")
+    assert rec["status"] == "not_found"
+
+
+def test_placement_timeout_plus_correlation_http_404_is_definitive_absence():
+    class NotFound(RuntimeError):
+        status = 404
+
+    http = Http(post_exc=TimeoutError("response lost"),
+                lookup_exc=NotFound("no such correlation"))
+    with pytest.raises(RuntimeError, match="found no order") as exc:
+        _place(_transport(http))
+    assert not isinstance(exc.value, OrderPlacementUnresolved)
+
+
 def test_resolver_without_a_correlation_id_is_unresolved_not_not_found():
     """A missing handle is not proof the order is absent."""
     rec = _transport(Http(lookup_body={})).order_by_correlation_id("")
