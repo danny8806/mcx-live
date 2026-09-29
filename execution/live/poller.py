@@ -47,6 +47,22 @@ _EXIT_ROLES = ("EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT")
 _TERMINAL_ORDER_STATES = ("rejected", "canceled", "cancelled", "expired")
 
 
+def _terminal_entry_matches_pending(strategy, order) -> bool:
+    """Whether a terminal entry order owns the strategy's current trigger.
+
+    Historical rejected orders remain in the restored execution book. Their
+    cleanup must never reset a newer, separately armed signal.
+    """
+    pending = getattr(strategy, "pending_entry", None)
+    if pending is None:
+        return True
+    pending_signal_id = getattr(getattr(pending, "signal", None), "signal_id", None)
+    order_signal_id = (getattr(order, "entry_signal_id", None)
+                       or getattr(order, "parent_signal_id", None))
+    return bool(pending_signal_id and order_signal_id
+                and str(pending_signal_id) == str(order_signal_id))
+
+
 def _is_live(env) -> bool:
     """True when the env is a LIVE broker-backed environment."""
     try:
@@ -298,6 +314,17 @@ class LiveBrokerPoller:
                     # stop while the position was OPEN.
                     strat = strategies.get(order.strategy_id)
                     if strat is None:
+                        continue
+                    if not _terminal_entry_matches_pending(strat, order):
+                        pending = getattr(strat, "pending_entry", None)
+                        pending_id = getattr(getattr(pending, "signal", None),
+                                             "signal_id", None)
+                        order_signal_id = (getattr(order, "entry_signal_id", None)
+                                           or getattr(order, "parent_signal_id", None))
+                        log.info("[LivePoller:%s] ignoring terminal entry %s "
+                                 "(signal=%s); strategy %s has newer pending %s",
+                                 self.env.name, order.order_id, order_signal_id,
+                                 order.strategy_id, pending_id)
                         continue
                     state_v = getattr(strat, "state", None)
                     if hasattr(state_v, "value"):
