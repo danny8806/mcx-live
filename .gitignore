@@ -153,8 +153,8 @@ trading.db-wal
 # Archive (large legacy output)
 archive/
 
-# Docker runtime volumes
-data/
+# Docker runtime volume; keep the Python data package in source control.
+data/db/
 
 # Three-service platform: runtime log mounts + TLS certs (never commit)
 logs/

@@ -97,9 +97,8 @@ class MarketEventFlowMixin:
         ws = getattr(self.data_adapter, "ws", None)
         ws_connected = bool(ws and ws.connected)
 
-        # Per-instrument tick freshness.  A completed candle still refreshes
-        # health, because REST is an independent confirmation that the market
-        # is reachable; only the LOSS of both is a genuine outage.
+        # Per-instrument WebSocket tick freshness. REST candles are handled
+        # separately and cannot make a disconnected tick feed look healthy.
         health = getattr(self, "market_data_health", None)
         if health is not None:
             if valid_ltp and (ws is None or ws_connected):
