@@ -353,9 +353,9 @@ def create_live_app(live_engine=None) -> FastAPI:
 
         Disabled unless the operator explicitly enables
         ``live_test_order_cycle.enabled`` in live config and provides a
-        one-time environment token. The test can submit only the configured
-        strategy/instrument/quantity and can force only that position's own
-        local stop monitor. It is not a general order endpoint.
+        one-time environment token. The test can arm a trigger only for the
+        configured strategy/instrument/quantity. All trigger crossing must
+        come from the real Dhan WebSocket; this is not a general order API.
         """
         if not _engine:
             raise HTTPException(status_code=503, detail="live engine unavailable")
@@ -482,6 +482,16 @@ def create_live_app(live_engine=None) -> FastAPI:
                 "note": "persisted exit fill routed through normal FillFlow; no order sent",
             }
 
+        # Conformance mode is intentionally WebSocket-driven.  These older
+        # helper actions used to fabricate an adverse LTP or call on_tick()
+        # directly; that is useful for unit tests, but cannot prove the live
+        # feed/trigger contract required by the controlled live validation.
+        if action in {"fire_reversal_exit", "fire_reversal_entry", "fire_test_stop"}:
+            raise HTTPException(
+                status_code=409,
+                detail="synthetic trigger firing is disabled; wait for a real Dhan WebSocket tick",
+            )
+
         if action == "entry":
             global _live_test_entry_signal_id
             with _live_test_cycle_lock:
@@ -509,51 +519,128 @@ def create_live_app(live_engine=None) -> FastAPI:
                     observed = float(execution._current_prices.get(instrument, 0.0) or 0.0)
                 if observed <= 0:
                     raise HTTPException(status_code=409, detail="no live tick price for test instrument")
+                # Candle context is taken from the production REST adapter.
+                # Never synthesize OHLC from the live WebSocket tick stream.
+                try:
+                    candle_state = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            env.data_adapter.fetch_candle_state, instrument, "5"),
+                        timeout=12.0,
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"recent closed REST candle unavailable: {exc}",
+                    )
+                candles = (candle_state or {}).get("closed") or []
+                if not candles:
+                    raise HTTPException(status_code=409,
+                                        detail="no completed REST candle for the test signal")
+                candle = candles[-1]
+                if len(candle) < 5:
+                    raise HTTPException(status_code=503,
+                                        detail="REST candle row is incomplete")
+                candle_ts = float(candle[0])
+                candle_open, candle_high, candle_low, candle_close = map(
+                    float, candle[1:5])
+                now = time.time()
+                if candle_ts + 300.0 > now or now - (candle_ts + 300.0) > 900.0:
+                    raise HTTPException(status_code=409,
+                                        detail="REST candle is not recently completed")
+                if (min(candle_open, candle_high, candle_low, candle_close) <= 0
+                        or candle_high < max(candle_open, candle_close, candle_low)
+                        or candle_low > min(candle_open, candle_close, candle_high)):
+                    raise HTTPException(status_code=503,
+                                        detail="REST candle OHLC validation failed")
 
-                from strategies.types import Signal, SignalType
+                from strategies.types import PendingEntry, Signal, SignalType, StrategyState
                 tick = float(_engine.config.instrument(instrument).get("tick_size", 1.0) or 1.0)
                 quantity = int(test_cfg["quantity"])
+                side = str(body.get("side", "LONG")).upper()
+                if side not in ("LONG", "SHORT"):
+                    raise HTTPException(status_code=422, detail="side must be LONG or SHORT")
+                trigger_price = (observed + tick if side == "LONG"
+                                 else max(tick, observed - tick))
+                stop_price = candle_low if side == "LONG" else candle_high
+                if ((side == "LONG" and stop_price >= trigger_price)
+                        or (side == "SHORT" and stop_price <= trigger_price)):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="latest REST candle stop level is invalid for the current trigger",
+                    )
+                test_run_id = str(body.get("test_run_id") or uuid.uuid4())
                 generation = int(getattr(strategy, "_trigger_generation", 0)) + 1
                 strategy._trigger_generation = generation
                 signal = Signal(
-                    signal_type=SignalType.LONG, instrument=instrument,
+                    signal_type=SignalType(side), instrument=instrument,
                     strategy_id=strategy_id, timestamp=time.time(),
-                    # Keep the opening leg alive long enough to drive and
-                    # inspect the reversal stages.  The dedicated stop test
-                    # still exercises the opposite position's ordinary local
-                    # SL monitor; this is canary-only test risk sizing.
-                    trigger_price=observed,
-                    stop_price=max(tick, observed - 50.0 * tick),
+                    # The controlled signal stops at the signal/trigger
+                    # boundary.  A real Dhan WebSocket tick must cross this
+                    # one-tick-away level before production SignalFlow can
+                    # create any order.
+                    trigger_price=trigger_price,
+                    stop_price=stop_price,
                     quantity=quantity,
+                    side=side,
                     metadata={
-                        "triggered": True, "trigger_state": "FIRED",
-                        "trigger_source": "loopback_live_canary",
-                        "trigger_ltp": observed + tick,
+                        "pending": True, "triggered": False,
+                        "trigger_state": "ARMED",
+                        "trigger_source": "market_websocket_ltp",
                         "trigger_generation": generation,
                         "test_cycle": True,
+                        "test_mode": True,
+                        "test_run_id": test_run_id,
+                        "signal_candle_timestamp": candle_ts,
+                        "signal_candle_open": candle_open,
+                        "signal_candle_high": candle_high,
+                        "signal_candle_low": candle_low,
+                        "signal_candle_close": candle_close,
+                        "candle_source": "dhan_rest",
                     },
                 )
                 broker_flat, flat_detail = _engine._broker_flat_for_entry(env, signal)
                 if not broker_flat:
                     raise HTTPException(status_code=409,
                                         detail={"broker_flat_required": flat_detail})
-                strategy._last_fired_trigger_signal_id = signal.signal_id
-                strategy._fired_trigger_signal_ids[signal.signal_id] = None
+                strategy.pending_entry = PendingEntry(
+                    signal=signal, trigger_price=signal.trigger_price,
+                    side=side, created_at=time.time(), status="pending")
+                strategy.state = (StrategyState.PENDING_LONG if side == "LONG"
+                                  else StrategyState.PENDING_SHORT)
                 _live_test_entry_signal_id = signal.signal_id
                 _engine._process_signal(signal, "live")
-                order = next((o for o in reversed(list(execution._orders.values()))
-                              if getattr(o, "parent_signal_id", None) == signal.signal_id
-                              or getattr(o, "entry_signal_id", None) == signal.signal_id), None)
+                pending_row = _engine._live_pending_row(env, signal)
+                if (not pending_row
+                        or str(pending_row.get("status", "")).lower() != "armed"):
+                    strategy._cancel_trigger(strategy.pending_entry)
+                    strategy.pending_entry = None
+                    strategy.state = StrategyState.FLAT
+                    _live_test_entry_signal_id = None
+                    raise HTTPException(
+                        status_code=409,
+                        detail="production signal flow did not persist and arm the test trigger",
+                    )
                 return {
-                    "accepted_by_app": order is not None,
+                    "accepted_by_app": True,
                     "signal_id": signal.signal_id,
                     "strategy_id": strategy_id,
                     "instrument": instrument,
                     "quantity": quantity,
                     "reference_ltp": observed,
-                    "limit_cap": observed + tick,
+                    "trigger_price": signal.trigger_price,
+                    "signal_candle_timestamp": candle_ts,
+                    "signal_candle": {
+                        "open": candle_open,
+                        "high": candle_high,
+                        "low": candle_low,
+                        "close": candle_close,
+                        "source": "dhan_rest",
+                    },
+                    "trigger_state": "ARMED",
+                    "trigger_source": "market_websocket_ltp",
                     "stop_price": signal.stop_price,
-                    "order": order.to_dict() if order and hasattr(order, "to_dict") else str(order),
+                    "order_created": False,
+                    "note": "controlled signal is persisted as ARMED; only a real Dhan WebSocket crossing may enter production order flow",
                 }
 
         if action == "opposite_signal":

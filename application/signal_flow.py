@@ -77,9 +77,10 @@ class SignalFlowMixin:
                 {"signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
                  "execution_mode": env.mode})
             return
-        # During the narrowly scoped live canary, only its loopback-triggered
-        # lifecycle may create entries. Normal strategy exits remain enabled
-        # so risk controls can still reduce exposure during the test.
+        # During the narrowly scoped live canary, only its explicitly marked
+        # test lifecycle may create entries. The canary signal is armed as a
+        # pending trigger; the normal Dhan WebSocket tick handler must fire it.
+        # Normal strategy exits remain enabled during the test.
         config = getattr(self, "config", None)
         test_cfg = (config.get("live_test_order_cycle", {}) or {}) if config else {}
         if (env.is_live and test_cfg.get("enabled")
