@@ -419,7 +419,12 @@ def create_live_app(live_engine=None) -> FastAPI:
                 signal = Signal(
                     signal_type=SignalType.LONG, instrument=instrument,
                     strategy_id=strategy_id, timestamp=time.time(),
-                    trigger_price=observed, stop_price=max(tick, observed - tick),
+                    # Keep the opening leg alive long enough to drive and
+                    # inspect the reversal stages.  The dedicated stop test
+                    # still exercises the opposite position's ordinary local
+                    # SL monitor; this is canary-only test risk sizing.
+                    trigger_price=observed,
+                    stop_price=max(tick, observed - 50.0 * tick),
                     quantity=quantity,
                     metadata={
                         "triggered": True, "trigger_state": "FIRED",
@@ -549,12 +554,15 @@ def create_live_app(live_engine=None) -> FastAPI:
             if not signal_id:
                 raise HTTPException(status_code=409, detail="test entry has not been started")
             execution = env.execution_engine
+            anchor = next((o for o in execution._orders.values()
+                          if (getattr(o, "parent_signal_id", None) == signal_id
+                              or getattr(o, "entry_signal_id", None) == signal_id)), None)
+            start_at = getattr(anchor, "created_at", float("inf"))
             orders = [o.to_dict() if hasattr(o, "to_dict") else str(o)
                       for o in execution._orders.values()
-                      if (getattr(o, "parent_signal_id", None) == signal_id
-                          or getattr(o, "entry_signal_id", None) == signal_id
-                          or (getattr(o, "trade_id", None) == getattr(strategy, "current_trade_id", None)
-                              and getattr(o, "order_role", "") in ("EXIT", "EMERGENCY_EXIT")))]
+                      if (getattr(o, "strategy_id", None) == strategy_id
+                          and getattr(o, "instrument", None) == instrument
+                          and float(getattr(o, "created_at", 0) or 0) >= start_at)]
             positions = [{
                 "position_id": p.position_id, "trade_id": p.trade_id,
                 "quantity": p.quantity, "is_open": p.is_open,
