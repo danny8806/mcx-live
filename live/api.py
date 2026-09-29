@@ -646,11 +646,16 @@ def create_live_app(live_engine=None) -> FastAPI:
             except Exception as exc:
                 raise HTTPException(status_code=503,
                                     detail=f"broker flat check unavailable: {exc}")
+            parent_signal = _persistence.get_signal(reversal.get("signal_id"))
+            reversal_side = str((parent_signal or {}).get("side", "")).upper()
+            if reversal_side not in ("LONG", "SHORT"):
+                raise HTTPException(status_code=409,
+                                    detail="durable reversal signal side is unavailable")
             pending = next((p for p in _persistence.get_pending_orders(
                 status="armed", execution_mode="LIVE")
                 if p.get("strategy_id") == strategy_id
                 and p.get("instrument") == instrument
-                and str(p.get("side", "")).upper() == str(reversal.get("side", "")).upper()), None)
+                and str(p.get("side", "")).upper() == reversal_side), None)
             if pending is None:
                 raise HTTPException(status_code=409, detail="durable opposite breakout is not armed")
             signal_row = _persistence.get_signal(pending.get("signal_id"))
