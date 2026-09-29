@@ -518,6 +518,7 @@ class FillFlowMixin:
                     entry_fill_ids=[entry_fill_id] if entry_fill_id else [],
                     stop_price=owner_row.get("stop_price"),
                     trade_id=owner_row.get("trade_id"),
+                    entry_signal_id=trade_row.get("entry_signal_id"),
                     status=PositionStatus.OPEN,
                     sl_state="EXITING",
                     sl_protected_at=(float(owner_row["sl_protected_at"])
