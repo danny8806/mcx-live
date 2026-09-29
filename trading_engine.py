@@ -1212,14 +1212,25 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             # §35 — trading must not begin on an unreconciled book.  An unknown
             # broker state is not "flat": if the position query failed we do not
             # know what is open, so entries stay closed until it succeeds.
-            if summary.get("status") == "reconciled":
+            # A broker position we cannot attribute to any local strategy is
+            # equally unsafe to stack new risk onto: it carries no stop we own
+            # and can never be exited by us.
+            if summary.get("status") == "reconciled" and not summary.get(
+                    "orphan_exposure"):
                 self._reconciled_envs.add(name)
                 log.info("[Engine] startup SL sync for env %s: %s", name, summary)
             else:
                 self._reconciled_envs.discard(name)
-                log.error("[Engine] startup reconciliation FAILED for %s (%s) — "
-                          "entries stay blocked until the broker position state "
-                          "is known", name, summary.get("error"))
+                if summary.get("orphan_exposure"):
+                    log.error("[Engine] env %s holds ORPHAN broker position(s) "
+                              "%s with no local record — entries stay blocked "
+                              "until they are resolved", name,
+                              summary.get("orphans"))
+                else:
+                    log.error("[Engine] startup reconciliation FAILED for %s "
+                              "(%s) — entries stay blocked until the broker "
+                              "position state is known", name,
+                              summary.get("error"))
 
         self.market_status.set_engine_status(EngineStatus.WARMING_UP)
         for env in self._envs.values():
@@ -1985,12 +1996,14 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                     sl_summary = self.sync_sl_from_broker(env_name=env.name)
                 except Exception as e:
                     sl_summary = {"status": "failed", "error": str(e)}
-                if sl_summary.get("status") == "reconciled":
+                if sl_summary.get("status") == "reconciled" and not \
+                        sl_summary.get("orphan_exposure"):
                     if env.name not in self._reconciled_envs:
                         log.info("[Engine] broker position state re-established "
                                  "for %s — entries re-enabled", env.name)
                     self._reconciled_envs.add(env.name)
                 else:
+                    # An unattributable broker position keeps the gate shut too.
                     self._reconciled_envs.discard(env.name)
             with self._lock:
                 for sid, strategy in list(env.strategies.items()):

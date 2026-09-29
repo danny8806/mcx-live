@@ -318,24 +318,37 @@ class BrokerSyncService:
                 self._stop_event.set()
                 return
             # WS feed health (when enabled)
+            ws_ok = True
             if self._ws_enabled and self._ws_feed is not None:
                 ws_alive = self._ws_feed.connected
                 stale = self._ws_feed.is_stale() if hasattr(self._ws_feed, "is_stale") else False
                 now = self._clock()
+                # A socket can report connected=True while its heartbeat has
+                # already timed out, so liveness is BOTH conditions. Reporting
+                # only ``connected`` is what let a dead order feed keep claiming
+                # to be healthy.
+                ws_ok = bool(ws_alive) and not stale
+                was_stale = self._ws_stale_active
                 if stale:
-                    if (not self._ws_stale_active
+                    if (not was_stale
                             or (now - self._ws_stale_warned_at) >= _WS_STALE_WARN_INTERVAL):
                         log.warning("[BrokerSync:%s] WS feed stale (heartbeat timeout) "
                                     "connected=%s — retrying every %.0fs",
                                     self.env.name, ws_alive, _WS_STALE_WARN_INTERVAL)
                         self._ws_stale_warned_at = now
-                        self._ws_stale_active = True
-                elif self._ws_stale_active:
-                    log.info("[BrokerSync:%s] WS feed recovered", self.env.name)
+                    self._ws_stale_active = True
+                else:
+                    if was_stale:
+                        log.info("[BrokerSync:%s] WS feed recovered", self.env.name)
                     self._ws_stale_active = False
                     self._ws_stale_warned_at = 0.0
-            # Overall health
-            self._healthy = worker_alive
+                if not ws_ok:
+                    self._stats["ws_unhealthy_ticks"] = \
+                        self._stats.get("ws_unhealthy_ticks", 0) + 1
+            # Overall health: a dead order feed degrades the service even while
+            # the REST poller worker is alive. Fills still arrive over REST, so
+            # this is degraded, not stopped.
+            self._healthy = worker_alive and ws_ok
 
     # ── stale detection ───────────────────────────────────────────────
 
@@ -435,6 +448,21 @@ class BrokerSyncService:
 
     # ── aggregated stats / snapshot ───────────────────────────────────
 
+    def _ws_liveness(self) -> dict:
+        """Single source of truth for order-feed liveness.
+
+        ``connected`` alone is not liveness: a socket whose heartbeat has timed
+        out still reports True. Reporting both lets an operator see the
+        contradiction instead of trusting a green ``ws_connected``.
+        """
+        if self._ws_feed is None:
+            return {"connected": False, "stale": False, "live": False}
+        connected = bool(self._ws_feed.connected)
+        stale = bool(self._ws_feed.is_stale()) if hasattr(
+            self._ws_feed, "is_stale") else False
+        return {"connected": connected, "stale": stale,
+                "live": connected and not stale}
+
     def stats(self) -> dict:
         with self._lock:
             poller_stats = self._poller.stats()
@@ -442,18 +470,22 @@ class BrokerSyncService:
             poller_stats.update(self._stats)
             poller_stats["service_healthy"] = self._healthy
             poller_stats["ws_enabled"] = self._ws_enabled
-            poller_stats["ws_connected"] = (
-                self._ws_feed.connected if self._ws_feed is not None else False)
+            live = self._ws_liveness()
+            poller_stats["ws_connected"] = live["connected"]
+            poller_stats["ws_stale"] = live["stale"]
+            poller_stats["ws_live"] = live["live"]
             poller_stats["last_cycle"] = dict(self._last_cycle)
             return poller_stats
 
     def snapshot(self) -> dict:
         poller_snap = self._poller.snapshot()
+        live = self._ws_liveness()
         poller_snap["service"] = {
             "healthy": self._healthy,
             "ws_enabled": self._ws_enabled,
-            "ws_connected": (
-                self._ws_feed.connected if self._ws_feed is not None else False),
+            "ws_connected": live["connected"],
+            "ws_stale": live["stale"],
+            "ws_live": live["live"],
             "worker_alive": self._poller.running,
         }
         return poller_snap

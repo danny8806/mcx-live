@@ -21,7 +21,11 @@ import uuid
 from typing import Optional
 
 from execution.broker_router import BrokerEventRouter
-from execution.live.broker_client import BrokerGateClosed, LiveBrokerClient
+from execution.live.broker_client import (
+    BrokerGateClosed,
+    LiveBrokerClient,
+    OrderPlacementUnresolved,
+)
 from execution.models import Fill, Order, OrderState
 from execution.price_model import (
     ExecutionPricePlan, PricePreset,
@@ -281,6 +285,17 @@ class LiveExecutionEngine:
         except BrokerGateClosed as e:
             order.state = OrderState.REJECTED
             order.reason = str(e)
+            order.updated_at = self._now()
+            return order
+        except OrderPlacementUnresolved as e:
+            # The broker outcome is UNKNOWN, not rejected. Marking this
+            # REJECTED made the local book flat while the exchange could hold a
+            # live order. Park it as SUBMITTED with no broker_order_id: the
+            # durable pending row stays ENTRY_SENT and reconciliation keeps
+            # asking the broker, which is the only authority that can resolve it.
+            order.state = OrderState.SUBMITTED
+            order.reason = str(e)
+            order.filled_quantity = 0
             order.updated_at = self._now()
             return order
         except Exception as e:

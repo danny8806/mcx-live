@@ -2,12 +2,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import struct
 import threading
 import time
 from typing import Any, Callable, Optional
 
 import websocket
+
+log = logging.getLogger("dhan_ws")
+
+# Packet codes Dhan emits that carry no LTP and are intentionally not parsed.
+# 5 = market depth, 8 = OHLC. Only code 2 (LTP) and code 4 (quote) drive the
+# trigger and the local stop-loss; candles come from REST.
+_IGNORED_PACKET_CODES = frozenset({5, 8})
 
 
 class DhanWebSocketClient:
@@ -303,9 +311,26 @@ class DhanWebSocketClient:
                 "timestamp": time.time(),
             }
 
-        # DEBUG: log unknown packet codes
+        # Dhan also sends market-depth (code 5) and OHLC (code 8) packets. Both
+        # are deliberately ignored: the stop-loss and the trigger both need only
+        # LTP, and candles come from REST. Counting them separately keeps them
+        # from being reported as UNKNOWN packets, which read as data loss.
+        if code in _IGNORED_PACKET_CODES:
+            self._stats["ignored_packets"] = \
+                self._stats.get("ignored_packets", 0) + 1
+            self._stats.setdefault("ignored_by_code", {})
+            self._stats["ignored_by_code"][str(code)] = \
+                self._stats["ignored_by_code"].get(str(code), 0) + 1
+            return None
+
+        # A genuinely unrecognised code IS worth flagging: it may mean a feed
+        # format change, and silently dropping real data is how a stop goes
+        # blind without anyone noticing.
+        self._stats["unknown_packets"] = \
+            self._stats.get("unknown_packets", 0) + 1
         if self._stats["recv"] < 500:
-            print(f"[dhan_ws] UNKNOWN code={code} len={len(data)} hex={data[:16].hex()}", flush=True)
+            log.warning("[dhan_ws] UNKNOWN packet code=%s len=%s hex=%s",
+                        code, len(data), data[:16].hex())
         return None
 
     def is_stale(self) -> bool:

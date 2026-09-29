@@ -42,6 +42,23 @@ class PreTradeGateBlocked(Exception):
     """
 
 
+class OrderPlacementUnresolved(Exception):
+    """The broker outcome of a placement could NOT be determined.
+
+    The ``POST /orders`` response was lost AND the follow-up correlation lookup
+    also failed, so the order MAY or MAY NOT have reached the exchange.  This is
+    explicitly NOT a rejection: the system has no evidence the order did not
+    execute.
+
+    A caller must never treat this as "flat".  Retrying blindly risks a
+    duplicate order against a real position, and recording a rejection risks a
+    silent local-flat / broker-exposed divergence.  The order is instead parked
+    in ``SUBMITTED`` with no ``broker_order_id`` so the durable pending row and
+    startup reconciliation keep asking the broker, which is the only party that
+    can resolve it.
+    """
+
+
 class LiveBrokerClient(ABC):
     """Interface contract every live broker transport must satisfy."""
 

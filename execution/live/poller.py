@@ -557,6 +557,12 @@ class LiveBrokerPoller:
         for row in rows:
             broker_id = row.get("broker_order_id") or ""
             if not broker_id:
+                # An order whose POST response AND correlation lookup both failed
+                # was parked as ENTRY_SENT with NO broker_order_id, so the
+                # by-id self-heal below can never see it. Resolve it by the
+                # correlation id we recorded instead of leaving it unresolved
+                # forever (a permanently "pending" row that may hide a fill).
+                self._self_heal_by_correlation(row, terminal)
                 continue
             rec = (statuses or {}).get(broker_id) or {}
             already_terminal = str(rec.get("status") or "").lower() in terminal
@@ -608,6 +614,78 @@ class LiveBrokerPoller:
         if changed:
             self._stats["pending_terminalized"] += changed
         return changed
+
+    def _self_heal_by_correlation(self, row, terminal) -> bool:
+        """F2 — resolve an ENTRY_SENT row that has no ``broker_order_id``.
+
+        Such a row exists only when both the placement POST and its correlation
+        lookup failed, i.e. the broker outcome was genuinely UNKNOWN. The
+        correlation id is the only handle we have.
+
+        A *failed* lookup is NOT a rejection: the row is left ENTRY_SENT so the
+        next cycle tries again, because the order may be live at the exchange.
+        Only an authoritative "no such order" terminalizes the row.
+        """
+        persistence = getattr(self.env, "persistence", None)
+        broker = getattr(self.env, "broker", None)
+        if persistence is None or broker is None:
+            return False
+        resolver = getattr(broker, "order_by_correlation_id", None)
+        if not callable(resolver):
+            return False
+        corr = row.get("correlation_id") or ""
+        if not corr:
+            return False
+        try:
+            rec = resolver(corr) or {}
+        except Exception as e:
+            self._errors.setdefault("pending_terminalize", 0)
+            self._errors["pending_terminalize"] += 1
+            log.error("[LivePoller:%s] correlation resolve failed %s: %s",
+                      self.env.name, corr, e)
+            return False
+        status = str(rec.get("status") or "").lower()
+        if status == "unresolved":
+            # Broker did not answer. Keep the row pending; never assume flat.
+            log.warning("[LivePoller:%s] pending order %s still UNRESOLVED at "
+                        "broker (correlation=%s)", self.env.name,
+                        row.get("pending_order_id"), corr)
+            return False
+        broker_id = rec.get("broker_order_id")
+        if broker_id:
+            # The order DID reach the exchange and we only just learned its id.
+            # Link it (save_pending_order upserts and keeps the existing status)
+            # so the normal by-id self-heal and fill reconciliation can take over.
+            pend_id = row.get("pending_order_id") or row.get("signal_id")
+            try:
+                update = dict(row)
+                update["pending_order_id"] = pend_id
+                update["broker_order_id"] = str(broker_id)
+                update["correlation_id"] = corr
+                persistence.save_pending_order(update)
+            except Exception as e:
+                log.error("[LivePoller:%s] linking broker id for %s failed: %s",
+                          self.env.name, row.get("pending_order_id"), e)
+                return False
+            log.warning("[LivePoller:%s] recovered broker order %s for pending "
+                        "%s via correlation %s", self.env.name, broker_id,
+                        row.get("pending_order_id"), corr)
+            return False
+        if status not in terminal and status not in ("not_found",):
+            return False
+        try:
+            if persistence.terminalize_pending_order(
+                    row.get("signal_id") or row.get("pending_order_id"),
+                    reason=f"broker_no_such_order: correlation={corr}"):
+                self._stats["pending_terminalized"] = \
+                    self._stats.get("pending_terminalized", 0) + 1
+                return True
+        except Exception as e:
+            self._errors.setdefault("pending_terminalize", 0)
+            self._errors["pending_terminalize"] += 1
+            log.error("[LivePoller:%s] correlation terminalize failed %s: %s",
+                      self.env.name, row.get("pending_order_id"), e)
+        return False
 
     def _persist_order_state(self, order) -> None:
         """Persist an order's current state to the DB without a fill (covers

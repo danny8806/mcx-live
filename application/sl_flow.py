@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from execution.live.sl_monitor import (
@@ -84,6 +85,12 @@ class SLFlowMixin:
                 "source": source,
                 "execution_mode": getattr(env, "mode", None),
             }, env_name=getattr(env, "name", None))
+            # A reversal parked in AWAITING_LOCAL_SL converges now that the
+            # stop genuinely exists.
+            try:
+                self._close_reversal_sl_gap(env, position)
+            except Exception as e:
+                log.warning("[Engine] reversal gap close skipped: %s", e)
         return state.value
 
     # ── firing ───────────────────────────────────────────────────────────
@@ -399,6 +406,68 @@ class SLFlowMixin:
                     fired += 1
         return fired
 
+    # ── reversal gap closure ───────────────────────────────────────────
+
+    def _close_reversal_sl_gap(self, env, position) -> None:
+        """Resolve a reversal left in ``AWAITING_LOCAL_SL`` once its stop is armed.
+
+        A reversal's new entry can fill before the local stop is armed (stop not
+        yet recovered, position missing it at fill time). The record is then
+        parked in ``AWAITING_LOCAL_SL`` — and nothing else ever reads that
+        status, so the reversal stays unresolved forever and the audit trail can
+        no longer tell a protected reversed-into position from an unprotected
+        one.
+
+        Called on every successful arm so the record converges as soon as the
+        stop actually exists. Purely a status/diagnostic write: it never places
+        an order and never touches the monitor.
+        """
+        if position is None:
+            return
+        persistence = getattr(env, "persistence", None)
+        if persistence is None:
+            return
+        getter = getattr(persistence, "get_reversals", None)
+        updater = getattr(persistence, "update_reversal", None)
+        if not callable(getter) or not callable(updater):
+            return
+        pid = str(getattr(position, "position_id", "") or "")
+        if not pid:
+            return
+        try:
+            records = getter() or []
+        except Exception as e:
+            log.debug("[SL] reversal gap lookup failed: %s", e)
+            return
+        for rev in records:
+            if str(rev.get("status") or "").upper() != "AWAITING_LOCAL_SL":
+                continue
+            # Only the reversal whose NEW position this is may be closed here.
+            if str(rev.get("new_position_id") or "") != pid:
+                continue
+            stop_price = getattr(position, "stop_price", None)
+            try:
+                updater(rev.get("reversal_id"), {
+                    "new_sl_state": SLState.ARMED.value,
+                    "status": "COMPLETE",
+                    "sl_gap_closed_at": datetime.now(
+                        timezone.utc).isoformat(),
+                })
+            except Exception as e:
+                log.warning("[Engine] reversal gap close failed for %s: %s",
+                            rev.get("reversal_id"), e)
+                continue
+            self.publish_event("reversal_sl_gap_closed", {
+                "reversal_id": rev.get("reversal_id"),
+                "position_id": pid,
+                "strategy_id": getattr(position, "strategy_id", None),
+                "instrument": getattr(position, "instrument", None),
+                "stop_price": float(stop_price) if stop_price else None,
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+            log.info("[SL] reversal %s SL gap closed: %s is now ARMED",
+                     rev.get("reversal_id"), pid)
+
     # ── startup / crash recovery ────────────────────────────────────────
 
     def sync_sl_from_broker(self, env_name: Optional[str] = None) -> dict:
@@ -520,6 +589,10 @@ class SLFlowMixin:
             self.publish_event("sl_recovered_from_broker", dict(
                 entry, execution_mode=getattr(env, "mode", None)),
                 env_name=getattr(env, "name", None))
+            try:
+                self._close_reversal_sl_gap(env, pos)
+            except Exception as e:
+                log.warning("[Engine] reversal gap close skipped: %s", e)
         for entry in summary.get("unavailable", []):
             pos = by_pid.get(str(entry.get("position_id")))
             if pos is None:
@@ -539,6 +612,40 @@ class SLFlowMixin:
             self.publish_event("sl_stale_local_position_closed", dict(
                 entry, execution_mode=getattr(env, "mode", None)),
                 env_name=getattr(env, "name", None))
+
+        # A broker position the local book cannot attribute to any strategy.
+        # It is NEVER auto-opened and NEVER auto-flattened: doing either would
+        # mean trading on a guess. But it IS real exposure we hold no stop for
+        # and can never exit, so it must be surfaced loudly and must keep the
+        # entry gate shut rather than let new risk stack on top of it.
+        orphans = summary.get("broker_only") or []
+        if orphans:
+            for entry in orphans:
+                log.error("[SL] ORPHAN broker position: %s %s held at broker "
+                          "with no local position — UNPROTECTED, unattributable, "
+                          "entries stay blocked", entry.get("instrument"),
+                          entry.get("quantity"))
+                try:
+                    self.publish_event("broker_orphan_position", {
+                        "instrument": entry.get("instrument"),
+                        "quantity": entry.get("quantity"),
+                        "reason": "broker_position_without_local_book",
+                        "execution_mode": getattr(env, "mode", None),
+                    }, env_name=getattr(env, "name", None))
+                except Exception as e:
+                    log.error("[SL] orphan event publish failed: %s", e)
+            try:
+                self.telegram.on_risk_alert({
+                    "severity": "CRITICAL",
+                    "type": "broker_orphan_position",
+                    "message": (f"Broker holds {len(orphans)} position(s) with no "
+                                f"local record: "
+                                f"{[o.get('instrument') for o in orphans]}"),
+                })
+            except Exception as e:
+                log.warning("[SL] orphan risk alert failed: %s", e)
+        summary["orphan_exposure"] = bool(orphans)
+        summary["orphans"] = orphans
 
         log.info("[SL] broker-authoritative SL sync: armed=%s unavailable=%s "
                  "dropped_local=%s broker_only=%s",

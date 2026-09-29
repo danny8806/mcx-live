@@ -177,10 +177,28 @@ class EnvironmentFactoryMixin:
             first_inst = list(instruments.values())[0] if instruments else {}
             session_open = first_inst.get("session_open", "09:00")
             session_close = first_inst.get("session_close", "23:30")
+
+            # A completed REST candle is the stop's safety net. Dhan's MCX tick
+            # feed is allowed to go silent while REST keeps flowing, and the
+            # local stop is invisible in the order book — so without this a dead
+            # tick feed silently strips every position of its protection. This
+            # runs BEFORE the candle reaches any strategy, so a stop breach
+            # always wins over a signal from the same candle.
+            def on_candle_closed(bar, _router=env.candle_router):
+                try:
+                    self._evaluate_positions_from_candle(None, bar)
+                except Exception as e:
+                    log.error("[Engine] candle SL evaluation failed: %s", e)
+                try:
+                    self._report_sl_protection_gaps()
+                except Exception as e:
+                    log.error("[Engine] SL protection gap report failed: %s", e)
+                _router.on_candle_closed(bar)
+
             env.candle_fetcher = CandleFetcher(
                 data_adapter=env.data_adapter,
                 instruments=instruments,
-                on_candle_closed=env.candle_router.on_candle_closed,
+                on_candle_closed=on_candle_closed,
                 session_open=session_open,
                 session_close=session_close,
                 market_status=env.market_status,
@@ -224,6 +242,21 @@ class EnvironmentFactoryMixin:
                 last_tick_time=(ws._last_tick_time if ws else 0.0),
             )
 
+            # Per-instrument tick freshness. The local stop-loss is evaluated ONLY
+            # on a live tick and Dhan places no broker-side protective order, so a
+            # silent feed leaves every open position UNPROTECTED. Record freshness
+            # here, then refuse to let an untrusted price drive the stop.
+            health = getattr(self, "market_data_health", None)
+            if health is not None:
+                if valid_ltp and (ws is None or ws_connected):
+                    health.record_tick(instrument, timestamp)
+                elif ws is not None and not ws_connected:
+                    health.mark_unhealthy(instrument)
+                if not health.is_healthy(instrument):
+                    valid_ltp = False
+            if ws is not None and not ws_connected:
+                valid_ltp = False
+
             with self._lock:
                 if valid_ltp:
                     try:
@@ -233,6 +266,40 @@ class EnvironmentFactoryMixin:
                                 pos.update_mark(ltp)
                     except Exception:
                         pass
+
+                    # Resting LIMIT entries need continuous LTP to evaluate
+                    # skip/cancel/fallback; without it the watcher's
+                    # trigger_crossed latch can never set.
+                    watcher = getattr(env, "order_watcher", None)
+                    if watcher is not None:
+                        try:
+                            watcher.feed_market(instrument, ltp)
+                        except Exception as e:
+                            log.warning("[SL] order watcher feed_market failed for %s: %s",
+                                        instrument, e)
+
+                # ── Position-owned SL evaluation ──────────────────────────
+                # The ONLY stop-loss path. Each position is evaluated against
+                # ITS OWN stop by THIS env's monitor; no strategy and no other
+                # strategy's position can influence the decision. The stop is
+                # local — Dhan carries no protective order for it.
+                try:
+                    positions = env.position_manager.get_positions_by_instrument(
+                        instrument)
+                except Exception:
+                    positions = []
+                for pos in positions:
+                    if not getattr(pos, "is_open", False):
+                        continue
+                    if not valid_ltp:
+                        continue
+                    try:
+                        self._evaluate_position_sl(
+                            env, pos, ltp, env_name=getattr(env, "name", None))
+                    except Exception as e:
+                        log.error("[Engine] SL evaluation failed for %s/%s: %s",
+                                  getattr(pos, "strategy_id", "?"),
+                                  getattr(pos, "position_id", "?"), e)
 
                 event = TickEvent(
                     instrument=instrument, ltp=float(ltp) if valid_ltp else 0.0,

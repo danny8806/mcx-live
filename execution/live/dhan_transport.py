@@ -37,6 +37,7 @@ from typing import Optional
 from execution.live.broker_client import (
     BrokerGateClosed,
     LiveBrokerClient,
+    OrderPlacementUnresolved,
     PreTradeGateBlocked,
 )
 
@@ -356,6 +357,7 @@ class DhanRestTransport(LiveBrokerClient):
           so the engine marks the signal REJECTED with the explicit origin.
         """
         with self._lock:
+            lookup_ok = True
             try:
                 body = self._http._get(f"/orders/external/{correlation_id}") or {}
             except Exception as exc:
@@ -365,6 +367,8 @@ class DhanRestTransport(LiveBrokerClient):
                             http_status=getattr(exc, "status", None) or 400,
                             correlation_id=correlation_id)
                 body = {}
+                # The lookup ITSELF failed. This is not proof of non-execution.
+                lookup_ok = False
             else:
                 self._audit("ORDER_BY_CORRELATION",
                             f"/orders/external/{correlation_id}", "GET",
@@ -401,11 +405,72 @@ class DhanRestTransport(LiveBrokerClient):
                 self._orders[oid] = rec
                 return dict(rec, status="submitted",
                             note="resolved_via_correlation_lookup")
+        if not lookup_ok:
+            # A failed lookup is UNRESOLVED, never "rejected". Raising the
+            # generic error here used to let the engine mark the order
+            # REJECTED while the exchange may hold a live order, leaving the
+            # local book flat against real broker exposure.
+            raise OrderPlacementUnresolved(
+                f"place_order outcome UNRESOLVED and correlation lookup FAILED "
+                f"({correlation_id}); the order may have reached the exchange: "
+                f"{origin}")
         raise RuntimeError(
             f"place_order broker outcome UNKNOWN and correlation lookup found "
             f"no order ({correlation_id}): {origin}")
 
     # ── Phase 5 wire primitives ─────────────────────────────────────────
+
+    def order_by_correlation_id(self, correlation_id: str) -> dict:
+        """Resolve a placement by its correlation id (``GET /orders/external/{id}``).
+
+        The recovery path for an order whose ``POST /orders`` response was lost
+        AND whose own correlation lookup failed at placement time: such an order
+        has no ``broker_order_id``, so it can never be self-healed by
+        :meth:`order_status`. This is the only way to learn whether it reached
+        the exchange.
+
+        Returns a status dict, ``{}`` when the broker authoritatively has no such
+        order, or ``{"status": "unresolved"}`` when the lookup itself failed.
+        The distinction is the whole point: "no order" is proof of
+        non-execution, while "lookup failed" is not.
+        """
+        cid = str(correlation_id or "").strip()
+        if not cid:
+            return {"status": "unresolved", "reason": "missing_correlation_id"}
+        try:
+            body = self._http._get(f"/orders/external/{cid}") or {}
+        except Exception as exc:
+            self._audit("ORDER_BY_CORRELATION", f"/orders/external/{cid}",
+                        "GET", error=exc,
+                        http_status=getattr(exc, "status", None) or 400,
+                        correlation_id=cid)
+            return {"status": "unresolved",
+                    "reason": f"correlation_lookup_failed: {exc}",
+                    "correlation_id": cid}
+        self._audit("ORDER_BY_CORRELATION", f"/orders/external/{cid}", "GET",
+                    response=body, http_status=200, correlation_id=cid)
+        oid = body.get("orderId") or body.get("order_id")
+        if not oid:
+            return {"status": "not_found", "correlation_id": cid}
+        oid = str(oid)
+        with self._lock:
+            rec = self._orders.get(oid)
+        if rec is not None:
+            return dict(rec)
+        raw_status = (body.get("orderStatus") or body.get("order_status")
+                      or "PENDING")
+        return {
+            "broker_order_id": oid,
+            "status": _normalize_status(raw_status),
+            "raw_status": str(raw_status).upper(),
+            "reason": (body.get("omsErrorDescription")
+                       or body.get("errorMessage") or None),
+            "correlation_id": cid,
+            "quantity": body.get("quantity"),
+            "tradedQuantity": body.get("tradedQuantity"),
+            "averageTradedPrice": body.get("averageTradedPrice"),
+            "timestamp": self._clock(),
+        }
 
     def _http_delete(self, path: str) -> dict:
         deleter = getattr(self._http, "_delete", None)
