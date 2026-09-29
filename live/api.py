@@ -429,6 +429,10 @@ def create_live_app(live_engine=None) -> FastAPI:
                         "test_cycle": True,
                     },
                 )
+                broker_flat, flat_detail = _engine._broker_flat_for_entry(env, signal)
+                if not broker_flat:
+                    raise HTTPException(status_code=409,
+                                        detail={"broker_flat_required": flat_detail})
                 strategy._last_fired_trigger_signal_id = signal.signal_id
                 strategy._fired_trigger_signal_ids[signal.signal_id] = None
                 _live_test_entry_signal_id = signal.signal_id
@@ -447,6 +451,94 @@ def create_live_app(live_engine=None) -> FastAPI:
                     "stop_price": signal.stop_price,
                     "order": order.to_dict() if order and hasattr(order, "to_dict") else str(order),
                 }
+
+        if action == "opposite_signal":
+            # Exercise the strategy's normal reversal construction.  The
+            # reversal exit is armed first and its opposite entry remains
+            # waiting for a confirmed flat broker book.
+            with _live_test_cycle_lock:
+                if not _live_test_entry_signal_id:
+                    raise HTTPException(status_code=409, detail="test entry has not been started")
+                positions = [p for p in env.position_manager.get_positions_by_strategy(strategy_id)
+                             if p.instrument == instrument and p.is_open]
+                if len(positions) != 1:
+                    raise HTTPException(status_code=409, detail="exactly one open canary position required")
+                position = positions[0]
+                if int(position.quantity) != 1 or int(test_cfg["quantity"]) != 1:
+                    raise HTTPException(status_code=409, detail="reversal test is restricted to quantity one")
+                if strategy.just_entered:
+                    raise HTTPException(status_code=409, detail="wait for the next completed candle after entry")
+                health = getattr(_engine, "market_data_health", None)
+                if health is None or not health.is_healthy(instrument):
+                    raise HTTPException(status_code=409, detail="test instrument feed is not fresh")
+                execution = env.execution_engine
+                with execution._price_lock:
+                    observed = float(execution._current_prices.get(instrument, 0.0) or 0.0)
+                tick = float(_engine.config.instrument(instrument).get("tick_size", 1.0) or 1.0)
+                side = "SHORT" if position.is_long else "LONG"
+                signal = strategy._create_reversal_signal(
+                    side, observed, observed + tick, max(tick, observed - tick),
+                    time.time(), prev_high=observed + tick,
+                    prev_low=max(tick, observed - tick), open_=observed)
+                _engine._bind_signal_position(signal, strategy, "live")
+                _engine._process_signal(signal, "live")
+                pending = strategy.pending_exit_trigger
+                return {
+                    "accepted_by_app": pending is not None,
+                    "reversal_exit_signal_id": signal.signal_id,
+                    "reversal_side": side,
+                    "quantity": 1,
+                    "exit_trigger": pending.trigger_price if pending else None,
+                    "opposite_entry_trigger": (strategy.pending_entry.trigger_price
+                                                if strategy.pending_entry else None),
+                    "position_id": position.position_id,
+                    "note": "strategy reversal armed; no opposite entry is sent before broker-confirmed flat",
+                }
+
+        if action == "fire_reversal_exit":
+            with _live_test_cycle_lock:
+                if not _live_test_entry_signal_id:
+                    raise HTTPException(status_code=409, detail="test entry has not been started")
+                pending = strategy.pending_exit_trigger
+                if pending is None or pending.status != "pending":
+                    raise HTTPException(status_code=409, detail="armed reversal exit required")
+                if strategy.just_entered:
+                    raise HTTPException(status_code=409, detail="wait for the next completed candle after entry")
+                tick = float(_engine.config.instrument(instrument).get("tick_size", 1.0) or 1.0)
+                forced_ltp = pending.trigger_price - tick if pending.side == "SHORT" else pending.trigger_price + tick
+                signal = strategy.on_tick(forced_ltp, time.time())
+                if signal is None:
+                    raise HTTPException(status_code=409, detail="strategy reversal trigger did not fire")
+                _engine._bind_signal_position(signal, strategy, "live")
+                _engine._process_signal(signal, "live")
+                return {"fired": True, "signal_id": signal.signal_id,
+                        "forced_ltp": forced_ltp, "trigger_price": pending.trigger_price,
+                        "note": "trigger passed through StrategyInstance.on_tick and standard exit lifecycle"}
+
+        if action == "fire_reversal_entry":
+            with _live_test_cycle_lock:
+                if not _live_test_entry_signal_id:
+                    raise HTTPException(status_code=409, detail="test entry has not been started")
+                if any(p.is_open for p in env.position_manager.get_positions_by_instrument(instrument)):
+                    raise HTTPException(status_code=409, detail="old position is not locally flat")
+                pen = strategy.pending_entry
+                if pen is None or pen.status != "pending" or not (pen.signal.metadata or {}).get("is_reversal_entry"):
+                    raise HTTPException(status_code=409, detail="armed opposite entry required")
+                flat, detail = _engine._broker_flat_for_entry(env, pen.signal)
+                if not flat:
+                    raise HTTPException(status_code=409, detail={"broker_flat_required": detail})
+                if strategy.just_entered:
+                    raise HTTPException(status_code=409, detail="wait for the next completed candle before reversal entry")
+                tick = float(_engine.config.instrument(instrument).get("tick_size", 1.0) or 1.0)
+                forced_ltp = pen.trigger_price + tick if pen.side == "LONG" else max(tick, pen.trigger_price - tick)
+                signal = strategy.on_tick(forced_ltp, time.time())
+                if signal is None:
+                    raise HTTPException(status_code=409, detail="strategy opposite-entry trigger did not fire")
+                _engine._process_signal(signal, "live")
+                return {"fired": True, "signal_id": signal.signal_id,
+                        "side": pen.side, "quantity": 1,
+                        "forced_ltp": forced_ltp, "trigger_price": pen.trigger_price,
+                        "note": "broker-flat checked; entry passed through standard live signal flow"}
 
         if action == "status":
             with _live_test_cycle_lock:
@@ -514,6 +606,26 @@ def create_live_app(live_engine=None) -> FastAPI:
             if str(getattr(position, "sl_state", "")).upper() == "EXITING":
                 _engine._release_sl_after_failed_exit(
                     env, position, reason="test_recovery_unsubmitted_exit")
+            if not recovery_boot:
+                # Test the ordinary position-owned local SL signal and normal
+                # exit order/fill lifecycle, with a single adverse test tick.
+                if int(position.quantity) != 1 or int(test_cfg["quantity"]) != 1:
+                    raise HTTPException(status_code=409, detail="stop test is restricted to quantity one")
+                if position.stop_price is None or float(position.stop_price) <= 0:
+                    raise HTTPException(status_code=409, detail="position has no armed stop price")
+                adverse_ltp = (float(position.stop_price) - 1.0 if position.is_long
+                               else float(position.stop_price) + 1.0)
+                sl_signal = _engine._evaluate_position_sl(
+                    env, position, adverse_ltp, env_name="live")
+                return {
+                    "sl_triggered": sl_signal is not None,
+                    "signal_id": getattr(sl_signal, "signal_id", None),
+                    "forced_ltp": adverse_ltp,
+                    "stop_price": position.stop_price,
+                    "position_closed": not position.is_open,
+                    "note": "normal position-owned SL monitor and direct exit lifecycle",
+                }
+
             result = _engine.emergency_exit_all("live", instrument=instrument)
             # In recovery-only mode the standard poller is intentionally not
             # running.  Poll just the newly submitted canary exit through the
@@ -577,7 +689,7 @@ def create_live_app(live_engine=None) -> FastAPI:
                 "note": "lifecycle-owned emergency flatten requested for the single canary position",
             }
 
-        raise HTTPException(status_code=400, detail="action must be entry, status, or fire_test_stop")
+        raise HTTPException(status_code=400, detail="unsupported canary action")
 
     for r in ROUTE_MODULES:
         app.include_router(r.router)
