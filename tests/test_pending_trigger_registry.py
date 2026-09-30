@@ -191,6 +191,128 @@ def test_startup_restore_does_not_resurrect_terminal_snapshot_trigger():
     assert env.pending_triggers.entry_for("gold_02") is None
 
 
+@pytest.mark.parametrize("durable_status", [
+    None, "pending", "entry_sent", "expired", "cancelled_by_reversal",
+    "resolved", "rejected", "filled",
+])
+def test_startup_discards_snapshot_entry_without_armed_durable_row(durable_status):
+    signal_id = "snapshot-only"
+    signal = Signal(
+        signal_type=SignalType.LONG, instrument="GOLDM", strategy_id="gold_02",
+        timestamp=1.0, trigger_price=100.0, stop_price=90.0, quantity=1,
+        metadata={"pending": True, "trigger_state": "ARMED"})
+    signal.signal_id = signal_id
+    strategy = create_gold_15m(strategy_id="gold_02", instrument="GOLDM", quantity=1)
+    strategy.pending_entry = PendingEntry(
+        signal=signal, trigger_price=100.0, side="LONG", status="pending")
+
+    class _Persistence:
+        def get_pending_orders(self, **kwargs):
+            return ([{"pending_order_id": signal_id, "signal_id": signal_id,
+                      "strategy_id": "gold_02", "status": durable_status}]
+                    if durable_status == kwargs.get("status") else [])
+
+        def get_pending_order(self, requested_id, **_kwargs):
+            return ({"pending_order_id": requested_id, "signal_id": requested_id,
+                     "strategy_id": "gold_02", "status": durable_status}
+                    if durable_status else None)
+
+    env = Environment(name="live", mode="LIVE", is_live=True,
+                      strategies={"gold_02": strategy}, persistence=_Persistence())
+
+    assert PersistenceFlowMixin()._restore_live_pending_triggers(env) == 0
+    assert strategy.pending_entry is None
+    assert env.pending_triggers.entry_for("gold_02") is None
+
+
+def test_missing_reversal_entry_row_clears_its_paired_exit_but_keeps_position():
+    entry_id, exit_id = "orphan-reversal-entry", "orphan-reversal-exit"
+    entry = Signal(
+        signal_type=SignalType.SHORT, instrument="GOLDM", strategy_id="gold_02",
+        timestamp=1.0, trigger_price=95.0, stop_price=110.0, quantity=1,
+        metadata={"pending": True, "is_reversal_entry": True,
+                  "reversal_parent_signal_id": exit_id})
+    entry.signal_id = entry_id
+    exit_signal = Signal(
+        signal_type=SignalType.SHORT, instrument="GOLDM", strategy_id="gold_02",
+        timestamp=1.0, trigger_price=98.0, stop_price=99.0, quantity=1,
+        metadata={"pending": True, "exit": True})
+    exit_signal.signal_id = exit_id
+    strategy = create_gold_15m(strategy_id="gold_02", instrument="GOLDM", quantity=1)
+    strategy.position_side = "LONG"
+    strategy.pending_entry = PendingEntry(
+        signal=entry, trigger_price=95.0, side="SHORT", status="waiting_for_flat")
+    strategy.pending_exit_trigger = PendingEntry(
+        signal=exit_signal, trigger_price=98.0, side="SHORT", status="pending")
+
+    class _Persistence:
+        def get_pending_orders(self, **_kwargs):
+            return []
+
+        def get_pending_order(self, _requested_id, **_kwargs):
+            return None
+
+    env = Environment(name="live", mode="LIVE", is_live=True,
+                      strategies={"gold_02": strategy}, persistence=_Persistence())
+    env.pending_triggers.sync_strategy(strategy)
+
+    assert PersistenceFlowMixin()._restore_live_pending_triggers(env) == 0
+    assert strategy.pending_entry is None
+    assert strategy.pending_exit_trigger is None
+    assert strategy.position_side == "LONG"
+    assert strategy.state.value == "long_position"
+    assert env.pending_triggers.entry_for("gold_02") is None
+    assert env.pending_triggers.exit_for("gold_02") is None
+
+
+def test_startup_db_read_failure_discards_snapshot_only_entry():
+    signal = Signal(
+        signal_type=SignalType.LONG, instrument="GOLDM", strategy_id="gold_02",
+        timestamp=1.0, trigger_price=100.0, stop_price=90.0, quantity=1)
+    strategy = create_gold_15m(strategy_id="gold_02", instrument="GOLDM", quantity=1)
+    strategy.pending_entry = PendingEntry(
+        signal=signal, trigger_price=100.0, side="LONG", status="pending")
+
+    class _Persistence:
+        def get_pending_orders(self, **_kwargs):
+            raise OSError("SQLite unavailable")
+
+    env = Environment(name="live", mode="LIVE", is_live=True,
+                      strategies={"gold_02": strategy}, persistence=_Persistence())
+
+    assert PersistenceFlowMixin()._restore_live_pending_triggers(env) == 0
+    assert strategy.pending_entry is None
+    assert env.pending_triggers.entry_for("gold_02") is None
+
+
+def test_live_arm_write_failure_disarms_ram_and_registry_trigger():
+    signal = Signal(
+        signal_type=SignalType.LONG, instrument="GOLDM", strategy_id="gold_02",
+        timestamp=1.0, trigger_price=100.0, stop_price=90.0, quantity=1,
+        metadata={"pending": True, "trigger_state": "ARMED"})
+    strategy = create_gold_15m(strategy_id="gold_02", instrument="GOLDM", quantity=1)
+    strategy.pending_entry = PendingEntry(
+        signal=signal, trigger_price=100.0, side="LONG", status="pending")
+
+    class _Persistence:
+        def get_pending_orders(self, **_kwargs):
+            return []
+
+        def save_pending_order(self, _row):
+            raise OSError("disk full")
+
+    env = Environment(name="live", mode="LIVE", is_live=True,
+                      strategies={"gold_02": strategy}, persistence=_Persistence())
+    env.pending_triggers.sync_strategy(strategy)
+
+    with pytest.raises(OSError, match="disk full"):
+        PersistenceFlowMixin()._arm_live_pending(signal, env)
+
+    assert strategy.pending_entry is None
+    assert env.pending_triggers.entry_for("gold_02") is None
+    assert env.pending_triggers.live_row(signal.signal_id) is None
+
+
 def test_live_arming_rebuilds_missing_memory_trigger_and_registry():
     signal = Signal(
         signal_type=SignalType.LONG, instrument="GOLDM", strategy_id="gold_02",

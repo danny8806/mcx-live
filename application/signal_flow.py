@@ -460,7 +460,21 @@ class SignalFlowMixin:
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
 
-        self._persist_signal(signal, "exit" if is_exit else "entry", env_name)
+        try:
+            self._persist_signal(signal, "exit" if is_exit else "entry", env_name)
+        except Exception as exc:  # noqa: BLE001
+            if is_pending and env.mode == "LIVE":
+                self._discard_unjournaled_live_pending(
+                    strategy, env, f"signal persistence failed: {exc}")
+                self.publish_event("pending_order_blocked", {
+                    "signal_id": signal.signal_id,
+                    "reason": "live_signal_persistence_failed",
+                    "execution_mode": env.mode,
+                }, env_name=env.name)
+                log.exception("[Engine] refusing RAM-only LIVE trigger %s",
+                              signal.signal_id)
+                return
+            raise
         self.publish_event("signal_created", {
             "signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
             "instrument": signal.instrument, "signal_type": signal.signal_type.name,
@@ -477,12 +491,23 @@ class SignalFlowMixin:
             # strategy itself is never modified (read-only for 9.6).
             if env.mode == "LIVE":
                 reversal_entry = metadata.get("reversal_entry_signal")
-                if (metadata.get("pending_trigger_kind") == "REVERSAL_EXIT"
-                        and reversal_entry is not None):
-                    self._persist_signal(reversal_entry, "entry", env.name)
-                    self._arm_live_pending(reversal_entry, env)
-                elif not is_exit:
-                    self._arm_live_pending(signal, env)
+                try:
+                    if (metadata.get("pending_trigger_kind") == "REVERSAL_EXIT"
+                            and reversal_entry is not None):
+                        self._persist_signal(reversal_entry, "entry", env.name)
+                        self._arm_live_pending(reversal_entry, env)
+                    elif not is_exit:
+                        self._arm_live_pending(signal, env)
+                except Exception as exc:  # noqa: BLE001
+                    self._discard_unjournaled_live_pending(
+                        strategy, env, f"pending trigger persistence failed: {exc}")
+                    self.publish_event("pending_order_blocked", {
+                        "signal_id": getattr(reversal_entry, "signal_id", None)
+                        if reversal_entry is not None else signal.signal_id,
+                        "reason": "live_pending_persistence_failed",
+                        "execution_mode": env.mode,
+                    }, env_name=env.name)
+                    log.exception("[Engine] refusing LIVE trigger without durable row")
             return
 
         # Exits reduce risk and remain available during a safety halt. Entries

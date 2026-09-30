@@ -121,7 +121,69 @@ class PersistenceFlowMixin:
             return registry.live_row(signal.signal_id)
         rows = env.persistence.get_pending_orders(execution_mode="LIVE")
         return next((r for r in rows if r.get("pending_order_id") == signal.signal_id), None)
+    def _discard_unjournaled_live_pending(self, strategy, env, reason: str,
+                                          signal_id: str | None = None) -> None:
+        """Fail closed when a pending trigger cannot be confirmed in SQLite.
+
+        A JSON strategy snapshot is useful for restoring indicators/positions,
+        but it is not authoritative for an executable LIVE trigger.  Keep the
+        local trigger and O(1) index from firing if its durable row is absent,
+        terminal, or could not be read/written.
+        """
+        pending = getattr(strategy, "pending_entry", None)
+        pending_signal = getattr(pending, "signal", None)
+        pending_id = getattr(pending_signal, "signal_id", None)
+        entry_matches = (pending is not None and (signal_id is None
+                          or str(pending_id) == str(signal_id)))
+        exit_pending = getattr(strategy, "pending_exit_trigger", None)
+        exit_signal = getattr(exit_pending, "signal", None)
+        exit_id = getattr(exit_signal, "signal_id", None)
+        exit_matches = (exit_pending is not None and signal_id is not None
+                        and str(exit_id) == str(signal_id))
+        if not entry_matches and not exit_matches:
+            return
+        metadata = getattr(pending_signal, "metadata", None) or {}
+        paired_exit_id = metadata.get("reversal_parent_signal_id")
+        if (entry_matches and paired_exit_id and exit_pending is not None
+                and str(getattr(exit_signal, "signal_id", "")) == str(paired_exit_id)):
+            strategy._cancel_trigger(exit_pending)
+            strategy.pending_exit_trigger = None
+        elif exit_matches:
+            strategy._cancel_trigger(exit_pending)
+            strategy.pending_exit_trigger = None
+        if entry_matches:
+            strategy._cancel_trigger(pending)
+            strategy.pending_entry = None
+        if getattr(strategy, "position_side", None) == "LONG":
+            strategy.state = StrategyState.LONG_POSITION
+        elif getattr(strategy, "position_side", None) == "SHORT":
+            strategy.state = StrategyState.SHORT_POSITION
+        else:
+            strategy.state = StrategyState.FLAT
+        registry = getattr(env, "pending_triggers", None)
+        if registry is not None:
+            if entry_matches and pending_id:
+                registry.remove_signal(str(pending_id))
+            if exit_matches and exit_id:
+                registry.remove_signal(str(exit_id))
+            registry.sync_strategy(strategy)
+        discarded_id = pending_id if entry_matches else exit_id
+        log.error("[Engine] discarded unjournaled LIVE trigger %s for %s: %s",
+                  discarded_id, getattr(strategy, "strategy_id", "?"), reason)
+
     def _arm_live_pending(self, signal, env) -> None:
+        """Persist and index a LIVE trigger, disarming RAM state on DB failure."""
+        try:
+            self._arm_live_pending_durable(signal, env)
+        except Exception as exc:  # noqa: BLE001
+            strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
+            if strategy is not None:
+                self._discard_unjournaled_live_pending(
+                    strategy, env, f"database arm failed: {exc}",
+                    signal_id=signal.signal_id)
+            raise
+
+    def _arm_live_pending_durable(self, signal, env) -> None:
         """Register a LIVE pending breakout durably: PENDING -> ARMED.
 
         The row is written PENDING first (the moment the strategy armed the
@@ -304,6 +366,12 @@ class PersistenceFlowMixin:
                 rows = persistence.get_pending_orders(execution_mode="LIVE")
         except Exception as exc:
             log.error("[Engine] pending trigger restore failed: %s", exc)
+            # The JSON snapshot is not sufficient authority to execute a LIVE
+            # entry. If SQLite cannot be read at startup, remove snapshot-only
+            # entries before the WebSocket adapter starts.
+            for strategy in (getattr(env, "strategies", {}) or {}).values():
+                self._discard_unjournaled_live_pending(
+                    strategy, env, f"database restore failed: {exc}")
             return 0
         restored = 0
         rows_by_signal = {
@@ -314,7 +382,6 @@ class PersistenceFlowMixin:
         # has since been terminalized in the canonical DB. Do not resurrect it
         # from RAM on restart (for example after an operator expires stale
         # signals before a fresh live session).
-        terminal = {"expired", "cancelled_by_reversal", "resolved"}
         for sid, strategy in (getattr(env, "strategies", {}) or {}).items():
             current = getattr(strategy, "pending_entry", None)
             signal_id = getattr(getattr(current, "signal", None), "signal_id", None)
@@ -327,16 +394,15 @@ class PersistenceFlowMixin:
                 except Exception as exc:
                     log.warning("[Engine] pending state lookup failed for %s: %s",
                                 signal_id, exc)
-            if row and str(row.get("status", "")).lower() in terminal:
-                strategy._cancel_trigger(current)
-                strategy.pending_entry = None
-                if not getattr(strategy, "position_side", None):
-                    strategy.state = StrategyState.FLAT
-                registry.sync_strategy(strategy)
-                log.info("[Engine] discarded terminal startup trigger %s for %s",
-                         signal_id, sid)
-            elif (row and str(row.get("status", "")).lower()
-                  == PendingOrderState.ARMED.value and current is not None
+            status = str((row or {}).get("status", "")).lower()
+            if current is not None and status != PendingOrderState.ARMED.value:
+                self._discard_unjournaled_live_pending(
+                    strategy, env,
+                    f"durable status is {status or 'missing'}, expected armed",
+                    signal_id=str(signal_id) if signal_id else None)
+                log.info("[Engine] discarded non-armed startup trigger %s for %s",
+                         signal_id or "?", sid)
+            elif (status == PendingOrderState.ARMED.value and current is not None
                   and getattr(current.signal, "signal_id", None) == signal_id):
                 current.signal.metadata = restored_trigger_metadata(
                     current.signal.metadata, active=True)
