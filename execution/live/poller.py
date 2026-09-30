@@ -910,25 +910,61 @@ class LiveBrokerPoller:
         self._last_broker_positions = bpos
         report: list[dict] = []
         pm = getattr(self.env, "position_manager", None)
-        for p in bpos:
-            sid = p.get("strategy_id") or ""
-            inst = p.get("instrument") or ""
-            bside = (p.get("side") or "").upper()
-            bqty = int(p.get("quantity") or 0)
-            mem = None
-            if pm is not None:
-                mem = next((
-                    x for x in pm.get_positions_by_strategy(sid)
-                    if getattr(x, "instrument", None) == inst
-                    and getattr(x, "is_open", False)), None)
-            mside = ("LONG" if getattr(mem, "is_long", False) else "SHORT") if mem else None
-            mqty = getattr(mem, "quantity", 0) if mem else 0
-            if (mside, mqty) != (bside, bqty):
-                report.append({
-                    "strategy_id": sid, "instrument": inst,
-                    "broker_side": bside, "broker_qty": bqty,
-                    "memory_side": mside, "memory_qty": mqty,
+        # Dhan positions are instrument-level, but DhanRestTransport expands
+        # each net row to every configured strategy on that instrument. Compare
+        # one broker net to the aggregate local net once; per-strategy
+        # comparison falsely reports every non-owning strategy as MISSING_LOCAL.
+        broker_by_instrument: dict[str, set[tuple[str, int]]] = {}
+        for row in bpos:
+            instrument = str(row.get("instrument") or "")
+            quantity = int(row.get("quantity") or 0)
+            if not instrument or quantity <= 0:
+                continue
+            side = str(row.get("side") or "").upper()
+            signed = quantity if side in ("LONG", "BUY") else -quantity
+            broker_by_instrument.setdefault(instrument, set()).add((side, signed))
+
+        local_by_instrument: dict[str, list[dict]] = {}
+        if pm is not None:
+            try:
+                open_positions = list(pm.open_positions)
+            except Exception:
+                open_positions = []
+            for position in open_positions:
+                if not getattr(position, "is_open", False):
+                    continue
+                instrument = str(getattr(position, "instrument", "") or "")
+                quantity = int(getattr(position, "quantity", 0) or 0)
+                if not instrument or quantity <= 0:
+                    continue
+                signed = quantity if getattr(position, "is_long", False) else -quantity
+                local_by_instrument.setdefault(instrument, []).append({
+                    "strategy_id": getattr(position, "strategy_id", None),
+                    "side": "LONG" if signed > 0 else "SHORT",
+                    "quantity": quantity,
+                    "signed_quantity": signed,
                 })
+
+        for instrument in sorted(set(broker_by_instrument) | set(local_by_instrument)):
+            broker_rows = broker_by_instrument.get(instrument, set())
+            local_rows = local_by_instrument.get(instrument, [])
+            local_net = sum(row["signed_quantity"] for row in local_rows)
+            broker_nets = {signed for _side, signed in broker_rows}
+            conflicting = len(broker_nets) > 1
+            broker_net = next(iter(broker_nets)) if len(broker_nets) == 1 else 0
+            if not conflicting and broker_net == local_net:
+                continue
+            report.append({
+                "strategy_id": (local_rows[0]["strategy_id"]
+                                if len(local_rows) == 1 else None),
+                "instrument": instrument,
+                "reason": "BROKER_ROWS_CONFLICT" if conflicting else "INSTRUMENT_NET_MISMATCH",
+                "broker_side": "LONG" if broker_net > 0 else "SHORT" if broker_net < 0 else None,
+                "broker_qty": abs(broker_net),
+                "memory_side": "LONG" if local_net > 0 else "SHORT" if local_net < 0 else None,
+                "memory_qty": abs(local_net),
+                "local_owners": local_rows,
+            })
         self._last_position_report = report
         return report
 

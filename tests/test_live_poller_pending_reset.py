@@ -19,6 +19,48 @@ def test_default_reconciliation_interval_is_fast_for_broker_flat_release():
     }
 
 
+def test_position_poll_collapses_dhan_instrument_fanout_to_one_net():
+    position = SimpleNamespace(
+        position_id="P1", strategy_id="silver_01", instrument="SILVERM",
+        quantity=1, is_long=True, is_open=True,
+    )
+    broker = SimpleNamespace(positions=lambda: [
+        {"strategy_id": "silver_01", "instrument": "SILVERM",
+         "side": "LONG", "quantity": 1},
+        {"strategy_id": "silver_02", "instrument": "SILVERM",
+         "side": "LONG", "quantity": 1},
+    ])
+    env = SimpleNamespace(name="LIVE", broker=broker,
+                          position_manager=SimpleNamespace(open_positions=[position]))
+    poller = LiveBrokerPoller(env, config={})
+
+    assert poller.poll_positions() == []
+    assert poller.snapshot()["position_mismatches"] == []
+
+
+def test_position_poll_reports_instrument_net_mismatch_once():
+    position = SimpleNamespace(
+        position_id="P1", strategy_id="silver_01", instrument="SILVERM",
+        quantity=1, is_long=True, is_open=True,
+    )
+    broker = SimpleNamespace(positions=lambda: [
+        {"strategy_id": "silver_01", "instrument": "SILVERM",
+         "side": "LONG", "quantity": 2},
+        {"strategy_id": "silver_02", "instrument": "SILVERM",
+         "side": "LONG", "quantity": 2},
+    ])
+    env = SimpleNamespace(name="LIVE", broker=broker,
+                          position_manager=SimpleNamespace(open_positions=[position]))
+    poller = LiveBrokerPoller(env, config={})
+
+    report = poller.poll_positions()
+    assert len(report) == 1
+    assert report[0]["instrument"] == "SILVERM"
+    assert report[0]["broker_qty"] == 2
+    assert report[0]["memory_qty"] == 1
+    assert report[0]["reason"] == "INSTRUMENT_NET_MISMATCH"
+
+
 def test_poller_scheduler_runs_each_live_task_every_half_second(monkeypatch):
     class FakeClock:
         now = 0.0
