@@ -28,6 +28,14 @@ def _strategy_positions_for_risk(signal_type, open_positions) -> int:
     return len(open_held)
 
 
+def _pending_row_has_unresolved_order(row: Optional[dict]) -> bool:
+    """An old trigger or broker submission must not coexist with a replacement."""
+    if not row:
+        return False
+    return str(row.get("status") or "pending").lower() in {
+        "pending", "armed", "entry_sent"}
+
+
 class SignalFlowMixin:
     def _retire_fired_live_pending(self, signal, env, reason: str) -> None:
         """Do not restore an already-fired trigger after a local gate rejects it."""
@@ -112,10 +120,13 @@ class SignalFlowMixin:
         # Normal strategy exits remain enabled during the test.
         config = getattr(self, "config", None)
         test_cfg = (config.get("live_test_order_cycle", {}) or {}) if config else {}
+        cancel_control = bool(metadata.get("cancel_only")) and bool(
+            metadata.get("cancel_inflight") or metadata.get("cancel_pending_only"))
         if (env.is_live and test_cfg.get("enabled")
                 and signal.strategy_id == str(test_cfg.get("strategy_id", ""))
                 and signal.instrument == str(test_cfg.get("instrument", ""))
-                and not is_exit and not bool(metadata.get("test_cycle"))):
+                and not is_exit and not bool(metadata.get("test_cycle"))
+                and not cancel_control):
             self.publish_event("live_test_cycle_signal_blocked", {
                 "signal_id": signal.signal_id,
                 "strategy_id": signal.strategy_id,
@@ -141,6 +152,56 @@ class SignalFlowMixin:
         order_manager = runtime.order_manager
         position_manager = runtime.position_manager
 
+        # A DEMA change can retire a pending reversal entry while its old
+        # position/exit lifecycle must remain untouched. This local-trigger
+        # cancellation is intentionally separate from cancel_inflight, whose
+        # ordinary reset semantics are for flat entry replacement.
+        if bool(metadata.get("cancel_pending_only")):
+            old_pending_id = metadata.get("old_pending_id")
+            terminalized = False
+            cancellation_error = None
+            if (env.mode == "LIVE" and old_pending_id
+                    and env.persistence is not None):
+                try:
+                    terminalized = env.persistence.terminalize_pending_order(
+                        str(old_pending_id),
+                        status="cancelled_by_indicator_change",
+                        reason="hourly_dema_atr_changed",
+                    )
+                except Exception as exc:
+                    cancellation_error = exc
+                    log.error("[Engine] DEMA-change pending cancellation failed "
+                              "for %s: %s", old_pending_id, exc)
+                if not terminalized and cancellation_error is None:
+                    try:
+                        row = env.persistence.get_pending_order(
+                            str(old_pending_id), execution_mode="LIVE")
+                        if _pending_row_has_unresolved_order(row):
+                            cancellation_error = RuntimeError(
+                                "durable trigger row remained active")
+                    except Exception as exc:
+                        cancellation_error = exc
+            registry = getattr(env, "pending_triggers", None)
+            if registry is not None and old_pending_id:
+                registry.remove_signal(str(old_pending_id))
+            if cancellation_error is not None:
+                safe_mode = getattr(env, "safe_mode", None)
+                if safe_mode is not None:
+                    safe_mode.enter_safe_mode(
+                        "pending_trigger_state_mismatch",
+                        f"Could not terminalize stale trigger {old_pending_id}")
+            self.publish_event("pending_trigger_cancelled_by_dema_change", {
+                "old_signal_id": str(old_pending_id or ""),
+                "strategy_id": signal.strategy_id,
+                "instrument": signal.instrument,
+                "trigger_htf_dema_atr": metadata.get("trigger_htf_dema_atr"),
+                "current_htf_dema_atr": metadata.get("current_htf_dema_atr"),
+                "terminalized": bool(terminalized),
+                "error": str(cancellation_error) if cancellation_error else None,
+                "execution_mode": env.mode,
+            }, env_name=env.name)
+            return
+
         # A newer candle can replace an untriggered reversal. The strategy
         # cancels the old trigger in memory and includes its opposite-entry
         # signal id on the new REVERSAL_EXIT intent. Keep the LIVE recovery
@@ -150,10 +211,17 @@ class SignalFlowMixin:
         if (env.mode == "LIVE" and superseded_pending_id
                 and env.persistence is not None):
             try:
+                indicator_changed = (
+                    metadata.get("superseded_pending_termination")
+                    == "indicator_change")
+                superseded_status = (
+                    "cancelled_by_indicator_change" if indicator_changed
+                    else "cancelled_by_reversal")
                 terminalized = env.persistence.terminalize_pending_order(
                     str(superseded_pending_id),
-                    status="cancelled_by_reversal",
-                    reason="reversal_signal_replaced_before_exit_trigger")
+                    status=superseded_status,
+                    reason=("hourly_dema_atr_changed" if indicator_changed
+                            else "reversal_signal_replaced_before_exit_trigger"))
                 registry = getattr(env, "pending_triggers", None)
                 if registry is not None:
                     registry.remove_signal(str(superseded_pending_id))
@@ -163,10 +231,25 @@ class SignalFlowMixin:
                     "strategy_id": signal.strategy_id,
                     "instrument": signal.instrument,
                     "terminalized": bool(terminalized),
-                    "status": "cancelled_by_reversal",
+                    "status": superseded_status,
                     "execution_mode": env.mode,
                 }, env_name=env.name)
                 if not terminalized:
+                    try:
+                        row = env.persistence.get_pending_order(
+                            str(superseded_pending_id), execution_mode="LIVE")
+                    except Exception:
+                        row = None
+                    if indicator_changed and _pending_row_has_unresolved_order(row):
+                        safe_mode = getattr(env, "safe_mode", None)
+                        if safe_mode is not None:
+                            safe_mode.enter_safe_mode(
+                                "pending_trigger_state_mismatch",
+                                f"Could not terminalize stale reversal entry "
+                                f"{superseded_pending_id}")
+                        self._preserve_position_after_exit_block(
+                            signal, env, cancel_reversal=True)
+                        return
                     log.warning(
                         "[Engine] superseded reversal pending %s had no row "
                         "to terminalize before %s",
@@ -187,6 +270,13 @@ class SignalFlowMixin:
                     "error": str(e),
                     "execution_mode": env.mode,
                 }, env_name=env.name)
+                if metadata.get("superseded_pending_termination") == "indicator_change":
+                    safe_mode = getattr(env, "safe_mode", None)
+                    if safe_mode is not None:
+                        safe_mode.enter_safe_mode(
+                            "pending_trigger_state_mismatch",
+                            f"Could not terminalize stale reversal entry "
+                            f"{superseded_pending_id}")
                 # Do not arm or execute the replacement while durable state
                 # still says the old opposite entry is active. Keep the
                 # existing broker position and its stop as the sole owner.
@@ -277,14 +367,38 @@ class SignalFlowMixin:
             if old_pending_id is not None and env.persistence is not None:
                 try:
                     expired = metadata.get("pending_termination") == "expired"
-                    env.persistence.terminalize_pending_order(
+                    indicator_changed = (
+                        metadata.get("pending_termination") == "indicator_change")
+                    terminal_status = (
+                        "expired" if expired else
+                        "cancelled_by_indicator_change" if indicator_changed else
+                        "cancelled_by_reversal")
+                    terminal_reason = (
+                        "pending_trigger_timed_out" if expired else
+                        "hourly_dema_atr_changed" if indicator_changed else
+                        "opposite_crossover_superseded")
+                    terminalized = env.persistence.terminalize_pending_order(
                         old_pending_id,
-                        status="expired" if expired else "cancelled_by_reversal",
-                        reason="pending_trigger_timed_out" if expired
-                        else "opposite_crossover_superseded")
+                        status=terminal_status,
+                        reason=terminal_reason)
+                    if indicator_changed and not terminalized:
+                        row = env.persistence.get_pending_order(
+                            str(old_pending_id), execution_mode="LIVE")
+                        if _pending_row_has_unresolved_order(row):
+                            raise RuntimeError(
+                                "durable trigger row remained active")
                 except Exception as e:
                     log.warning("[Engine] cancel_inflight: failed to "
                                 "terminalize pending %s: %s", old_pending_id, e)
+                    if metadata.get("pending_termination") == "indicator_change":
+                        safe_mode = getattr(env, "safe_mode", None)
+                        if safe_mode is not None:
+                            safe_mode.enter_safe_mode(
+                                "pending_trigger_state_mismatch",
+                                f"Could not terminalize stale trigger {old_pending_id}")
+                        self._reset_strategy_state(
+                            signal.strategy_id, env_name=env.name)
+                        return
                 registry = getattr(env, "pending_triggers", None)
                 if registry is not None:
                     registry.remove_signal(str(old_pending_id))

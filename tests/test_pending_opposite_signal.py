@@ -21,7 +21,8 @@ def test_new_valid_signal_replaces_untriggered_entry_with_its_candle_values(side
     strategy = StrategyInstance("s1", "GOLDM", "123", "5m",
                                 pending_timeout_bars=50)
     old = strategy._create_triggered_entry_signal(
-        "LONG", 100.0, 101.0, 99.0, 1.0, 100.0, 98.0)
+        "LONG", 100.0, 101.0, 99.0, 1.0, 100.0, 98.0,
+        htf_val=100.0)
     strategy._prev_fast_close = 101.0
     strategy._prev_htf_value = 100.0
     strategy._prev_fast_high = 101.0
@@ -126,7 +127,8 @@ def test_stop_exit_limit_uses_the_signal_stop_price(side, ltp, expected):
 def test_live_opposite_pending_signal_terminalizes_old_without_broker_order():
     strategy = StrategyInstance("s1", "GOLDM", "123", "5m")
     old = strategy._create_triggered_entry_signal(
-        "LONG", 100.0, 101.0, 99.0, 1.0, 100.0, 98.0)
+        "LONG", 100.0, 101.0, 99.0, 1.0, 100.0, 98.0,
+        htf_val=100.0)
     strategy._prev_fast_close = 101.0
     strategy._prev_htf_value = 100.0
     strategy._check_long_cross = lambda *args: False

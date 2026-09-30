@@ -12,7 +12,8 @@ from typing import Any
 class PendingTriggerRegistry:
     _ACTIVE_LIVE_STATES = {"pending", "armed"}
     _TERMINAL_LIVE_STATES = {
-        "entry_sent", "expired", "cancelled_by_reversal", "resolved",
+        "entry_sent", "expired", "cancelled_by_reversal",
+        "cancelled_by_indicator_change", "resolved",
         "filled", "rejected", "cancelled", "canceled",
     }
 

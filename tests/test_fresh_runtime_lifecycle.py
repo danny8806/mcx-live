@@ -132,7 +132,11 @@ def _runtime(tmp_path, *, quantity=1, broker=None):
         trade_ledger=env.trade_ledger,
     )
     engine._reconciled_envs.add("live")
-    env.market_status.force_state(MarketState.LIVE_TRADING)
+    # EnvMarketStatus delegates the session state to its own wrapped instance.
+    # LIVE-only wiring may rebind engine.market_status after env creation, so
+    # force the exact base object used by the environment's admission check.
+    (getattr(env.market_status, "_base", None) or env.market_status).force_state(
+        MarketState.LIVE_TRADING)
     env.market_status.set_engine_status(EngineStatus.TRADING)
     env.market_status.mark_rest_data_fresh()
     engine.market_data_health.record_tick("GOLDM", time.time())
@@ -195,6 +199,8 @@ def _fire_and_submit(engine, env, broker, strategy, signal, price=None):
 def test_fresh_candle_trigger_entry_reversal_and_sl_full_runtime_cycle(tmp_path):
     engine, env, broker, persistence = _runtime(tmp_path)
     strategy = env.strategies["gold_02"]
+    reversal_alerts = []
+    engine.telegram.on_reversal_complete = reversal_alerts.append
     try:
         # Actual DEMA crossover rule on an actual completed Bar creates only
         # an armed signal; no broker order may exist before the LTP crossing.
@@ -264,6 +270,11 @@ def test_fresh_candle_trigger_entry_reversal_and_sl_full_runtime_cycle(tmp_path)
         assert not new_position.is_long
         assert new_position.sl_state == "ARMED"
         assert env.sl_monitor.armed_ids() == [new_position.position_id]
+        assert len(reversal_alerts) == 1
+        assert reversal_alerts[0]["old_side"] == "LONG"
+        assert reversal_alerts[0]["new_side"] == "SHORT"
+        assert reversal_alerts[0]["status"] == "COMPLETE"
+        assert reversal_alerts[0]["stop_price"] == new_position.stop_price
 
         # The new short's own stop creates one ordinary exit and closes only
         # its owning position; the old long stop cannot be inherited.

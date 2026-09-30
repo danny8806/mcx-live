@@ -232,6 +232,12 @@ class FillFlowMixin:
                 # MARKET fills immediately (including a partial fill).
                 self._protect_entry_fill_if_ready(
                     env, current, entry_order, source="entry_fill_augment")
+                if str(getattr(entry_order, "order_role", "")).upper() in (
+                        "REVERSAL_ENTRY", "FALLBACK_MARKET"):
+                    reversal_parent = self._reversal_parent_signal_id(
+                        env, entry_order)
+                    self._update_reversal_entry_fill(
+                        env, reversal_parent or signal_id, fill, current)
                 self._notify_entry_fill(fill, current, env, signal_id)
                 self._sync_strategy_on_entry_fill(
                     env, fill.strategy_id, "LONG" if current.is_long else "SHORT",
@@ -339,14 +345,8 @@ class FillFlowMixin:
                 # the NEW position; record its fill + SL on the reversal.
                 if str(getattr(entry_order, "order_role", "")).upper() in (
                         "REVERSAL_ENTRY", "FALLBACK_MARKET"):
-                    reversal_parent = getattr(
-                        entry_order, "reversal_parent_signal_id", None)
-                    if not reversal_parent and getattr(entry_order, "original_order_id", None):
-                        root_order = env.execution_engine.get_order(
-                            entry_order.original_order_id)
-                        if str(getattr(root_order, "order_role", "")).upper() == "REVERSAL_ENTRY":
-                            reversal_parent = getattr(
-                                root_order, "reversal_parent_signal_id", None)
+                    reversal_parent = self._reversal_parent_signal_id(
+                        env, entry_order)
                     self._update_reversal_entry_fill(
                         env, reversal_parent or signal_id, fill, position)
                 self._notify_entry_fill(fill, position, env, signal_id)

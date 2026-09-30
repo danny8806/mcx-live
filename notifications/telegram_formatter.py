@@ -204,6 +204,38 @@ def format_trade_exit(close_data: dict) -> str:
     )
 
 
+def format_reversal_complete(data: dict) -> str:
+    """Format a broker-confirmed reversal whose new local stop is armed."""
+    old_side = data.get("old_side", "?")
+    new_side = data.get("new_side", data.get("side", "?"))
+    instrument = data.get("instrument", "?")
+    strategy_id = data.get("strategy_id", "?")
+    quantity = data.get("quantity", 0)
+    exit_price = data.get("old_exit_fill_price")
+    entry_price = data.get("new_entry_fill_price")
+    stop_price = data.get("stop_price")
+    lines = [
+        "🔄 <b>REVERSAL COMPLETE</b>",
+        "",
+        f"<b>Instrument:</b> {instrument}",
+        f"<b>Strategy:</b> {strategy_id}",
+        f"<b>Direction:</b> {old_side} → {new_side}",
+        f"<b>Filled Quantity:</b> {quantity}",
+    ]
+    if exit_price is not None:
+        lines.append(f"<b>Old Exit Fill:</b> {float(exit_price):,.2f}")
+    if entry_price is not None:
+        lines.append(f"<b>New Entry Fill:</b> {float(entry_price):,.2f}")
+    if stop_price is not None:
+        lines.append(f"<b>New Local Stop:</b> {float(stop_price):,.2f} (ARMED)")
+    if data.get("old_exit_order_id"):
+        lines.append(f"<b>Exit Order:</b> {data['old_exit_order_id']}")
+    if data.get("new_broker_order_id"):
+        lines.append(f"<b>Entry Broker Order:</b> {data['new_broker_order_id']}")
+    lines.append(f"<b>Timestamp:</b> {_ist()}")
+    return "\n".join(lines)
+
+
 def format_risk_alert(alert_data: dict) -> str:
     severity = alert_data.get("severity", "WARNING")
     emoji = "\u26a0\ufe0f" if severity == "WARNING" else "\U0001f6a8"

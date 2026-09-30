@@ -45,6 +45,9 @@ class FakePersistence:
 
 def _harness_with_reversal(reversal):
     h = Harness()
+    h.reversal_alerts = []
+    h._notify_reversal_complete = lambda env, record, position=None: \
+        h.reversal_alerts.append((dict(record), position))
     broker = FakeBroker([{"instrument": "NIFTY", "quantity": 10, "side": "LONG"}])
     env = h.add_env(FakeEnv("LIVE", {"S1": FakeStrategy("S1", "NIFTY")},
                             make_pm([]), broker))
@@ -68,6 +71,20 @@ def test_armed_stop_closes_the_reversal_gap():
     assert rid == "REV1"
     assert fields["status"] == "COMPLETE"
     assert fields["new_sl_state"] == "ARMED"
+    assert len(h.reversal_alerts) == 1
+    assert h.reversal_alerts[0][0]["status"] == "COMPLETE"
+    assert h.reversal_alerts[0][1] is pos
+
+
+def test_completed_reversal_alert_waits_for_the_new_stop():
+    h, env = _harness_with_reversal(_reversal())
+    pos = make_position(pid="P1", strategy_id="S1", instrument="NIFTY", stop=None)
+    h._close_reversal_sl_gap(env, pos)
+    assert h.reversal_alerts == []
+
+    pos.stop_price = 90.0
+    h._arm_position_sl(env, pos)
+    assert len(h.reversal_alerts) == 1
 
 
 def test_closing_the_gap_publishes_an_event():

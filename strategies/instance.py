@@ -6,6 +6,7 @@ gets its own StrategyInstance. No shared mutable state between instances.
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from collections import OrderedDict
@@ -313,8 +314,13 @@ class StrategyInstance:
         self._prev_fast_high = high
         self._prev_fast_low = low
 
-        # Skip if no HTF value available
+        # A missing current hourly value cannot validate an older armed
+        # trigger. Retire it on this completed candle before ticks resume.
         if htf_val is None or prev_htf_val is None:
+            invalidated = self._invalidate_changed_dema_triggers(htf_val)
+            if invalidated:
+                return self._dema_cancel_control_signal(
+                    bar.start_ts or time.time(), bar.close, invalidated)
             return None
 
         signal = None
@@ -332,6 +338,14 @@ class StrategyInstance:
                 self.position_side = None
             else:
                 self.pending_entry.bars_pending += 1
+
+        # A signal trigger is valid only for the hourly DEMA-ATR context it
+        # captured when armed. Invalidate it on this completed strategy bar
+        # before the next market tick can reach the trigger. Timeout takes
+        # precedence when both conditions occur on the same completed bar.
+        # The engine calls on_bar and on_tick under the same lock, so
+        # cancellation and crossing cannot win concurrently.
+        invalidated_pending = self._invalidate_changed_dema_triggers(htf_val)
 
         # 2. A fresh crossover replaces an ARMED local entry, including a
         # same-direction crossover with newer candle/DEMA values. Once its
@@ -422,6 +436,31 @@ class StrategyInstance:
                                                       htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
                                                       open_=bar.open)
 
+        if invalidated_pending:
+            if signal is None:
+                # Terminalize the old durable LIVE trigger even when this bar
+                # does not produce a replacement signal. This control signal
+                # never places an order and preserves an existing position.
+                signal = self._dema_cancel_control_signal(
+                    bar.start_ts or time.time(), bar.close, invalidated_pending)
+            else:
+                metadata = signal.metadata = dict(signal.metadata or {})
+                if metadata.get("pending_trigger_kind") == "REVERSAL_EXIT":
+                    metadata["superseded_pending_entry_signal_id"] = (
+                        invalidated_pending["old_pending_id"])
+                    metadata["superseded_pending_termination"] = "indicator_change"
+                else:
+                    metadata.update(
+                        cancel_inflight=True,
+                        old_pending_id=invalidated_pending["old_pending_id"],
+                        pending_termination="indicator_change",
+                        cancel_reason="hourly_dema_atr_changed",
+                    )
+                metadata["trigger_htf_dema_atr"] = invalidated_pending[
+                    "trigger_htf_dema_atr"]
+                metadata["current_htf_dema_atr"] = invalidated_pending[
+                    "current_htf_dema_atr"]
+
         self.just_entered = False
         if expired_pending is not None:
             # The old LIVE pending row must become terminal even when this
@@ -446,6 +485,89 @@ class StrategyInstance:
                 pending_termination="expired",
             )
         return signal
+
+    @staticmethod
+    def _trigger_htf_dema_changed(trigger: Optional[PendingEntry],
+                                 current_value: float) -> bool:
+        """Fail closed when an armed signal has a different/missing 1H value."""
+        if (trigger is None or trigger.status not in ("pending", "waiting_for_flat")
+                or trigger.signal is None):
+            return False
+        metadata = trigger.signal.metadata or {}
+        frozen = metadata.get("signal_htf_dema_atr", metadata.get("htf_value"))
+        try:
+            frozen_value = float(frozen)
+            current = float(current_value)
+        except (TypeError, ValueError):
+            return True
+        if not math.isfinite(frozen_value) or not math.isfinite(current):
+            return True
+        return not math.isclose(frozen_value, current, rel_tol=0.0, abs_tol=1e-9)
+
+    def _dema_cancel_control_signal(self, timestamp: float, price: float,
+                                    invalidated: dict) -> Signal:
+        control = Signal(
+            signal_type=SignalType.LONG,
+            instrument=self.instrument,
+            strategy_id=self.strategy_id,
+            timestamp=timestamp,
+            trigger_price=price,
+            stop_price=price,
+            quantity=self.quantity,
+        )
+        control.metadata = {
+            "cancel_pending_only": True,
+            "cancel_only": True,
+            "pending": False,
+            "triggered": False,
+            "pending_termination": "indicator_change",
+            "cancel_reason": "hourly_dema_atr_changed",
+            **invalidated,
+        }
+        return control
+
+    def _invalidate_changed_dema_triggers(self, current_htf_value) -> Optional[dict]:
+        """Cancel an armed entry or both legs of an armed reversal on DEMA change."""
+        entry = self.pending_entry
+        exit_trigger = self.pending_exit_trigger
+        if not (self._trigger_htf_dema_changed(entry, current_htf_value)
+                or self._trigger_htf_dema_changed(exit_trigger, current_htf_value)):
+            return None
+
+        entry_signal = getattr(entry, "signal", None)
+        exit_signal = getattr(exit_trigger, "signal", None)
+        source_signal = entry_signal or exit_signal
+        old_pending_id = (getattr(entry_signal, "signal_id", None)
+                          or getattr(exit_signal, "signal_id", None))
+        source_metadata = getattr(source_signal, "metadata", None) or {}
+        frozen_value = source_metadata.get(
+            "signal_htf_dema_atr", source_metadata.get("htf_value"))
+        reversal_was_waiting = (
+            exit_trigger is not None
+            and exit_trigger.status in ("pending", "waiting_for_flat"))
+        self._cancel_trigger(entry)
+        self._cancel_trigger(exit_trigger)
+        self.pending_entry = None
+        self.pending_exit_trigger = None
+        self._trigger_generation += 1
+        self._last_armed_pending_id = None
+
+        if self.position_side is None:
+            self.state = StrategyState.FLAT
+            self.current_trade_id = None
+        elif reversal_was_waiting and self.state == StrategyState.EXIT_PENDING:
+            # The old position remains open and its own stop remains owned by
+            # that position. Only the untriggered reversal intent is retired.
+            self.state = (StrategyState.LONG_POSITION if self.position_side == "LONG"
+                          else StrategyState.SHORT_POSITION)
+        # If the reversal exit already fired, preserve EXIT_ORDER_SUBMITTED and
+        # the old position identity; only its still-untriggered opposite entry
+        # is invalidated.
+        return {
+            "old_pending_id": str(old_pending_id),
+            "trigger_htf_dema_atr": frozen_value,
+            "current_htf_dema_atr": current_htf_value,
+        } if old_pending_id else None
 
     # ═══════════════════════════════════════════════════════════════════════
     # CROSSOVER DETECTION

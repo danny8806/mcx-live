@@ -596,6 +596,42 @@ class PersistenceFlowMixin:
                 log.error("[Engine] armed pending %s cannot be safely restored: %s",
                           signal_id, exc)
         return restored
+
+    def _invalidate_warmed_pending_triggers(self, env) -> int:
+        """Retire restored triggers against the latest completed hourly line.
+
+        Startup restores SQLite rows before the REST warmup. Run this check
+        after warmup and before connecting the market feed, so a gap-open tick
+        cannot fire a trigger from an older hourly indicator context.
+        """
+        invalidated_count = 0
+        with getattr(self, "_lock", nullcontext()):
+            for strategy in (getattr(env, "strategies", {}) or {}).values():
+                pending = (getattr(strategy, "pending_entry", None)
+                           or getattr(strategy, "pending_exit_trigger", None))
+                old_signal = getattr(pending, "signal", None)
+                if old_signal is None:
+                    continue
+                slow_state = getattr(strategy, "slow_htf_state", None)
+                current_value = getattr(slow_state, "last_value", None)
+                invalidated = strategy._invalidate_changed_dema_triggers(
+                    current_value)
+                if not invalidated:
+                    continue
+                registry = getattr(env, "pending_triggers", None)
+                if registry is not None:
+                    registry.sync_strategy(strategy)
+                control = strategy._dema_cancel_control_signal(
+                    time.time(), float(old_signal.trigger_price), invalidated)
+                self._process_signal(control, env.name)
+                invalidated_count += 1
+                log.warning(
+                    "[Engine] retired restored trigger %s for %s: hourly "
+                    "DEMA-ATR %r -> %r",
+                    invalidated["old_pending_id"], strategy.strategy_id,
+                    invalidated["trigger_htf_dema_atr"],
+                    invalidated["current_htf_dema_atr"])
+        return invalidated_count
         self.publish_event("pending_order_entry_sent", {
             "pending_order_id": pend_id, "signal_id": pend_id,
             "trade_id": trade.trade_id, "order_id": order.order_id,

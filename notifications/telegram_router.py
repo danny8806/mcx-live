@@ -23,6 +23,7 @@ from notifications.telegram_client import TelegramClient
 from notifications.telegram_formatter import (
     format_new_trade, format_trade_exit, format_risk_alert, format_error_alert, format_daily_summary,
     format_signal_alert, format_startup_alert, format_shutdown_alert, format_order_lifecycle,
+    format_reversal_complete,
 )
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,11 @@ class TelegramRouter:
     def on_trade_close(self, close_data: dict) -> None:
         text = format_trade_exit(close_data)
         self._emit("EXIT", close_data or {}, text, source="LOCAL")
+
+    def on_reversal_complete(self, reversal_data: dict) -> None:
+        """Notify only after the old exit, new fill, and new local SL are confirmed."""
+        text = format_reversal_complete(reversal_data or {})
+        self._emit("REVERSAL", reversal_data or {}, text, source="LOCAL")
 
     def on_risk_alert(self, alert_data: dict) -> None:
         text = format_risk_alert(alert_data)

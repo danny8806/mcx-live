@@ -1270,6 +1270,25 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 env.market_status.set_engine_status(EngineStatus.WARMING_UP)
         # Warm up PAPER from shared data adapter; LIVE from its own adapter.
         self._warmup_from_rest()
+        # SQLite triggers were restored before the REST warmup. Revalidate
+        # their frozen hourly DEMA-ATR against the warmed, completed 1H line
+        # before the first live tick can cross a stale overnight trigger.
+        for name, env in self._envs.items():
+            if not env.is_live:
+                continue
+            try:
+                self._invalidate_warmed_pending_triggers(env)
+            except Exception as exc:
+                log.exception(
+                    "[Engine] startup pending-trigger DEMA validation failed "
+                    "for %s", name)
+                for strategy in env.strategies.values():
+                    self._discard_unjournaled_live_pending(
+                        strategy, env,
+                        f"startup hourly DEMA-ATR validation failed: {exc}")
+                if env.safe_mode is not None:
+                    env.safe_mode.enter_safe_mode(
+                        "pending_trigger_revalidation_failed", str(exc))
         if not self._live_only:
             # Start PAPER data feeds (shared infrastructure). In LIVE-only mode
             # the engine's candle_fetcher/data_adapter ARE the live env's, so

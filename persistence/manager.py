@@ -784,7 +784,7 @@ class PersistenceManager:
         terminal state (default ``resolved``) once the broker confirms the
         entry ended without a fill (rejected / cancelled).  Safe to call from
         the poller every cycle for every terminal broker order: rows already
-        terminal (resolved / expired / cancelled_by_reversal) are left
+        terminal (resolved / expired / cancelled_*) are left
         untouched.  Returns True when a row was actually terminalized.
         """
         with self._lock, self._tx() as conn:
@@ -796,7 +796,10 @@ class PersistenceManager:
             if row is None:
                 return False
             current = (row["status"] or "pending").lower()
-            terminal = {"resolved", "expired", "cancelled_by_reversal"}
+            terminal = {
+                "resolved", "expired", "cancelled_by_reversal",
+                "cancelled_by_indicator_change",
+            }
             if current in terminal:
                 return False
             if current != status:

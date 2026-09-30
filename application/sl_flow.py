@@ -465,6 +465,12 @@ class SLFlowMixin:
                 continue
             stop_price = getattr(position, "stop_price", None)
             try:
+                stop_price = float(stop_price)
+                if stop_price <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            try:
                 updater(rev.get("reversal_id"), {
                     "new_sl_state": SLState.ARMED.value,
                     "status": "COMPLETE",
@@ -475,6 +481,17 @@ class SLFlowMixin:
                 log.warning("[Engine] reversal gap close failed for %s: %s",
                             rev.get("reversal_id"), e)
                 continue
+            try:
+                notifier = getattr(self, "_notify_reversal_complete", None)
+                if callable(notifier):
+                    notifier(env, {
+                        **rev,
+                        "new_sl_state": SLState.ARMED.value,
+                        "status": "COMPLETE",
+                    }, position=position)
+            except Exception as e:
+                log.warning("[Telegram] reversal completion alert failed for %s: %s",
+                            rev.get("reversal_id"), e)
             self.publish_event("reversal_sl_gap_closed", {
                 "reversal_id": rev.get("reversal_id"),
                 "position_id": pid,

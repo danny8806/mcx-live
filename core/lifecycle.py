@@ -75,23 +75,29 @@ class PendingOrderState(str, Enum):
     ENTRY_SENT = "entry_sent"                  # entry order placed (correlation set)
     EXPIRED = "expired"                        # entry never placed in time
     CANCELLED_BY_REVERSAL = "cancelled_by_reversal"  # superseded by a reversal
+    CANCELLED_BY_INDICATOR_CHANGE = "cancelled_by_indicator_change"
     RESOLVED = "resolved"                      # broker termined the entry (rej/cancel)
 
 
 _PENDING_ALLOWED: dict[PendingOrderState, set[PendingOrderState]] = {
     PendingOrderState.PENDING: {
         PendingOrderState.ARMED, PendingOrderState.EXPIRED,
-        PendingOrderState.CANCELLED_BY_REVERSAL, PendingOrderState.RESOLVED,
+        PendingOrderState.CANCELLED_BY_REVERSAL,
+        PendingOrderState.CANCELLED_BY_INDICATOR_CHANGE,
+        PendingOrderState.RESOLVED,
     },
     PendingOrderState.ARMED: {
         PendingOrderState.ENTRY_SENT, PendingOrderState.EXPIRED,
-        PendingOrderState.CANCELLED_BY_REVERSAL, PendingOrderState.RESOLVED,
+        PendingOrderState.CANCELLED_BY_REVERSAL,
+        PendingOrderState.CANCELLED_BY_INDICATOR_CHANGE,
+        PendingOrderState.RESOLVED,
     },
     PendingOrderState.ENTRY_SENT: {
         PendingOrderState.RESOLVED,
     },
     PendingOrderState.EXPIRED: set(),
     PendingOrderState.CANCELLED_BY_REVERSAL: set(),
+    PendingOrderState.CANCELLED_BY_INDICATOR_CHANGE: set(),
     PendingOrderState.RESOLVED: set(),
 }
 
@@ -104,10 +110,10 @@ def transition_pending_state(
     """Validate a pending-order state transition and return the resulting
     state (Phase 9.6).
 
-    Follows ``PENDING → ARMED → (ENTRY_SENT | EXPIRED | CANCELLED_BY_REVERSAL)``
+    Follows ``PENDING → ARMED → (ENTRY_SENT | EXPIRED | CANCELLED_BY_*)``
     plus a broker-derived terminal ``RESOLVED`` reachable from every
     pre-terminal state (entry rejected/cancelled by the exchange).  EXPIRED,
-    CANCELLED_BY_REVERSAL and RESOLVED are absorbing; a stranded row with an
+    cancellation states and RESOLVED are absorbing; a stranded row with an
     empty/unknown stored status is treated as PENDING so it can always be
     advanced to a defined state.  Invalid forward moves raise ValueError.
     """

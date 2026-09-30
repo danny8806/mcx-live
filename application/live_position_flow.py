@@ -82,6 +82,18 @@ class LivePositionFlowMixin:
         except Exception as e:
             log.warning("[Engine] reversal lookup failed for %s: %s", signal_id, e)
             return None
+
+    @staticmethod
+    def _reversal_parent_signal_id(env, order) -> Optional[str]:
+        """Resolve reversal lineage through a confirmed fallback child order."""
+        parent_signal_id = getattr(order, "reversal_parent_signal_id", None)
+        if parent_signal_id or not getattr(order, "original_order_id", None):
+            return parent_signal_id
+        engine = getattr(env, "execution_engine", None)
+        root = engine.get_order(order.original_order_id) if engine else None
+        if str(getattr(root, "order_role", "")).upper() == "REVERSAL_ENTRY":
+            return getattr(root, "reversal_parent_signal_id", None)
+        return None
     def _update_reversal_exit_fill(self, env, signal_id: Optional[str],
                                    fill) -> None:
         """Stamp the broker-confirmed old-exit fill (transition point)."""
@@ -143,7 +155,7 @@ class LivePositionFlowMixin:
                         rev["reversal_id"], e)
 
     def _update_reversal_entry_fill(self, env, signal_id: Optional[str],
-                                    fill, position) -> None:
+                                    fill, position) -> Optional[dict]:
         """Stamp the broker-confirmed NEW entry fill ONLY on a new position.
 
         The record stays EXIT_FILLED (never COMPLETE) until this broker
@@ -152,8 +164,9 @@ class LivePositionFlowMixin:
         """
         rev = self._find_reversal(env, signal_id)
         if rev is None:
-            return
+            return None
         try:
+            previous_status = str(rev.get("status") or "").upper()
             filled_order = (env.execution_engine.get_order(fill.order_id)
                             if getattr(env, "execution_engine", None) is not None
                             else None)
@@ -167,8 +180,10 @@ class LivePositionFlowMixin:
                         and float(stop_price) > 0)
             fields = {
                 "new_entry_order_id": getattr(fill, "order_id", None),
-                "new_entry_fill_price": fill.price,
-                "new_entry_filled_quantity": fill.quantity,
+                "new_entry_fill_price": getattr(
+                    position, "average_entry", None) or fill.price,
+                "new_entry_filled_quantity": int(
+                    getattr(position, "quantity", None) or fill.quantity),
                 "new_entry_broker_status": "FILLED",
                 "new_position_id": getattr(position, "position_id", None),
                 "new_sl_state": "ARMED" if sl_armed else sl_state,
@@ -181,9 +196,52 @@ class LivePositionFlowMixin:
             if is_fallback:
                 fields.update({"fallback_used": 1, "fallback_status": "FILLED"})
             env.persistence.update_reversal(rev["reversal_id"], fields)
+            updated = self._find_reversal(env, signal_id) or {**rev, **fields}
+            if (str(updated.get("status") or "").upper() == "COMPLETE"
+                    and previous_status != "COMPLETE"):
+                self._notify_reversal_complete(env, updated, position=position)
+            return updated
         except Exception as e:
             log.warning("[Engine] reversal entry-fill stamp failed for %s: %s",
                         rev["reversal_id"], e)
+            return None
+
+    def _notify_reversal_complete(self, env, reversal: dict,
+                                  position=None) -> None:
+        """Send one summary when a reversal is complete and its stop is armed."""
+        if str((reversal or {}).get("status") or "").upper() != "COMPLETE":
+            return
+        if str((reversal or {}).get("new_sl_state") or "").upper() != "ARMED":
+            return
+        notifier = getattr(getattr(self, "telegram", None),
+                            "on_reversal_complete", None)
+        if not callable(notifier):
+            return
+        new_side = ("LONG" if getattr(position, "is_long", False) else "SHORT") \
+            if position is not None else str(
+                (reversal or {}).get("new_side") or "").upper()
+        old_side = {"LONG": "SHORT", "SHORT": "LONG"}.get(new_side, "?")
+        try:
+            notifier({
+                "reversal_id": reversal.get("reversal_id"),
+                "signal_id": reversal.get("signal_id"),
+                "strategy_id": reversal.get("strategy_id"),
+                "instrument": reversal.get("instrument"),
+                "old_side": old_side,
+                "new_side": new_side or "?",
+                "quantity": reversal.get("new_entry_filled_quantity"),
+                "old_exit_fill_price": reversal.get("old_exit_fill_price"),
+                "new_entry_fill_price": reversal.get("new_entry_fill_price"),
+                "stop_price": getattr(position, "stop_price", None)
+                    if position is not None else reversal.get("new_stop_price"),
+                "old_exit_order_id": reversal.get("old_exit_order_id"),
+                "new_broker_order_id": reversal.get("new_broker_order_id"),
+                "execution_mode": getattr(env, "mode", None),
+                "status": "COMPLETE",
+            })
+        except Exception as e:
+            log.warning("[Telegram] reversal completion alert failed for %s: %s",
+                        reversal.get("reversal_id"), e)
     def _emergency_close_position(self, env, position, reason: str) -> None:
         """Market-close an unprotected position with an EMERGENCY_EXIT order."""
         if env.execution_engine is None:
