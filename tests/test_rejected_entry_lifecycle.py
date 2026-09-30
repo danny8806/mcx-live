@@ -153,3 +153,41 @@ def test_poller_does_not_settle_terminal_entry_with_any_fill():
 
     assert not poller._settle_terminal_entry_lifecycle(order)
     assert trade.status == TradeStatus.OPEN.value
+
+
+def test_poller_persists_async_reversal_fallback_rejection():
+    from types import SimpleNamespace
+    from execution.live.poller import LiveBrokerPoller
+
+    class Persistence:
+        def __init__(self):
+            self.updated = []
+
+        def get_reversal_by_signal_id(self, signal_id):
+            assert signal_id == "REV-EXIT-1"
+            return {"reversal_id": "RV-1"}
+
+        def update_reversal(self, reversal_id, fields):
+            self.updated.append((reversal_id, dict(fields)))
+
+    root = SimpleNamespace(order_role="REVERSAL_ENTRY",
+                           reversal_parent_signal_id="REV-EXIT-1")
+    fallback = SimpleNamespace(
+        order_id="O-FALLBACK", order_role="FALLBACK_MARKET",
+        original_order_id="O-ENTRY-LIMIT", reversal_parent_signal_id=None,
+        entry_signal_id="ENTRY-SIGNAL", state="rejected", reason="RMS rejected",
+    )
+    persistence = Persistence()
+    poller = LiveBrokerPoller.__new__(LiveBrokerPoller)
+    poller.env = SimpleNamespace(name="live", persistence=persistence)
+
+    poller._settle_reversal_terminal(
+        fallback, {"O-ENTRY-LIMIT": root})
+
+    assert persistence.updated[0][0] == "RV-1"
+    assert {key: value for key, value in persistence.updated[0][1].items()
+            if key != "updated_at"} == {
+        "new_entry_broker_status": "REJECTED",
+        "status": "ENTRY_REJECTED",
+        "failure_reason": "RMS rejected",
+    }

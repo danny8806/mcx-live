@@ -1228,6 +1228,12 @@ class OrderWatcher:
             new_order.position_id = rec.position_id
             new_order.position_generation = rec.position_generation
             new_order.original_order_id = rec.internal_order_id
+            get_order = getattr(engine, "get_order", None)
+            root_order = (get_order(rec.internal_order_id) if callable(get_order)
+                          else (getattr(engine, "_orders", {}) or {}).get(
+                              rec.internal_order_id))
+            new_order.reversal_parent_signal_id = getattr(
+                root_order, "reversal_parent_signal_id", None)
             new_order.fallback_cancel_confirmed = True
             # Persist the CREATED fallback before any broker side effect. This
             # preserves the orders -> fills foreign-key/data-flow invariant.

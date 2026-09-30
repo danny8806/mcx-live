@@ -336,11 +336,18 @@ class FillFlowMixin:
                     env, position, entry_order, source="entry_fill")
                 # REVERSAL — the broker-confirmed NEW opposite entry creates
                 # the NEW position; record its fill + SL on the reversal.
-                if getattr(entry_order, "order_role", "") == "REVERSAL_ENTRY":
+                if str(getattr(entry_order, "order_role", "")).upper() in (
+                        "REVERSAL_ENTRY", "FALLBACK_MARKET"):
+                    reversal_parent = getattr(
+                        entry_order, "reversal_parent_signal_id", None)
+                    if not reversal_parent and getattr(entry_order, "original_order_id", None):
+                        root_order = env.execution_engine.get_order(
+                            entry_order.original_order_id)
+                        if str(getattr(root_order, "order_role", "")).upper() == "REVERSAL_ENTRY":
+                            reversal_parent = getattr(
+                                root_order, "reversal_parent_signal_id", None)
                     self._update_reversal_entry_fill(
-                        env, getattr(entry_order, "reversal_parent_signal_id", None)
-                        or signal_id, fill,
-                                                     position)
+                        env, reversal_parent or signal_id, fill, position)
                 self._notify_entry_fill(fill, position, env, signal_id)
                 self._sync_strategy_on_entry_fill(
                     env, fill.strategy_id, "LONG" if position.is_long else "SHORT",

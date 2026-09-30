@@ -106,6 +106,7 @@ class PersistenceFlowMixin:
                 "parent_position_id": getattr(order, "parent_position_id", None),
                 "position_generation": getattr(order, "position_generation", None),
                 "original_order_id": getattr(order, "original_order_id", None),
+                "reversal_parent_signal_id": getattr(order, "reversal_parent_signal_id", None),
                 "trigger_state": getattr(order, "trigger_state", None),
                 "trigger_generation": getattr(order, "trigger_generation", None),
                 "trigger_source": getattr(order, "trigger_source", None),
@@ -497,6 +498,71 @@ class PersistenceFlowMixin:
                 # Rebuild the opposite-position exit trigger for a reversal.
                 # The entry row points back to its parent exit signal id.
                 reversal_exit_id = metadata.get("reversal_parent_signal_id")
+                reversal_record = None
+                get_reversal = getattr(persistence, "get_reversal_by_signal_id", None)
+                if reversal_exit_id and callable(get_reversal):
+                    try:
+                        reversal_record = get_reversal(str(reversal_exit_id))
+                    except Exception:
+                        reversal_record = None
+                reversal_status = str((reversal_record or {}).get("status") or "").upper()
+                if reversal_status in {"EXIT_REJECTED", "EXIT_CANCELLED"}:
+                    # Canonical reversal state wins over a stale ARMED trigger
+                    # row. Do not resurrect the paired entry after its old-side
+                    # exit definitively failed or was cancelled.
+                    try:
+                        persistence.terminalize_pending_order(
+                            signal_id, status="resolved",
+                            reason=f"reversal_exit_terminal:{reversal_status.lower()}")
+                    except Exception:
+                        pass
+                    registry.remove_signal(signal_id)
+                    strategy.pending_entry = None
+                    strategy.pending_exit_trigger = None
+                    continue
+
+                orders = list((getattr(
+                    getattr(env, "execution_engine", None), "_orders", {}) or {}).values())
+                active_reversal_exit = next((order for order in orders
+                    if str(getattr(order, "order_role", "")).upper() == "REVERSAL_EXIT"
+                    and str(getattr(getattr(order, "state", None), "value",
+                                    getattr(order, "state", ""))).lower()
+                        in ("created", "submitted", "acknowledged", "partially_filled")
+                    and str(getattr(order, "entry_signal_id", None)
+                            or getattr(order, "parent_signal_id", None) or "")
+                        == str(reversal_exit_id or "")), None)
+                if reversal_exit_id and active_reversal_exit is not None:
+                    # The exit trigger already fired and its broker order is
+                    # still live. Recreating the candle trigger after restart
+                    # could submit a duplicate exit. Keep the opposite entry
+                    # parked until this exact order is confirmed terminal/flat.
+                    pending.status = "waiting_for_flat"
+                    strategy.pending_exit_trigger = None
+                    strategy.stop_exit_submitted = True
+                    strategy.state = StrategyState.EXIT_ORDER_SUBMITTED
+                    position = next((p for p in getattr(
+                        getattr(env, "position_manager", None), "open_positions", [])
+                        if p.position_id == getattr(
+                            active_reversal_exit, "parent_position_id", None)
+                        and p.is_open), None)
+                    if position is not None:
+                        position.exit_started = True
+                        position.exit_order_id = active_reversal_exit.order_id
+                        position.sl_state = "EXITING"
+                        monitor_factory = getattr(self, "_sl_monitor", None)
+                        if callable(monitor_factory):
+                            monitor = monitor_factory(env)
+                            monitor.arm(position)
+                            monitor.mark_exiting(position.position_id,
+                                                 active_reversal_exit.order_id)
+                        try:
+                            persistence.save_position(position)
+                        except Exception:
+                            pass
+                    registry.sync_strategy(strategy)
+                    restored += 1
+                    continue
+
                 if reversal_exit_id and strategy.pending_exit_trigger is None:
                     exit_saved = persistence.get_signal(str(reversal_exit_id))
                     if exit_saved is not None:

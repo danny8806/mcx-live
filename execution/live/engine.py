@@ -740,3 +740,85 @@ class LiveExecutionEngine:
             if o_data.get("_broker_order_id"):
                 order._broker_order_id = o_data["_broker_order_id"]
             self._orders[order.order_id] = order
+
+    def restore_orders_from_persistence(self, rows: list[dict]) -> int:
+        """Hydrate missing live order objects from canonical DB rows.
+
+        The JSON execution snapshot is a fast restart cache, not the authority.
+        If it was missed or truncated, broker mappings can still be restored
+        while their internal order objects are absent; status polls would then
+        be silently ignored. Restore only nonterminal orders and never replace
+        an order already present in the snapshot.
+        """
+        active = {"created", "submitted", "acknowledged", "partially_filled"}
+        restored = 0
+        router = self.broker_router
+        with self._lock:
+            for row in rows or []:
+                oid = str(row.get("order_id") or "")
+                state_raw = str(row.get("state") or "").lower()
+                if not oid or oid in self._orders or state_raw not in active:
+                    continue
+                if str(row.get("execution_mode") or "LIVE").upper() != "LIVE":
+                    continue
+                try:
+                    state = OrderState(state_raw)
+                    order = Order(
+                        order_id=oid,
+                        strategy_id=str(row.get("strategy_id") or ""),
+                        instrument=str(row.get("instrument") or ""),
+                        side=str(row.get("side") or "").upper(),
+                        quantity=int(row.get("quantity") or 0),
+                        order_type=str(row.get("order_type") or "LIMIT").upper(),
+                        price=row.get("price"),
+                        trigger_price=row.get("trigger_price"),
+                        correlation_id=row.get("correlation_id"),
+                        planned_entry_price=row.get("planned_entry_price"),
+                        planned_sl=row.get("planned_sl"),
+                        planned_order_type=row.get("planned_order_type"),
+                        order_role=row.get("order_role"),
+                        state=state,
+                        filled_quantity=int(row.get("filled_quantity") or 0),
+                        average_fill_price=float(row.get("average_fill_price") or 0.0),
+                        entry_signal_id=row.get("signal_id") or row.get("entry_signal_id"),
+                        trade_id=row.get("trade_id"),
+                        lifecycle_id=row.get("lifecycle_id") or row.get("trade_id"),
+                        parent_signal_id=row.get("parent_signal_id") or row.get("signal_id"),
+                        parent_position_id=row.get("parent_position_id"),
+                        position_id=row.get("position_id") or row.get("parent_position_id"),
+                        position_generation=row.get("position_generation"),
+                        original_order_id=row.get("original_order_id"),
+                        reversal_parent_signal_id=row.get("reversal_parent_signal_id"),
+                        trigger_state=row.get("trigger_state"),
+                        trigger_generation=row.get("trigger_generation"),
+                        trigger_source=row.get("trigger_source"),
+                    )
+                    for attr, key in (("created_at", "created_at"),
+                                      ("updated_at", "updated_at")):
+                        value = row.get(key)
+                        if value is not None:
+                            try:
+                                setattr(order, attr, float(value))
+                            except (TypeError, ValueError):
+                                try:
+                                    from datetime import datetime
+                                    setattr(order, attr, datetime.fromisoformat(
+                                        str(value).replace("Z", "+00:00")).timestamp())
+                                except (TypeError, ValueError):
+                                    pass
+                    broker_id = row.get("broker_order_id")
+                    if broker_id:
+                        order._broker_order_id = str(broker_id)
+                    self._orders[oid] = order
+                    if router is not None and broker_id:
+                        router.register_from_kwargs(
+                            broker_order_id=str(broker_id), order_id=oid,
+                            trade_id=str(row.get("trade_id") or ""),
+                            strategy_id=order.strategy_id,
+                            instrument=order.instrument)
+                    restored += 1
+                except (TypeError, ValueError, KeyError) as exc:
+                    # A malformed row must be reported and skipped; it must
+                    # not prevent other broker orders from being recovered.
+                    continue
+        return restored

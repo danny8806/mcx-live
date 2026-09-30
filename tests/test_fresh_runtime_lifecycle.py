@@ -17,6 +17,7 @@ from execution.live.broker_client import StubLiveBroker
 from execution.models import OrderState
 from execution.live.order_watcher import OrderWatcher
 from persistence.manager import PersistenceManager
+from portfolio.position_manager import Position, PositionSide
 from trading_engine import TradingEngine
 
 
@@ -298,6 +299,59 @@ def test_fresh_candle_trigger_entry_reversal_and_sl_full_runtime_cycle(tmp_path)
         assert final_position.position_id != new_position.position_id
         assert final_position.sl_state == "ARMED"
         assert env.sl_monitor.armed_ids() == [final_position.position_id]
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_live_restore_hydrates_db_order_when_json_snapshot_is_missing(tmp_path):
+    engine, env, _broker, persistence = _runtime(tmp_path)
+    try:
+        persistence.save_signal({
+            "signal_id": "ENTRY-DB-ONLY", "strategy_id": "gold_02",
+            "instrument": "GOLDM", "side": "SHORT", "signal_type": "entry",
+            "timestamp": time.time(), "trigger_price": 228000.0,
+            "stop_price": 229000.0, "quantity": 1,
+        })
+        persistence.save_trade({
+            "trade_id": "TRADE-DB-ONLY", "strategy_id": "gold_02",
+            "instrument": "GOLDM", "side": "SHORT", "quantity": 1,
+            "multiplier": 1.0, "entry_timestamp": time.time(),
+            "entry_price": 228000.0, "status": "open", "execution_mode": "LIVE",
+            "entry_signal_id": "ENTRY-DB-ONLY",
+        })
+        persistence.save_position(Position(
+            position_id="POS-DB-ONLY", strategy_id="gold_02",
+            instrument="GOLDM", side=PositionSide.SHORT, quantity=1,
+            average_entry=228000.0, entry_timestamp=time.time(),
+            stop_price=229000.0, trade_id="TRADE-DB-ONLY", multiplier=1.0,
+            entry_signal_id="ENTRY-DB-ONLY", entry_order_id="LIVE-DB-ONLY",
+            position_generation=7, sl_state="ARMED", lifecycle_id="TRADE-DB-ONLY",
+        ))
+        persistence.save_order({
+            "order_id": "LIVE-DB-ONLY", "strategy_id": "gold_02",
+            "instrument": "GOLDM", "side": "SELL", "quantity": 1,
+            "order_type": "LIMIT", "price": 228000.0,
+            "trigger_price": 228000.0, "state": "submitted",
+            "filled_quantity": 0, "average_fill_price": 0.0,
+            "signal_id": "REV-ENTRY", "trade_id": "TRADE-DB-ONLY",
+            "broker_order_id": "DHAN-DB-ONLY", "order_role": "REVERSAL_ENTRY",
+            "reversal_parent_signal_id": "REV-EXIT",
+            "created_at": "2026-09-30T10:00:00+00:00",
+            "updated_at": "2026-09-30T10:00:00+00:00",
+        })
+        env.execution_engine._orders.clear()
+
+        engine.restore({}, env_name="live")
+
+        restored = env.execution_engine.get_order("LIVE-DB-ONLY")
+        assert restored is not None
+        assert restored._broker_order_id == "DHAN-DB-ONLY"
+        assert restored.reversal_parent_signal_id == "REV-EXIT"
+        position = env.position_manager.get_position("POS-DB-ONLY")
+        assert position is not None and position.is_open
+        assert env.strategies["gold_02"].position_side == "SHORT"
+        assert env.strategies["gold_02"].current_position_id == "POS-DB-ONLY"
     finally:
         engine.stop()
         persistence.close()

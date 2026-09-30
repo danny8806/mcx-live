@@ -163,6 +163,7 @@ class DhanOrderUpdateFeed:
         self._connected = False
         self._connecting = False
         self._last_message_time = 0.0
+        self._last_activity_time = 0.0
         self._stats = {"recv": 0, "alerts": 0, "parse_err": 0, "reconnects": 0}
         self._factory = socket_factory or websocket.WebSocketApp
 
@@ -250,6 +251,7 @@ class DhanOrderUpdateFeed:
             on_message=self._on_message,
             on_error=self._on_error,
             on_close=self._on_close,
+            on_pong=self._on_pong,
         )
         try:
             self._ws.run_forever(ping_interval=self.heartbeat_interval)
@@ -263,7 +265,7 @@ class DhanOrderUpdateFeed:
 
     def _on_open(self, ws: Any) -> None:
         self._connected = True
-        self._last_message_time = time.time()
+        self._last_activity_time = self._last_message_time = time.time()
         try:
             ws.send(json.dumps(login_message(self.client_id, self.token)))
         except Exception as e:  # pragma: no cover - socket-layer edge
@@ -278,7 +280,7 @@ class DhanOrderUpdateFeed:
         if not isinstance(message, str):
             return  # binary frames are not order alerts
         self._stats["recv"] += 1
-        self._last_message_time = time.time()
+        self._last_activity_time = self._last_message_time = time.time()
         try:
             record = parse_order_alert(message)
         except Exception as e:
@@ -301,6 +303,10 @@ class DhanOrderUpdateFeed:
         if self.on_status:
             self.on_status(f"error:{error}")
 
+    def _on_pong(self, ws: Any, message: Any) -> None:
+        """Treat a valid protocol pong as transport activity, not an order."""
+        self._last_activity_time = time.time()
+
     def _on_close(self, ws: Any, close_code: int, close_msg: str) -> None:
         if self.on_status:
             self.on_status(f"closed:{close_code}:{close_msg}")
@@ -310,4 +316,4 @@ class DhanOrderUpdateFeed:
     def is_stale(self) -> bool:
         if not self._connected:
             return True
-        return (time.time() - self._last_message_time) > self.stale_threshold
+        return (time.time() - self._last_activity_time) > self.stale_threshold

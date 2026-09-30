@@ -220,12 +220,14 @@ class EnvironmentFactoryMixin:
                 instrument = tick.get("instrument")
                 ltp = tick.get("ltp", 0.0)
                 timestamp = tick.get("event_timestamp") or tick.get("timestamp") or time.time()
+                received_at = tick.get("receive_timestamp") or timestamp
                 volume = tick.get("volume", 0.0)
             else:
                 instrument = getattr(tick, "instrument", None)
                 ltp = getattr(tick, "ltp", 0.0)
                 timestamp = (getattr(tick, "event_timestamp", None)
                              or getattr(tick, "timestamp", None) or time.time())
+                received_at = getattr(tick, "receive_timestamp", None) or timestamp
                 volume = getattr(tick, "volume", 0.0)
             if not instrument:
                 return
@@ -249,7 +251,7 @@ class EnvironmentFactoryMixin:
             health = getattr(self, "market_data_health", None)
             if health is not None:
                 if valid_ltp and (ws is None or ws_connected):
-                    health.record_tick(instrument, timestamp)
+                    health.record_tick(instrument, received_at)
                 elif ws is not None and not ws_connected:
                     health.mark_unhealthy(instrument)
                 if not health.is_healthy(instrument):

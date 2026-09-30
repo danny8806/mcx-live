@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 # Current schema version of the canonical database.  Bump when adding tables/
 # columns; the migrator applies step-wise idempotent DDL.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Tables whose rows are CANONICAL — the durable source of truth.  Never deleted
 # or rebuilt from memory; only mutated by lifecycle/domain persistence code.
@@ -211,6 +211,7 @@ _SCHEMA_DDL: list[str] = [
         parent_position_id TEXT,
         position_generation INTEGER,
         original_order_id TEXT,
+        reversal_parent_signal_id TEXT,
         trigger_state TEXT,
         trigger_generation INTEGER,
         trigger_source TEXT,
@@ -479,6 +480,44 @@ _SCHEMA_DDL: list[str] = [
         updated_at TEXT DEFAULT (datetime('now'))
     )
     """,
+    # Canonical reversal lifecycle: this is operational state, not a rebuildable
+    # analytics projection. Create it before column migrations run.
+    """
+    CREATE TABLE IF NOT EXISTS reversals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reversal_id TEXT UNIQUE NOT NULL,
+        signal_id TEXT UNIQUE,
+        strategy_id TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        old_trade_id TEXT,
+        old_position_id TEXT,
+        old_exit_order_id TEXT,
+        old_broker_order_id TEXT,
+        old_sl_order_id TEXT,
+        old_sl_state TEXT,
+        new_trade_id TEXT,
+        new_position_id TEXT,
+        new_entry_order_id TEXT,
+        new_broker_order_id TEXT,
+        new_sl_order_id TEXT,
+        new_sl_state TEXT,
+        reversal_trigger_price REAL,
+        old_exit_fill_price REAL,
+        new_entry_fill_price REAL,
+        old_exit_filled_quantity INTEGER,
+        new_entry_filled_quantity INTEGER,
+        old_exit_broker_status TEXT,
+        new_entry_broker_status TEXT,
+        fallback_used INTEGER DEFAULT 0,
+        fallback_status TEXT,
+        exit_verified_at TEXT,
+        entry_fill_confirmed_at TEXT,
+        status TEXT,
+        failure_reason TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+    )
+    """,
 ]
 # ── DERIVED tables (rebuildable read-model inside the SAME database) ──
 _DERIVED_DDL: list[str] = [
@@ -618,50 +657,6 @@ _DERIVED_DDL: list[str] = [
         trade_count INTEGER DEFAULT 0,
         net_pnl REAL,
         timestamp REAL
-    )
-    """,
-    # ── canonical: reversal lifecycle records (spec — SAME trigger, TWO
-    #    separate orders, EXIT FIRST, ENTRY SECOND).  One row per reversal:
-    #    the old-position exit (REVERSAL_EXIT on the OLD trade/position) and
-    #    the new opposite entry (REVERSAL_ENTRY on a NEW trade/position) share
-    #    one SIG-X signal id (the ``signal_id`` column, unique per reversal)
-    #    and one reversal trigger price.  Every broker-visible step is stored
-    #    so the dashboard chain is never shown COMPLETE until the old position
-    #    is provably flat AND the new entry fill is broker-confirmed AND the
-    #    new protective SL is on the broker.
-    """
-    CREATE TABLE IF NOT EXISTS reversals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        reversal_id TEXT UNIQUE NOT NULL,
-        signal_id TEXT UNIQUE,
-        strategy_id TEXT NOT NULL,
-        instrument TEXT NOT NULL,
-        old_trade_id TEXT,
-        old_position_id TEXT,
-        old_exit_order_id TEXT,
-        old_broker_order_id TEXT,
-        old_sl_order_id TEXT,
-        old_sl_state TEXT,
-        new_trade_id TEXT,
-        new_position_id TEXT,
-        new_entry_order_id TEXT,
-        new_broker_order_id TEXT,
-        new_sl_order_id TEXT,
-        new_sl_state TEXT,
-        reversal_trigger_price REAL,
-        old_exit_fill_price REAL,
-        new_entry_fill_price REAL,
-        old_exit_filled_quantity INTEGER,
-        new_entry_filled_quantity INTEGER,
-        old_exit_broker_status TEXT,
-        new_entry_broker_status TEXT,
-        fallback_used INTEGER DEFAULT 0,
-        fallback_status TEXT,
-        exit_verified_at TEXT,
-        entry_fill_confirmed_at TEXT,
-        status TEXT,
-        created_at TEXT DEFAULT (datetime('now')),
-        updated_at TEXT DEFAULT (datetime('now'))
     )
     """,
 ]
@@ -811,6 +806,8 @@ _ALTER_MIGRATIONS: list[tuple[str, str, str]] = [
     ("orders", "parent_position_id", "TEXT"),
     ("orders", "position_generation", "INTEGER"),
     ("orders", "original_order_id", "TEXT"),
+    ("orders", "reversal_parent_signal_id", "TEXT"),
+    ("reversals", "failure_reason", "TEXT"),
     ("orders", "trigger_state", "TEXT"),
     ("orders", "trigger_generation", "INTEGER"),
     ("orders", "trigger_source", "TEXT"),

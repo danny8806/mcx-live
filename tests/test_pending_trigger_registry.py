@@ -400,6 +400,51 @@ def test_startup_restore_rebuilds_both_reversal_triggers():
     assert env.pending_triggers.exit_for("gold_02") is strategy.pending_exit_trigger
 
 
+def test_startup_does_not_rearm_reversal_exit_already_in_flight():
+    from types import SimpleNamespace
+
+    entry_id, exit_id = "reversal-entry-inflight", "reversal-exit-inflight"
+    armed = {
+        "pending_order_id": entry_id, "signal_id": entry_id,
+        "strategy_id": "gold_02", "instrument": "GOLDM", "direction": "SHORT",
+        "trigger_price": 80.0, "quantity": 1, "status": "armed",
+        "trigger_state": "ARMED", "trigger_generation": 4,
+        "trigger_source": "market_websocket_ltp", "signal_timestamp": 10.0,
+    }
+    signals = {
+        entry_id: {
+            "signal_id": entry_id, "strategy_id": "gold_02", "instrument": "GOLDM",
+            "side": "SHORT", "trigger_price": 80.0, "stop_price": 120.0,
+            "quantity": 1, "signal_timestamp": 10.0,
+            "signal_metadata": '{"is_reversal_entry": true, '
+                '"reversal_parent_signal_id": "reversal-exit-inflight"}',
+        },
+    }
+
+    class _Persistence:
+        def get_pending_orders(self, **_kwargs):
+            return [armed]
+
+        def get_signal(self, requested_id):
+            return signals.get(requested_id)
+
+    strategy = create_gold_15m(strategy_id="gold_02", instrument="GOLDM", quantity=1)
+    strategy.position_side = "LONG"
+    exit_order = SimpleNamespace(
+        order_role="REVERSAL_EXIT", state=SimpleNamespace(value="submitted"),
+        entry_signal_id=exit_id, order_id="LIVE-EXIT", parent_position_id="POS-OLD",
+    )
+    env = Environment(name="live", mode="LIVE", is_live=True,
+                      strategies={"gold_02": strategy}, persistence=_Persistence())
+    env.execution_engine = SimpleNamespace(_orders={exit_order.order_id: exit_order})
+
+    assert PersistenceFlowMixin()._restore_live_pending_triggers(env) == 1
+    assert strategy.pending_entry.status == "waiting_for_flat"
+    assert strategy.pending_exit_trigger is None
+    assert strategy.state.value == "exit_order_submitted"
+    assert env.pending_triggers.exit_for("gold_02") is None
+
+
 def test_live_pending_order_lookup_is_memory_only_after_restore():
     signal = Signal(
         signal_type=SignalType.LONG, instrument="GOLDM", strategy_id="gold_02",

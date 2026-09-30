@@ -326,6 +326,7 @@ class LiveBrokerPoller:
                         except Exception:
                             pass
                     if role == "REVERSAL_EXIT":
+                        self._settle_reversal_terminal(order, engine_orders)
                         strat = strategies.get(order.strategy_id)
                         if strat is not None:
                             pending = getattr(strat, "pending_entry", None)
@@ -358,12 +359,14 @@ class LiveBrokerPoller:
                             if hasattr(strat, "_fired_trigger_signal_ids"):
                                 strat._fired_trigger_signal_ids.clear()
                             strat.stop_exit_submitted = False
-                if role.startswith("ENTRY") or role == "REVERSAL_ENTRY":
+                if role.startswith("ENTRY") or role in ("REVERSAL_ENTRY", "FALLBACK_MARKET"):
                     # The POST may have been accepted as PENDING and rejected
                     # only on a later broker status poll. Settle the canonical
                     # trade here too; SignalFlow's synchronous rejection path
                     # cannot handle this delayed terminal response.
                     self._settle_terminal_entry_lifecycle(order)
+                    if role in ("REVERSAL_ENTRY", "FALLBACK_MARKET"):
+                        self._settle_reversal_terminal(order, engine_orders)
                     # C5 — a terminal entry reset must fire ONCE and only for
                     # the strategy's CURRENT, pre-position entry.  Previously
                     # every terminal ENTRY order left in the book (up to 500)
@@ -425,6 +428,43 @@ class LiveBrokerPoller:
                 log.error("[LivePoller:%s] order watcher scan failed: %s",
                           self.env.name, e)
         return applied
+
+    def _settle_reversal_terminal(self, order, engine_orders=None) -> None:
+        """Persist broker-confirmed terminal reversal order outcomes."""
+        persistence = getattr(self.env, "persistence", None)
+        if persistence is None:
+            return
+        state = str(getattr(getattr(order, "state", None), "value",
+                            getattr(order, "state", ""))).lower()
+        if state not in _TERMINAL_ORDER_STATES:
+            return
+        role = str(getattr(order, "order_role", "") or "").upper()
+        status = "CANCELLED" if state in ("cancelled", "canceled", "expired") else "REJECTED"
+        if role == "REVERSAL_EXIT":
+            signal_id = (getattr(order, "entry_signal_id", None)
+                         or getattr(order, "parent_signal_id", None))
+            fields = {"old_exit_broker_status": status,
+                      "status": f"EXIT_{status}",
+                      "failure_reason": getattr(order, "reason", None) or state}
+        elif role in ("REVERSAL_ENTRY", "FALLBACK_MARKET"):
+            parent = getattr(order, "reversal_parent_signal_id", None)
+            if not parent and getattr(order, "original_order_id", None):
+                parent_order = (engine_orders or {}).get(order.original_order_id)
+                if str(getattr(parent_order, "order_role", "")).upper() == "REVERSAL_ENTRY":
+                    parent = getattr(parent_order, "reversal_parent_signal_id", None)
+            signal_id = parent or getattr(order, "entry_signal_id", None) or getattr(order, "parent_signal_id", None)
+            fields = {"new_entry_broker_status": status,
+                      "status": f"ENTRY_{status}",
+                      "failure_reason": getattr(order, "reason", None) or state}
+        else:
+            return
+        try:
+            reversal = persistence.get_reversal_by_signal_id(str(signal_id or ""))
+            if reversal:
+                persistence.update_reversal(reversal["reversal_id"], fields)
+        except Exception as exc:
+            log.error("[LivePoller:%s] reversal terminal persistence failed for %s: %s",
+                      self.env.name, getattr(order, "order_id", ""), exc)
 
     def _settle_terminal_entry_lifecycle(self, order) -> bool:
         """Settle a broker-terminal entry whose fill quantity is still zero."""

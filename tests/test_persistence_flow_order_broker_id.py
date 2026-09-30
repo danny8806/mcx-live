@@ -28,9 +28,11 @@ def test_order_persistence_includes_assigned_broker_order_id():
         original_order_id=None, trigger_state="FIRED",
         trigger_generation=None, trigger_source="operator_action",
         _broker_order_id="23826092913404",
+        reversal_parent_signal_id="REV-EXIT-1",
     )
     signal = SimpleNamespace(signal_id="SIG-EXIT", trigger_price=14897.0)
 
     _Engine()._persist_order(order, signal, "live")
 
     assert saved[0]["broker_order_id"] == "23826092913404"
+    assert saved[0]["reversal_parent_signal_id"] == "REV-EXIT-1"

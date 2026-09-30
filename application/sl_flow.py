@@ -670,13 +670,14 @@ class SLFlowMixin:
             pos.sl_state = SLState.ARMED.value
             if not pos.sl_protected_at:
                 pos.sl_protected_at = time.time()
-            try:
-                self._persist_position(pos, getattr(env, "name", None))
-            except Exception as e:
-                log.debug("[SL] arm persist skipped: %s", e)
-            self.publish_event("sl_recovered_from_broker", dict(
-                entry, execution_mode=getattr(env, "mode", None)),
-                env_name=getattr(env, "name", None))
+            if entry.get("changed", True):
+                try:
+                    self._persist_position(pos, getattr(env, "name", None))
+                except Exception as e:
+                    log.debug("[SL] arm persist skipped: %s", e)
+                self.publish_event("sl_recovered_from_broker", dict(
+                    entry, execution_mode=getattr(env, "mode", None)),
+                    env_name=getattr(env, "name", None))
             try:
                 self._close_reversal_sl_gap(env, pos)
             except Exception as e:

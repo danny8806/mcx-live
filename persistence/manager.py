@@ -235,7 +235,7 @@ class PersistenceManager:
         cursor = conn.cursor()
         # Check which columns exist on each table
         existing = {}
-        for table in ("trades", "orders", "fills"):
+        for table in ("trades", "orders", "fills", "reversals"):
             cursor.execute(f"PRAGMA table_info({table})")
             existing[table] = {row[1] for row in cursor.fetchall()}
 
@@ -250,6 +250,10 @@ class PersistenceManager:
             cursor.execute("ALTER TABLE orders ADD COLUMN entry_signal_id TEXT")
         if "trade_id" not in existing.get("orders", set()):
             cursor.execute("ALTER TABLE orders ADD COLUMN trade_id TEXT")
+        if "reversal_parent_signal_id" not in existing.get("orders", set()):
+            cursor.execute("ALTER TABLE orders ADD COLUMN reversal_parent_signal_id TEXT")
+        if "failure_reason" not in existing.get("reversals", set()):
+            cursor.execute("ALTER TABLE reversals ADD COLUMN failure_reason TEXT")
 
         # fills table
         if "entry_signal_id" not in existing.get("fills", set()):
@@ -364,8 +368,8 @@ class PersistenceManager:
                     protected_order_id, correlation_id, lifecycle_id,
                     parent_signal_id, position_id, parent_position_id,
                     position_generation, original_order_id, trigger_state,
-                    trigger_generation, trigger_source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    trigger_generation, trigger_source, reversal_parent_signal_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     state=excluded.state, filled_quantity=excluded.filled_quantity,
                     average_fill_price=excluded.average_fill_price,
@@ -394,7 +398,9 @@ class PersistenceManager:
                         original_order_id=COALESCE(excluded.original_order_id, orders.original_order_id),
                         trigger_state=COALESCE(excluded.trigger_state, orders.trigger_state),
                         trigger_generation=COALESCE(excluded.trigger_generation, orders.trigger_generation),
-                        trigger_source=COALESCE(excluded.trigger_source, orders.trigger_source)
+                        trigger_source=COALESCE(excluded.trigger_source, orders.trigger_source),
+                        reversal_parent_signal_id=COALESCE(excluded.reversal_parent_signal_id,
+                                                           orders.reversal_parent_signal_id)
                     """, (
                 order.get("order_id"),
                 order.get("strategy_id"),
@@ -428,6 +434,7 @@ class PersistenceManager:
                 order.get("trigger_state"),
                 order.get("trigger_generation"),
                 order.get("trigger_source"),
+                order.get("reversal_parent_signal_id"),
             ))
 
     def save_fill(self, fill: dict) -> None:
@@ -1264,8 +1271,8 @@ class PersistenceManager:
                     old_exit_broker_status, new_entry_broker_status,
                     fallback_used, fallback_status,
                     exit_verified_at, entry_fill_confirmed_at,
-                    status, created_at, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    status, failure_reason, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(reversal_id) DO UPDATE SET
                     signal_id=COALESCE(excluded.signal_id, signal_id),
                     strategy_id=COALESCE(excluded.strategy_id, strategy_id),
@@ -1294,6 +1301,7 @@ class PersistenceManager:
                     exit_verified_at=COALESCE(excluded.exit_verified_at, exit_verified_at),
                     entry_fill_confirmed_at=COALESCE(excluded.entry_fill_confirmed_at, entry_fill_confirmed_at),
                     status=COALESCE(excluded.status, status),
+                    failure_reason=COALESCE(excluded.failure_reason, failure_reason),
                     updated_at=?
             """, (
                 reversal.get("reversal_id"),
@@ -1324,6 +1332,7 @@ class PersistenceManager:
                 reversal.get("exit_verified_at"),
                 reversal.get("entry_fill_confirmed_at"),
                 reversal.get("status"),
+                reversal.get("failure_reason"),
                 now,
                 now,
                 now,

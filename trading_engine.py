@@ -1724,8 +1724,9 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         consistent. PAPER is the default target (legacy callers unchanged);
         the LIVE environment restores its own snapshot/state file.
         """
-        if not saved_state:
+        if not saved_state and env_name != "live":
             return
+        saved_state = saved_state or {}
         env = self._env_for(env_name)
         strategies_state = saved_state.get("strategies", {})
         for name, strat in env.strategies.items():
@@ -1738,6 +1739,68 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             if registry is not None:
                 registry.sync_strategy(strat)
         positions_state = saved_state.get("positions")
+        if not positions_state and env.mode == "LIVE":
+            persistence = getattr(env, "persistence", None)
+            get_open_positions = getattr(persistence, "get_open_positions", None)
+            if callable(get_open_positions):
+                try:
+                    durable_positions = get_open_positions()
+                    restored_open = {}
+                    for row in durable_positions or []:
+                        pid = str(row.get("position_id") or "")
+                        if not pid:
+                            continue
+                        strategy = env.strategies.get(str(row.get("strategy_id") or ""))
+                        entry_time = row.get("entry_time") or row.get("entry_timestamp") or 0.0
+                        try:
+                            entry_time = float(entry_time)
+                        except (TypeError, ValueError):
+                            try:
+                                from datetime import datetime
+                                entry_time = datetime.fromisoformat(
+                                    str(entry_time).replace("Z", "+00:00")).timestamp()
+                            except (TypeError, ValueError):
+                                entry_time = 0.0
+                        average_entry = float(row.get("average_entry_price") or 0.0)
+                        restored_open[pid] = {
+                            "position_id": pid,
+                            "strategy_id": row.get("strategy_id"),
+                            "instrument": row.get("instrument"),
+                            "side": str(row.get("side") or "LONG").upper(),
+                            "quantity": int(row.get("quantity") or 0),
+                            "average_entry": average_entry,
+                            "entry_timestamp": entry_time,
+                            "entry_fill_ids": [],
+                            "stop_price": row.get("stop_price"),
+                            "current_mark": average_entry,
+                            "realized_pnl": float(row.get("realized_pnl") or 0.0),
+                            "unrealized_pnl": 0.0,
+                            "margin": 0.0,
+                            "trade_id": row.get("trade_id"),
+                            "exit_reason": None,
+                            "exit_fills": [],
+                            "status": "open",
+                            "multiplier": float(getattr(strategy, "multiplier", 1.0) or 1.0),
+                            "entry_signal_id": row.get("entry_signal_id"),
+                            "exit_signal_id": row.get("exit_signal_id"),
+                            "sl_state": row.get("sl_state"),
+                            "sl_trigger_price": row.get("sl_trigger_price"),
+                            "sl_protected_at": row.get("sl_protected_at"),
+                            "entry_order_id": row.get("entry_order_id"),
+                            "exit_order_id": row.get("exit_order_id"),
+                            "position_generation": int(row.get("position_generation") or 0),
+                            "exit_started": bool(row.get("exit_started")),
+                            "lifecycle_id": row.get("lifecycle_id") or row.get("trade_id"),
+                        }
+                    if restored_open:
+                        positions_state = {"open_positions": restored_open,
+                                           "closed_positions": [],
+                                           "generation_counters": {}}
+                        log.warning("[Engine] restored %d LIVE open position(s) "
+                                    "from canonical DB without a JSON snapshot",
+                                    len(restored_open))
+                except Exception as e:
+                    log.error("[Engine] durable open-position recovery failed: %s", e)
         if positions_state:
             try:
                 persistence = getattr(env, "persistence", None)
@@ -1763,6 +1826,19 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                                  if p.is_open), None)
                 if open_pos is None:
                     continue
+                # The canonical open position owns current exposure after a
+                # restart. Rebind strategy memory to that exact identity so a
+                # DB-restored position cannot coexist with a flat strategy
+                # state (or a different stale snapshot position).
+                strat.position_side = "LONG" if open_pos.is_long else "SHORT"
+                strat.current_position_id = open_pos.position_id
+                strat.position_generation = open_pos.position_generation
+                strat.position_quantity = open_pos.quantity
+                strat.current_trade_id = open_pos.trade_id
+                if getattr(open_pos, "stop_price", None) is not None:
+                    strat.stop_price = open_pos.stop_price
+                strat.state = (StrategyState.LONG_POSITION if open_pos.is_long
+                               else StrategyState.SHORT_POSITION)
                 if getattr(strat, "stop_price", None) is None:
                     _rec_stop = getattr(open_pos, "stop_price", None)
                     if _rec_stop is None:
@@ -1848,6 +1924,22 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             except Exception as e:
                 log.warning("[Engine] %s live execution restore failed: %s",
                             env_name, e)
+        # The snapshot is only a cache. Recover any still-working LIVE orders
+        # that were durably written to SQLite but absent from that snapshot so
+        # the broker status map can resolve to an internal order after restart.
+        if env.mode == "LIVE" and env.persistence is not None:
+            restore_orders = getattr(
+                env.execution_engine, "restore_orders_from_persistence", None)
+            get_orders = getattr(env.persistence, "get_orders", None)
+            if callable(restore_orders) and callable(get_orders):
+                try:
+                    count = restore_orders(get_orders())
+                    if count:
+                        log.warning("[Engine] restored %d LIVE order(s) from canonical DB "
+                                    "missing in execution snapshot", count)
+                except Exception as e:
+                    log.error("[Engine] %s durable order restore failed: %s",
+                              env_name, e)
         # Per-strategy operator gates survive restart via the saved snapshot.
         gates_state = saved_state.get("strategy_gates")
         if gates_state:

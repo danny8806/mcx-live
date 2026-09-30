@@ -47,10 +47,25 @@ class LivePositionFlowMixin:
                 "old_trade_id": getattr(trade, "trade_id", None),
                 "old_position_id": getattr(position, "position_id", None),
                 "old_exit_order_id": getattr(order, "order_id", None),
+                "old_broker_order_id": getattr(order, "_broker_order_id", None),
                 "old_sl_order_id": None,
                 "old_sl_state": getattr(position, "sl_state", None),
                 "reversal_trigger_price": trigger,
-                "status": "PENDING_EXIT",
+                "old_exit_broker_status": str(getattr(
+                    getattr(order, "state", None), "value",
+                    getattr(order, "state", "submitted"))).upper(),
+                "failure_reason": (getattr(order, "reason", None)
+                                   if str(getattr(getattr(order, "state", None),
+                                                  "value", "")).lower()
+                                   in ("rejected", "cancelled", "canceled", "expired")
+                                   else None),
+                "status": ("EXIT_REJECTED" if str(getattr(
+                    getattr(order, "state", None), "value",
+                    getattr(order, "state", ""))).lower() == "rejected"
+                    else "EXIT_CANCELLED" if str(getattr(
+                    getattr(order, "state", None), "value",
+                    getattr(order, "state", ""))).lower() in
+                    ("cancelled", "canceled", "expired") else "PENDING_EXIT"),
             })
             try:
                 setattr(order, "reversal_id", reversal_id)
@@ -139,6 +154,10 @@ class LivePositionFlowMixin:
         if rev is None:
             return
         try:
+            filled_order = (env.execution_engine.get_order(fill.order_id)
+                            if getattr(env, "execution_engine", None) is not None
+                            else None)
+            is_fallback = str(getattr(filled_order, "order_role", "")).upper() == "FALLBACK_MARKET"
             # The NEW position's stop is the local position-owned monitor, so
             # "protected" is simply "this position is ARMED (or explicitly
             # unavailable) with a stop level".  There is no broker SL id.
@@ -146,7 +165,8 @@ class LivePositionFlowMixin:
             stop_price = getattr(position, "stop_price", None)
             sl_armed = (sl_state == "ARMED" and stop_price is not None
                         and float(stop_price) > 0)
-            env.persistence.update_reversal(rev["reversal_id"], {
+            fields = {
+                "new_entry_order_id": getattr(fill, "order_id", None),
                 "new_entry_fill_price": fill.price,
                 "new_entry_filled_quantity": fill.quantity,
                 "new_entry_broker_status": "FILLED",
@@ -154,7 +174,13 @@ class LivePositionFlowMixin:
                 "new_sl_state": "ARMED" if sl_armed else sl_state,
                 "entry_fill_confirmed_at": datetime.now(timezone.utc).isoformat(),
                 "status": "COMPLETE" if sl_armed else "AWAITING_LOCAL_SL",
-            })
+            }
+            broker_order_id = getattr(filled_order, "_broker_order_id", None)
+            if broker_order_id:
+                fields["new_broker_order_id"] = broker_order_id
+            if is_fallback:
+                fields.update({"fallback_used": 1, "fallback_status": "FILLED"})
+            env.persistence.update_reversal(rev["reversal_id"], fields)
         except Exception as e:
             log.warning("[Engine] reversal entry-fill stamp failed for %s: %s",
                         rev["reversal_id"], e)

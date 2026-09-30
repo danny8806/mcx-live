@@ -100,16 +100,13 @@ class LiveEngine:
         """Restore the LIVE engine from its own durable snapshot (if any).
         Returns the loaded state or None."""
         saved = self.persistence.load_state()
-        if saved:
-            try:
-                self.engine.restore(saved, env_name="live")
-            except Exception as e:  # noqa: BLE001
-                log.error("[LiveEngine] restore failed: %s", e)
-        # Even without a JSON state snapshot, pending entries survive in the
-        # canonical DB. Rebuild their in-memory hot-path triggers before the
-        # caller starts the WebSocket adapter.
-        if not saved:
-            self.engine._restore_live_pending_triggers(self.env)
+        try:
+            # An empty JSON snapshot does not mean there is no durable LIVE
+            # state. Restore canonical orders and armed triggers from SQLite
+            # before the caller starts the market WebSocket adapter.
+            self.engine.restore(saved or {}, env_name="live")
+        except Exception as e:  # noqa: BLE001
+            log.error("[LiveEngine] restore failed: %s", e)
         return saved
 
     def start(self) -> None:

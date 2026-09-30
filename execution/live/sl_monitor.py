@@ -490,11 +490,19 @@ class PositionOwnedSLMonitor:
                 lp.stop_price = float(stop)
             except Exception:
                 pass
+            position_id = str(getattr(lp, "position_id", ""))
+            before = self.snapshot(position_id)
             if self.arm(lp) == SLState.ARMED:
+                changed = (before is None or
+                           before.get("state") != SLState.ARMED.value or
+                           before.get("stop_price") != float(stop) or
+                           before.get("quantity") != int(lp.quantity) or
+                           before.get("position_generation") != int(
+                               getattr(lp, "position_generation", 0) or 0))
                 summary["armed"].append(
                     {"position_id": lp.position_id, "strategy_id": sid,
                      "instrument": instrument, "quantity": int(lp.quantity),
-                     "stop_price": float(stop)})
+                     "stop_price": float(stop), "changed": changed})
 
         for idx, p in enumerate(rows):
             if idx in consumed:
