@@ -52,7 +52,7 @@ def _adoption_runtime(tmp_path, monkeypatch, *, live_price=229107.0,
     broker.day_order_book = lambda: [{
         "broker_order_id": BROKER_ORDER, "status": "filled",
         "side": "BUY", "quantity": 1, "filled_quantity": 1,
-        "average_fill_price": 228940.0, "order_type": "LIMIT",
+        "average_fill_price": 228095.0, "order_type": "LIMIT",
         "security_id": "483080",
     }]
     broker.tradebook = lambda: [
@@ -197,6 +197,138 @@ def test_correct_imported_stop_from_exact_historical_signal_candle(
         assert position.stop_price == 228100.0
         assert order.planned_sl == 228100.0
         assert result["broker_order_sent"] is False
+        assert not broker._orders
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def _prepare_reversal_short(tmp_path, monkeypatch, *, live_price=229107.0):
+    engine, env, broker, persistence = _adoption_runtime(
+        tmp_path, monkeypatch, live_price=live_price)
+    from strategies.types import Signal, SignalType, freeze_signal_context
+
+    strategy_id = "silver_01"
+    parent_id = "REVERSAL-EXIT-1"
+    signal_id = "REVERSAL-SHORT-ENTRY-1"
+    broker_order_id = "35826093061304"
+    broker_fill_id = "240176402"
+    broker.positions = lambda: [
+        {"strategy_id": "silver_01", "instrument": "SILVERM",
+         "side": "SHORT", "quantity": 1},
+        {"strategy_id": "silver_02", "instrument": "SILVERM",
+         "side": "SHORT", "quantity": 1},
+    ]
+    broker.day_order_book = lambda: [{
+        "broker_order_id": broker_order_id, "status": "filled",
+        "side": "SELL", "quantity": 1, "filled_quantity": 1,
+        "average_fill_price": 228940.0, "order_type": "LIMIT",
+        "security_id": "483080",
+    }]
+    broker.tradebook = lambda: [
+        {"orderId": "older-buy", "securityId": "483080",
+         "transactionType": "BUY", "tradedQuantity": 1,
+         "tradedPrice": 229144.0, "exchangeTradeId": "older-fill",
+         "exchangeTime": "2026-09-30 10:15:38"},
+        {"orderId": "older-sell", "securityId": "483080",
+         "transactionType": "SELL", "tradedQuantity": 1,
+         "tradedPrice": 228208.0, "exchangeTradeId": "older-exit",
+         "exchangeTime": "2026-09-30 10:46:12"},
+        {"orderId": broker_order_id, "securityId": "483080",
+         "transactionType": "SELL", "tradedQuantity": 1,
+         "tradedPrice": 228095.0, "exchangeTradeId": broker_fill_id,
+         "exchangeTime": "2026-09-30 11:02:13"},
+    ]
+    env.broker = broker
+    env.execution_engine.broker = broker
+    signal = Signal(
+        signal_type=SignalType.SHORT, instrument="SILVERM",
+        strategy_id=strategy_id, timestamp=CANDLE_TS,
+        trigger_price=228100.0, stop_price=229140.0,
+        quantity=1, side="SHORT",
+        metadata={
+            "is_reversal": True, "is_reversal_entry": True,
+            "entry_after_confirmed_reversal_exit": True,
+            "reversal_entry_trigger_level": 228100.0,
+            "trigger_state": "FIRED", "trigger_generation": 1,
+            "trigger_source": "broker_confirmed_reversal_flat",
+            "reversal_parent_signal_id": parent_id,
+        },
+    )
+    freeze_signal_context(signal, timestamp=CANDLE_TS, open_=228374.0,
+                          high=228900.0, low=228100.0, close=228895.0)
+    engine._persist_signal(signal, "entry", env_name="live")
+    persistence.save_signal({
+        "signal_id": signal.signal_id, "strategy_id": strategy_id,
+        "instrument": "SILVERM", "side": "SHORT", "signal_type": "entry",
+        "timestamp": CANDLE_TS, "trigger_price": 228100.0,
+        "stop_price": 229140.0, "quantity": 1,
+        "candle_timestamp": CANDLE_TS,
+        "signal_metadata": signal.metadata,
+    })
+    runtime = env.runtimes.require(strategy_id)
+    trade = runtime.lifecycle.create_trade_from_signal(
+        signal, strategy_id, strategy_id, "SILVERM", 1, 5.0)
+    # Simulate a restored pending DB row whose legacy signal fields hydrated
+    # blank; adoption must recover them only from this exact durable signal.
+    trade.entry_side = ""
+    trade.entry_trigger_price = 0.0
+    runtime.lifecycle.persist_trade(trade)
+    persistence.save_signal({
+        "signal_id": parent_id, "strategy_id": strategy_id,
+        "instrument": "SILVERM", "side": "SHORT", "signal_type": "exit",
+        "timestamp": CANDLE_TS, "trigger_price": 228100.0,
+        "stop_price": 229305.0, "quantity": 1,
+        "signal_metadata": {"exit": True, "is_reversal": True},
+    })
+    persistence.save_reversal({
+        "reversal_id": "RV-TEST-SHORT", "signal_id": parent_id,
+        "strategy_id": strategy_id, "instrument": "SILVERM",
+        "side": "SHORT",
+        "old_trade_id": "OLD-TRADE", "old_position_id": "OLD-POSITION",
+        "old_exit_order_id": "OLD-EXIT", "old_exit_broker_status": "FILLED",
+        "reversal_trigger_price": 228100.0,
+        "exit_verified_at": "2026-09-30T05:32:00+00:00",
+        "status": "EXIT_FILLED",
+    })
+    return engine, env, broker, persistence, signal, trade, broker_order_id
+
+
+def test_imports_manual_short_into_pending_reversal_and_arms_local_sl(
+        tmp_path, monkeypatch):
+    engine, env, broker, persistence, signal, trade, broker_order_id = (
+        _prepare_reversal_short(tmp_path, monkeypatch))
+    try:
+        result = live_api._adopt_filled_reversal_short({
+            "strategy_id": "silver_01", "broker_order_id": broker_order_id,
+            "signal_id": signal.signal_id,
+        })
+        assert result["adopted"] is True
+        assert result["broker_order_sent"] is False
+        assert result["position"]["side"] == "SHORT"
+        assert result["position"]["quantity"] == 1
+        assert result["stop_price"] == 229140.0
+        assert result["position"]["sl_state"] == "ARMED"
+        assert persistence.get_reversal_by_signal_id("REVERSAL-EXIT-1")["status"] == "COMPLETE"
+        assert persistence.fill_by_broker_fill_id("240176402")
+        assert not broker._orders
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_manual_short_adoption_refuses_when_short_stop_is_already_crossed(
+        tmp_path, monkeypatch):
+    engine, env, broker, persistence, signal, _trade, broker_order_id = (
+        _prepare_reversal_short(tmp_path, monkeypatch, live_price=229200.0))
+    try:
+        with pytest.raises(HTTPException) as exc:
+            live_api._adopt_filled_reversal_short({
+                "strategy_id": "silver_01", "broker_order_id": broker_order_id,
+                "signal_id": signal.signal_id,
+            })
+        assert exc.value.status_code == 409
+        assert not env.runtimes.require("silver_01").position_manager.open_positions
         assert not broker._orders
     finally:
         engine.stop()

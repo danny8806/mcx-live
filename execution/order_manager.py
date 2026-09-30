@@ -5,6 +5,7 @@ import threading
 from typing import Any, Optional
 
 from execution.models import Order, OrderState, Fill
+from strategies.types import resolve_order_role
 
 
 class OrderManager:
@@ -53,7 +54,11 @@ class OrderManager:
         collect = []
         with self._lock:
             # Check for duplicate signals
-            key = f"{signal.strategy_id}:{signal.instrument}:{signal.timestamp}"
+            # EXIT and its paired REVERSAL_ENTRY intentionally share the
+            # signal candle timestamp.  Deduplicate each canonical order role
+            # separately: same-role repeats remain blocked, while the paired
+            # exit/entry legs can both reach their normal lifecycle.
+            key = self._signal_key(signal)
             if key in self._pending_signals:
                 return None
             self._pending_signals[key] = signal
@@ -127,8 +132,14 @@ class OrderManager:
         deduplicated.
         """
         with self._lock:
-            key = f"{signal.strategy_id}:{signal.instrument}:{signal.timestamp}"
+            key = self._signal_key(signal)
             self._pending_signals.pop(key, None)
+
+    @staticmethod
+    def _signal_key(signal: Any) -> str:
+        role = resolve_order_role(signal)
+        return (f"{signal.strategy_id}:{signal.instrument}:"
+                f"{signal.timestamp}:{role}")
 
     def get_order(self, order_id: str) -> Optional[Order]:
         """Get order by ID."""

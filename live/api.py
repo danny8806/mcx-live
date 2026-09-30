@@ -563,6 +563,306 @@ def _adopt_broker_position(body: dict) -> dict:
         _broker_position_adoption_lock.release()
 
 
+def _adopt_filled_reversal_short(body: dict) -> dict:
+    """Book an exact, already-filled manual SHORT onto its fired reversal.
+
+    This is deliberately narrower than general position adoption: it only
+    accepts the exact pending reversal signal whose old exit is broker-filled,
+    verifies the matching new SELL fill and current broker net, then routes
+    that existing fill through the ordinary FillFlow so its local SL is armed.
+    It never sends or changes a broker order.
+    """
+    from zoneinfo import ZoneInfo
+    from execution.models import Fill, Order, OrderState
+    from strategies.intent import entry_levels
+    from strategies.types import Signal, SignalType, freeze_signal_context
+
+    if not _engine or not _persistence:
+        raise HTTPException(status_code=503, detail="live engine unavailable")
+    if not _broker_position_adoption_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="position adoption already running")
+    try:
+        strategy_id = str(body.get("strategy_id") or "")
+        broker_order_id = str(body.get("broker_order_id") or "")
+        signal_id = str(body.get("signal_id") or "")
+        if not all((strategy_id, broker_order_id, signal_id)):
+            raise HTTPException(status_code=422,
+                                detail="strategy_id, broker_order_id, and signal_id are required")
+        env = _engine.live
+        strategy_cfg = (_engine.config.get("strategies", {}) or {}).get(strategy_id)
+        strategy = (getattr(env, "strategies", {}) or {}).get(strategy_id)
+        runtime = env.runtimes.require(strategy_id)
+        if (not strategy_cfg or not strategy or strategy_cfg.get("instrument") != "SILVERM"
+                or not bool(strategy_cfg.get("enabled"))
+                or str(strategy_cfg.get("fast_timeframe", "")).lower() != "15m"
+                or int(strategy_cfg.get("quantity", 0)) != 1):
+            raise HTTPException(status_code=409,
+                                detail="selected strategy is not an enabled SILVERM 15m quantity-1 strategy")
+
+        # Resolve the exact durable signal/trade/reversal triplet. A free-form
+        # stop or an unrelated manually placed position is never adopted here.
+        saved_signal = _persistence.get_signal(signal_id)
+        if not saved_signal or saved_signal.get("strategy_id") != strategy_id:
+            raise HTTPException(status_code=409, detail="durable reversal entry signal was not found")
+        metadata = json.loads(saved_signal.get("signal_metadata") or "{}")
+        parent_signal_id = str(metadata.get("reversal_parent_signal_id") or "")
+        if (saved_signal.get("instrument") != "SILVERM"
+                or not metadata.get("is_reversal_entry")
+                or not metadata.get("entry_after_confirmed_reversal_exit")
+                or not parent_signal_id):
+            raise HTTPException(status_code=409,
+                                detail="signal is not the exact fired SHORT reversal entry")
+        reversal = _persistence.get_reversal_by_signal_id(parent_signal_id)
+        parent_signal = _persistence.get_signal(parent_signal_id)
+        if (not reversal or reversal.get("strategy_id") != strategy_id
+                or reversal.get("instrument") != "SILVERM"
+                or not parent_signal
+                or str(parent_signal.get("side", "")).upper() != "SHORT"
+                or (saved_signal.get("side")
+                    and str(saved_signal.get("side")).upper() != "SHORT")
+                or str(reversal.get("status", "")).upper() != "EXIT_FILLED"
+                or str(reversal.get("old_exit_broker_status", "")).upper() != "FILLED"
+                or reversal.get("new_entry_order_id")):
+            raise HTTPException(status_code=409,
+                                detail="paired reversal is not awaiting its first entry fill")
+        trade = runtime.lifecycle.resolve_trade_from_signal(signal_id)
+        trade_status = str(getattr(getattr(trade, "status", None), "value",
+                                    getattr(trade, "status", ""))).upper()
+        if (trade is None or trade.strategy_id != strategy_id
+                or trade.instrument != "SILVERM"
+                or str(getattr(trade, "entry_signal_id", "")) != signal_id
+                or str(getattr(trade, "entry_side", "") or "").upper() not in ("", "SHORT")
+                or trade_status not in ("PENDING", "OPEN")):
+            raise HTTPException(status_code=409,
+                                detail="existing pending reversal trade is missing or settled")
+        if int(saved_signal.get("quantity") or 0) != 1 or int(trade.quantity) != 1:
+            raise HTTPException(status_code=409, detail="reversal quantity is not exactly one")
+
+        # Dhan must prove this exact SELL was fully filled and is still the
+        # current instrument net. The duplicate strategy-labelled net rows
+        # returned by Dhan are collapsed before comparison.
+        broker = env.broker
+        day_orders_fn, tradebook_fn = getattr(broker, "day_order_book", None), getattr(broker, "tradebook", None)
+        if not callable(day_orders_fn) or not callable(tradebook_fn):
+            raise HTTPException(status_code=503, detail="Dhan orderbook/tradebook unavailable")
+        day_orders = day_orders_fn() or []
+        broker_order = next((o for o in day_orders
+                             if str(o.get("broker_order_id") or "") == broker_order_id), None)
+        if (not broker_order or str(broker_order.get("status", "")).lower() != "filled"
+                or str(broker_order.get("side", "")).upper() != "SELL"
+                or int(broker_order.get("quantity") or 0) != 1
+                or int(broker_order.get("filled_quantity") or 0) != 1
+                or str(broker_order.get("security_id") or "") != "483080"):
+            raise HTTPException(status_code=409,
+                                detail="Dhan order is not the exact filled SILVERM SELL quantity 1")
+        trades = tradebook_fn() or []
+        order_trades = [t for t in trades
+                        if str(t.get("orderId") or t.get("order_id") or "") == broker_order_id
+                        and str(t.get("securityId") or t.get("security_id") or "") == "483080"]
+        if len(order_trades) != 1:
+            raise HTTPException(status_code=409,
+                                detail="expected one exact Dhan exchange fill for the manual SELL")
+        broker_trade = order_trades[0]
+        broker_fill_id = str(broker_trade.get("exchangeTradeId")
+                             or broker_trade.get("tradeId") or "")
+        fill_price = float(broker_trade.get("tradedPrice") or 0.0)
+        fill_qty = int(broker_trade.get("tradedQuantity") or 0)
+        if (not broker_fill_id or fill_price <= 0 or fill_qty != 1
+                or str(broker_trade.get("transactionType") or "").upper() != "SELL"):
+            raise HTTPException(status_code=409, detail="Dhan SELL fill identity is invalid")
+        reversal_entry_trigger = float(
+            metadata.get("reversal_entry_trigger_level")
+            or saved_signal.get("trigger_price") or 0)
+        if reversal_entry_trigger <= 0 or fill_price > reversal_entry_trigger:
+            raise HTTPException(status_code=409,
+                                detail="manual SELL fill does not confirm beyond the fired SHORT trigger")
+        if _persistence.fill_by_broker_fill_id(broker_fill_id):
+            raise HTTPException(status_code=409, detail="manual SELL fill is already in local ledger")
+        broker_rows = broker.positions() or []
+        nets = {(str(r.get("side") or "").upper(), abs(int(r.get("quantity") or 0)))
+                for r in broker_rows if r.get("instrument") == "SILVERM"
+                and int(r.get("quantity") or 0) != 0}
+        if nets != {("SHORT", 1)}:
+            raise HTTPException(status_code=409,
+                                detail=f"current Dhan SILVERM net is not exactly SHORT 1: {sorted(nets)}")
+        silver_trades = [t for t in trades
+                         if str(t.get("securityId") or t.get("security_id") or "") == "483080"]
+        latest = max(silver_trades,
+                     key=lambda t: str(t.get("exchangeTime") or t.get("createTime") or ""),
+                     default=None)
+        if not latest or str(latest.get("orderId") or latest.get("order_id") or "") != broker_order_id:
+            raise HTTPException(status_code=409,
+                                detail="a later SILVERM tradebook fill superseded this manual SELL")
+        signed_net = sum(
+            (-1 if str(t.get("transactionType") or "").upper() == "SELL" else 1)
+            * int(t.get("tradedQuantity") or 0) for t in silver_trades)
+        if signed_net != -1:
+            raise HTTPException(status_code=409,
+                                detail=f"Dhan SILVERM tradebook net is not SHORT 1: {signed_net}")
+
+        # Attribute the manual fill only to the existing reversal after the
+        # old exit confirmation and within its immediate follow-up window.
+        try:
+            fill_time = datetime.strptime(
+                str(broker_trade.get("exchangeTime") or broker_trade.get("createTime") or ""),
+                "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("Asia/Kolkata")).timestamp()
+            exit_verified = datetime.fromisoformat(
+                str(reversal.get("exit_verified_at")).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=409, detail="Dhan fill/reversal timestamps cannot be verified")
+        if not (exit_verified <= fill_time <= exit_verified + 900):
+            raise HTTPException(status_code=409,
+                                detail="manual SELL is outside the paired reversal follow-up window")
+
+        candle_ts = float(saved_signal.get("candle_timestamp") or 0)
+        candle_state = env.data_adapter.fetch_candle_state("SILVERM", "15") or {}
+        closed = candle_state.get("closed") or []
+        candle = next((c for c in closed if float(c[0]) == candle_ts), None)
+        idx = closed.index(candle) if candle is not None else -1
+        if candle is None or idx == 0:
+            history_fn = getattr(env.data_adapter, "fetch_historical_candles", None)
+            if callable(history_fn):
+                try:
+                    signal_day = datetime.fromtimestamp(
+                        candle_ts, timezone.utc).date()
+                    today = datetime.now(timezone.utc).date()
+                    history = history_fn("SILVERM", "15", signal_day, today) or []
+                    by_start = {float(c[0]): c for c in [*closed, *history]}
+                    closed = sorted(by_start.values(), key=lambda c: float(c[0]))
+                    candle = next((c for c in closed if float(c[0]) == candle_ts), None)
+                    idx = closed.index(candle) if candle is not None else -1
+                except Exception as exc:
+                    raise HTTPException(status_code=503,
+                                        detail=f"historical reversal candle fetch failed: {exc}")
+        if candle is None:
+            raise HTTPException(status_code=409,
+                                detail="the reversal signal candle is unavailable from Dhan REST history")
+        if idx == 0:
+            raise HTTPException(status_code=409,
+                                detail="prior candle is unavailable to verify the reversal stop")
+        o, high, low, close = map(float, candle[1:5])
+        prev = closed[idx - 1]
+        trigger, stop = entry_levels("SHORT", high, low,
+                                     float(prev[2]), float(prev[3]))
+        stored_stop = float(saved_signal.get("stop_price")
+                            or getattr(trade, "stop_loss_price", 0) or 0)
+        if stop != stored_stop or stop <= fill_price:
+            raise HTTPException(status_code=409,
+                                detail=f"stored reversal stop {stored_stop} does not match candle stop {stop}")
+        # Some restored PENDING TradeContext rows predate full signal-field
+        # hydration. Reconstitute only blank fields from the exact persisted
+        # signal before booking its broker-confirmed fill.
+        trade.entry_side = "SHORT"
+        trade.entry_trigger_price = float(saved_signal.get("trigger_price") or trigger)
+        trade.stop_loss_price = stop
+        trade.quantity = 1
+        trade.multiplier = float(_engine.config.instrument("SILVERM").get("multiplier", 1.0))
+        trade.signal_candle_open = o
+        trade.signal_candle_high = high
+        trade.signal_candle_low = low
+        trade.signal_candle_close = close
+        trade.signal_htf_value = float(saved_signal.get("htf_value") or 0.0)
+        trade.signal_mid_value = float(saved_signal.get("mid_value") or 0.0)
+        trade.signal_fast_dema = float(saved_signal.get("fast_dema") or 0.0)
+        trade.signal_fast_atr = float(saved_signal.get("fast_atr") or 0.0)
+        if not runtime.lifecycle.persist_trade(trade):
+            raise HTTPException(status_code=500,
+                                detail="could not restore pending reversal trade context")
+        ltp = float((candle_state.get("forming") or [0, 0, 0, 0, 0])[4] or 0)
+        if ltp <= 0:
+            raise HTTPException(status_code=503, detail="live SILVERM price unavailable")
+        if ltp >= stop:
+            raise HTTPException(status_code=409,
+                                detail="SHORT stop is already crossed; refusing to mark it safely armed")
+        for rt in env.runtimes.all():
+            if any(p.instrument == "SILVERM" and p.is_open
+                   for p in rt.position_manager.get_positions_by_strategy(rt.strategy_id)):
+                raise HTTPException(status_code=409,
+                                    detail="a local SILVERM position already exists")
+
+        signal = Signal(
+            signal_type=SignalType.SHORT, instrument="SILVERM",
+            strategy_id=strategy_id, timestamp=candle_ts,
+            trigger_price=float(saved_signal.get("trigger_price") or trigger),
+            stop_price=stop, quantity=1, side="SHORT", metadata=metadata,
+        )
+        signal.signal_id = signal_id
+        signal.lifecycle_id = trade.trade_id
+        signal.metadata = dict(metadata)
+        signal.position_generation = runtime.position_manager.allocate_generation(
+            strategy_id, "SILVERM")
+        freeze_signal_context(signal, timestamp=candle_ts, open_=o,
+                              high=high, low=low, close=close)
+
+        local_order_id = f"IMPORT-{broker_order_id}"
+        for existing in (getattr(env.execution_engine, "_orders", {}) or {}).values():
+            if str(getattr(existing, "_broker_order_id", "")) == broker_order_id:
+                raise HTTPException(status_code=409,
+                                    detail="Dhan order already has a local execution record")
+        order = Order(
+            order_id=local_order_id, strategy_id=strategy_id,
+            instrument="SILVERM", side="SELL", quantity=1,
+            order_type=str(broker_order.get("order_type") or "LIMIT").upper(),
+            price=fill_price, planned_entry_price=float(saved_signal.get("trigger_price") or trigger),
+            planned_sl=stop, planned_order_type="EXTERNAL_DHAN_FILL",
+            order_role="REVERSAL_ENTRY", state=OrderState.FILLED,
+            filled_quantity=1, average_fill_price=fill_price,
+            created_at=fill_time, updated_at=fill_time,
+            reason="operator_imported_existing_reversal_sell",
+            multiplier=float(_engine.config.instrument("SILVERM").get("multiplier", 1.0)),
+            entry_signal_id=signal_id, trade_id=trade.trade_id,
+            lifecycle_id=trade.trade_id, parent_signal_id=signal_id,
+            position_generation=signal.position_generation,
+            reversal_parent_signal_id=parent_signal_id,
+            trigger_state="FIRED", trigger_generation=metadata.get("trigger_generation"),
+            trigger_source="broker_confirmed_reversal_flat",
+        )
+        order._broker_order_id = broker_order_id
+        order.correlation_id = None
+        if not runtime.lifecycle.register_order(trade.trade_id, local_order_id,
+                                                role="REVERSAL_ENTRY"):
+            raise HTTPException(status_code=409, detail="lifecycle rejected the imported reversal order")
+        with env.execution_engine._lock:
+            if local_order_id in env.execution_engine._orders:
+                raise HTTPException(status_code=409, detail="imported order id already exists")
+            env.execution_engine._orders[local_order_id] = order
+        _engine._persist_order(order, signal, env_name="live")
+        _engine._update_reversal_entry_created(env, parent_signal_id, trade, order)
+
+        fill = Fill(
+            fill_id=f"DHAN-{broker_fill_id}", order_id=local_order_id,
+            instrument="SILVERM", side="SELL", quantity=1,
+            price=fill_price, timestamp=fill_time, strategy_id=strategy_id,
+            multiplier=order.multiplier, entry_signal_id=signal_id,
+            trade_id=trade.trade_id, lifecycle_id=trade.trade_id,
+            position_generation=order.position_generation,
+        )
+        fill.broker_order_id = broker_order_id
+        fill.broker_fill_id = broker_fill_id
+        fill.broker_trade_id = broker_fill_id
+        fill.cumulative_filled_quantity = 1
+        _engine._handle_fill(fill, signal_id, env_name="live")
+        position = next((p for p in runtime.position_manager.get_positions_by_strategy(
+            strategy_id) if p.instrument == "SILVERM" and p.is_open), None)
+        if position is None or str(position.sl_state).upper() != "ARMED":
+            raise HTTPException(status_code=500,
+                                detail="manual fill booked but local SHORT stop did not arm")
+        order.position_id = position.position_id
+        order.parent_position_id = position.position_id
+        order.position_generation = position.position_generation
+        _engine._persist_order(order, signal, env_name="live")
+        _persistence.save_state(_engine.snapshot("live"))
+        return {
+            "adopted": True, "broker_order_sent": False,
+            "broker_order_id": broker_order_id, "broker_fill_id": broker_fill_id,
+            "signal_id": signal_id, "reversal_parent_signal_id": parent_signal_id,
+            "position": position.snapshot(), "stop_price": stop,
+            "monitor": "local_position_owned_sl_armed",
+        }
+    finally:
+        _broker_position_adoption_lock.release()
+
+
 def _correct_imported_position_stop(body: dict) -> dict:
     """Recompute one imported open position's local stop from exact Dhan bars.
 
@@ -761,6 +1061,8 @@ def create_live_app(live_engine=None) -> FastAPI:
             raise HTTPException(status_code=403, detail="loopback caller required")
         if not peer.is_loopback:
             raise HTTPException(status_code=403, detail="loopback caller required")
+        if str(body.get("side", "")).upper() == "SHORT":
+            return await asyncio.to_thread(_adopt_filled_reversal_short, body)
         return await asyncio.to_thread(_adopt_broker_position, body)
 
     @app.post("/api/live/reconcile/correct-imported-position-stop")
