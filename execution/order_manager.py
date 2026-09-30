@@ -27,6 +27,11 @@ class OrderManager:
         self.execution_engine = execution_engine
 
         self._pending_signals: dict[str, Any] = {}
+        # Keep the order paired with each dedup key.  Signal candle timestamps
+        # are strategy time, not an order TTL: a reversal may wait a long time
+        # for its trigger, and a submitted Dhan order must remain deduplicated
+        # until that broker order reaches a terminal state.
+        self._pending_signal_orders: dict[str, Order] = {}
         self._active_orders: dict[str, Order] = {}
         self._fills_to_notify: list[Fill] = []
         self._lock = threading.Lock()
@@ -53,6 +58,25 @@ class OrderManager:
             raise ValueError("trade_id is required to submit a signal")
         collect = []
         with self._lock:
+            # Retire old keys only after their corresponding order is known to
+            # be terminal.  Never use the candle timestamp alone to release a
+            # key: delayed reversal triggers and broker acknowledgements can
+            # legitimately outlive one hour.
+            import time
+            now = time.time()
+            terminal_states = {
+                OrderState.FILLED, OrderState.REJECTED, OrderState.CANCELED,
+            }
+            stale_keys = [
+                k for k, v in self._pending_signals.items()
+                if hasattr(v, "timestamp") and now - v.timestamp > 3600
+                and self._pending_signal_orders.get(k) is not None
+                and self._pending_signal_orders[k].state in terminal_states
+            ]
+            for stale_key in stale_keys:
+                self._pending_signals.pop(stale_key, None)
+                self._pending_signal_orders.pop(stale_key, None)
+
             # Check for duplicate signals
             # EXIT and its paired REVERSAL_ENTRY intentionally share the
             # signal candle timestamp.  Deduplicate each canonical order role
@@ -63,18 +87,11 @@ class OrderManager:
                 return None
             self._pending_signals[key] = signal
 
-            # Cleanup old pending signals (> 1 hour old) to prevent memory leak
-            import time
-            now = time.time()
-            stale_keys = [k for k, v in self._pending_signals.items()
-                          if hasattr(v, 'timestamp') and now - v.timestamp > 3600]
-            for k in stale_keys:
-                del self._pending_signals[k]
-
             # Create order
             order = self.execution_engine.create_order(
                 signal, multiplier=multiplier, trade_id=trade_id, side=side
             )
+            self._pending_signal_orders[key] = order
             self._active_orders[order.order_id] = order
 
             # Execute
@@ -91,6 +108,7 @@ class OrderManager:
             elif order.state == OrderState.REJECTED:
                 # Order rejected — clean up memory
                 self._pending_signals.pop(key, None)
+                self._pending_signal_orders.pop(key, None)
                 self._active_orders.pop(order.order_id, None)
                 return None
 
@@ -98,6 +116,7 @@ class OrderManager:
             # avoid unbounded memory growth over a long session.
             if order.state in (OrderState.FILLED, OrderState.CANCELED):
                 self._pending_signals.pop(key, None)
+                self._pending_signal_orders.pop(key, None)
                 self._active_orders.pop(order.order_id, None)
 
             # Append (never overwrite): a caller that submits two signals
@@ -134,6 +153,7 @@ class OrderManager:
         with self._lock:
             key = self._signal_key(signal)
             self._pending_signals.pop(key, None)
+            self._pending_signal_orders.pop(key, None)
 
     @staticmethod
     def _signal_key(signal: Any) -> str:

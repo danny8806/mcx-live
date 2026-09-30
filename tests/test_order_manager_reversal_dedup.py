@@ -71,3 +71,15 @@ def test_remove_pending_uses_same_role_aware_dedup_key():
     # Clearing the EXIT cannot accidentally clear or collide with the new
     # REVERSAL_ENTRY, even though both legs use the same candle timestamp.
     assert manager.submit_signal(_signal(), trade_id="new-trade") is not None
+
+
+def test_old_reversal_signal_stays_deduplicated_while_broker_order_is_pending():
+    manager = OrderManager(_Execution())
+    signal = _signal()
+
+    order = manager.submit_signal(signal, trade_id="new-trade")
+    assert order is not None and order.state == OrderState.SUBMITTED
+
+    # The fixture candle is intentionally older than the old one-hour cleanup
+    # threshold. Age must not release a live broker order's dedup key.
+    assert manager.submit_signal(_signal(), trade_id="duplicate-trade") is None
