@@ -454,11 +454,80 @@ def test_fresh_runtime_sl_exit_limit_fallback_closes_only_after_broker_fill(tmp_
 
         watcher.register_from_order(market_exit)
         assert broker.ack_order(market_exit._broker_order_id, price=97.0)
+        # Dhan can report flat as soon as this MARKET fill happens, a few
+        # milliseconds before the order watcher routes its fill. Reconciliation
+        # must retain the position because the cancelled LIMIT's owned child is
+        # already FILLED.
+        sync = engine.sync_sl_from_broker(env_name="live")
+        assert sync["status"] == "reconciled"
+        assert env.position_manager.open_positions[0].position_id == old_sl_id
+        assert env.position_manager.open_positions[0].sl_state == "EXITING"
         summary = watcher.verify_order(market_exit.order_id, force=True)
         assert summary["fills_applied"] == 1
         assert market_exit.state == OrderState.FILLED
         assert not env.position_manager.open_positions
         assert old_sl_id not in env.sl_monitor.armed_ids()
+        trade = env.runtimes.require("gold_02").lifecycle.get_trade(
+            position.trade_id)
+        assert str(trade.status).upper() in ("CLOSED", "COMPLETED")
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_fresh_runtime_stale_sl_fallback_fill_recovers_exact_open_trade(tmp_path):
+    """Recover the exact SL fallback if flat reconciliation already dropped it."""
+    broker = _FundedStubBroker(defer_fills=True)
+    engine, env, broker, persistence = _runtime(tmp_path, broker=broker)
+    strategy = env.strategies["gold_02"]
+    watcher = _watcher(engine, env, broker)
+    try:
+        signal = _long_candle_signal(engine, env, broker, strategy)
+        entry = _fire_and_submit(engine, env, broker, strategy, signal)
+        watcher.register_from_order(entry)
+        assert broker.ack_order(entry._broker_order_id, price=103.0)
+        assert watcher.verify_order(entry.order_id, force=True)["fills_applied"] == 1
+        position = env.position_manager.open_positions[0]
+        engine._evaluate_position_sl(env, position, position.stop_price - 1, "live")
+        exit_limit = position and env.execution_engine.get_order(
+            position.exit_order_id)
+        rec = watcher.register_from_order(exit_limit)
+        rec.current_market_price = position.stop_price - 1
+        fallback_result = watcher._do_market_fallback(rec, time.time())
+        assert fallback_result["ok"] is True
+        market_exit = env.execution_engine.get_order(
+            fallback_result["market_order_id"])
+        watcher.register_from_order(market_exit)
+        assert broker.ack_order(market_exit._broker_order_id, price=97.0)
+
+        # Simulate the precise production race: local broker-position sync has
+        # removed the memory owner, while durable trade/position rows remain
+        # open and the exact fallback fill is now available from Dhan.
+        env.position_manager.abandon_stale_position(position.position_id)
+        assert not env.position_manager.open_positions
+        summary = watcher.verify_order(market_exit.order_id, force=True)
+        assert summary["fills_applied"] == 1
+        assert not env.position_manager.open_positions
+        trade = env.runtimes.require("gold_02").lifecycle.get_trade(
+            position.trade_id)
+        assert str(trade.status).upper() in ("CLOSED", "COMPLETED")
+        assert not persistence.get_open_positions("gold_02")
+        durable_trade = next(t for t in persistence.get_trades("gold_02")
+                             if t.get("trade_id") == position.trade_id)
+        assert str(durable_trade.get("status", "")).upper() in (
+            "CLOSED", "COMPLETED")
+        exit_fill_count = len([row for row in persistence.get_fills()
+                               if row.get("order_id") == market_exit.order_id])
+        engine._handle_fill(
+            env.execution_engine.get_fills(
+                strategy_id="gold_02", instrument="GOLDM")[-1],
+            None, is_exit=True, env_name="live")
+        assert len([row for row in persistence.get_fills()
+                    if row.get("order_id") == market_exit.order_id]) == exit_fill_count == 1
+        quarantines = persistence.get_quarantine_records(limit=200)
+        assert not any("stale_lifecycle_fill_rejected" in str(q.get("reason", ""))
+                       or "stale_lifecycle_fill_rejected"
+                       in str(q.get("payload", "")) for q in quarantines)
     finally:
         engine.stop()
         persistence.close()

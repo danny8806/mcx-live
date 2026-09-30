@@ -575,15 +575,45 @@ class SLFlowMixin:
                 if not broker_flat_or_conflicting:
                     continue
                 oid = getattr(lp, "exit_order_id", None)
-                order = execution.get_order(oid) if oid else None
-                role = str(getattr(order, "order_role", "") or "").upper()
-                state_obj = getattr(order, "state", "") if order is not None else ""
-                state = str(getattr(state_obj, "value", state_obj)).lower()
-                if (order is not None
+                if not oid:
+                    continue
+                # A fallback MARKET is a child of the original LIMIT.  The
+                # position keeps the root exit id, so checking only that row
+                # misses the exact cancel-confirm -> market-fill race: the
+                # root is CANCELLED while its owned child is already FILLED
+                # but its fill has not yet been routed.
+                candidates = []
+                root = execution.get_order(oid)
+                if root is not None:
+                    candidates.append(root)
+                for child in (getattr(execution, "_orders", {}) or {}).values():
+                    if getattr(child, "original_order_id", None) != oid:
+                        continue
+                    if (getattr(child, "parent_position_id", None)
+                            != getattr(lp, "position_id", None)
+                            or (getattr(child, "lifecycle_id", None)
+                                or getattr(child, "trade_id", None))
+                            != getattr(lp, "trade_id", None)
+                            or getattr(child, "position_generation", None)
+                            != getattr(lp, "position_generation", None)):
+                        continue
+                    candidates.append(child)
+                for order in candidates:
+                    role = str(getattr(order, "order_role", "") or "").upper()
+                    state_obj = getattr(order, "state", "")
+                    state = str(getattr(state_obj, "value", state_obj)).lower()
+                    is_owned_fallback = (
+                        order is not root
+                        and getattr(order, "order_type", "") == "MARKET"
+                        and bool(getattr(order, "fallback_cancel_confirmed", False))
                         and role in {"EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"}
-                        and state in {"created", "submitted", "acknowledged",
-                                      "partially_filled", "filled"}):
-                    deferred_exit_positions.append(lp)
+                    )
+                    if (role in {"EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"}
+                            and state in {"created", "submitted", "acknowledged",
+                                          "partially_filled", "filled"}
+                            and (order is root or is_owned_fallback)):
+                        deferred_exit_positions.append(lp)
+                        break
 
         if deferred_exit_positions:
             deferred_ids = {id(p) for p in deferred_exit_positions}

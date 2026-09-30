@@ -460,7 +460,17 @@ class FillFlowMixin:
             if pm is None or engine is None or persistence is None:
                 return False
             persisted = persistence.fill_by_broker_fill_id(fill.broker_fill_id)
-            if not persisted:
+            # On the first WS/REST delivery, LiveExecutionEngine has already
+            # minted this Fill from the broker's authoritative order-status
+            # response, but the poller's post-route DB upgrade has not run yet.
+            # Accept that exact in-memory broker fill for the same narrowly
+            # validated recovery; arbitrary/unowned fills still fail closed.
+            known_live_fill = any(
+                getattr(f, "fill_id", None) == getattr(fill, "fill_id", None)
+                and getattr(f, "broker_fill_id", None) == fill.broker_fill_id
+                for f in (engine.get_fills() if callable(
+                    getattr(engine, "get_fills", None)) else []))
+            if not persisted and not known_live_fill:
                 return False
             order = engine.get_order(fill.order_id)
             if order is None:
@@ -477,11 +487,13 @@ class FillFlowMixin:
             current = next((p for p in positions
                             if p.instrument == fill.instrument and p.is_open), None)
             if current is None:
-                # After restart, the saved engine snapshot may already contain
-                # the stale CLOSED/zero-quantity snapshot even though the
-                # canonical DB position/trade stayed OPEN.  Reconstruct only
-                # when the exact persisted reversal exit and broker-flat state
-                # jointly prove this is an unbooked close.
+                # Broker-flat reconciliation can beat the fill router and
+                # remove a still-open local position. Reconstruct only from
+                # the exact durable OPEN owner and a filled, position-owned
+                # exit order (or its cancel-confirmed MARKET fallback child),
+                # while Dhan independently confirms flat. This also covers
+                # restart recovery and the SL fallback race; it never invents
+                # an entry or accepts an unrelated/manual fill.
                 db_positions = persistence.get_open_positions(fill.strategy_id)
                 reversals = persistence.get_reversals(fill.strategy_id, limit=100)
                 reversal = next((r for r in reversals
@@ -493,19 +505,70 @@ class FillFlowMixin:
                             or (reversal or {}).get("old_position_id"))
                 owner_row = next((p for p in db_positions
                                   if p.get("position_id") == owner_id
-                                  and p.get("instrument") == fill.instrument
-                                  and p.get("exit_order_id") == fill.order_id), None)
+                                  and p.get("instrument") == fill.instrument), None)
                 if owner_row is None:
+                    return False
+                owner_trade_id = (getattr(order, "lifecycle_id", None)
+                                  or getattr(order, "trade_id", None))
+                owner_generation = getattr(order, "position_generation", None)
+                if (owner_row.get("trade_id") != owner_trade_id
+                        or int(owner_row.get("position_generation") or 0)
+                        != int(owner_generation or 0)
+                        or role not in {"EXIT", "STOP_LOSS", "REVERSAL_EXIT",
+                                        "EMERGENCY_EXIT"}):
+                    return False
+
+                root_exit_id = owner_row.get("exit_order_id")
+                owns_exit_chain = bool(root_exit_id and root_exit_id == fill.order_id)
+                if not owns_exit_chain and root_exit_id:
+                    # Fallback MARKETs are new broker orders. Require their
+                    # explicit child->parent link, confirmed parent cancel,
+                    # and matching position/trade/generation on both legs.
+                    child = order
+                    seen = set()
+                    while getattr(child, "original_order_id", None):
+                        parent_id = str(child.original_order_id)
+                        if parent_id in seen:
+                            break
+                        seen.add(parent_id)
+                        parent = engine.get_order(parent_id)
+                        if parent is None:
+                            break
+                        same_owner = (
+                            getattr(parent, "parent_position_id", None) == owner_id
+                            and (getattr(parent, "lifecycle_id", None)
+                                 or getattr(parent, "trade_id", None)) == owner_trade_id
+                            and int(getattr(parent, "position_generation", 0) or 0)
+                                == int(owner_generation or 0)
+                            and str(getattr(parent, "order_role", "") or "").upper()
+                                in {"EXIT", "STOP_LOSS", "REVERSAL_EXIT",
+                                    "EMERGENCY_EXIT"}
+                        )
+                        if (parent_id == str(root_exit_id) and same_owner
+                                and getattr(child, "order_type", "") == "MARKET"
+                                and bool(getattr(child,
+                                                 "fallback_cancel_confirmed", False))):
+                            parent_state_obj = getattr(parent, "state", "")
+                            parent_state = str(getattr(
+                                parent_state_obj, "value", parent_state_obj)).lower()
+                            parent_filled = int(getattr(parent, "filled_quantity", 0) or 0)
+                            parent_quantity = int(getattr(parent, "quantity", 0) or 0)
+                            owns_exit_chain = parent_state in {
+                                "canceled", "cancelled"} and (
+                                    parent_filled < parent_quantity
+                                    and parent_quantity > 0)
+                            break
+                        child = parent
+                if not owns_exit_chain:
                     return False
                 reversal = next((r for r in reversals
                                  if r.get("old_position_id") == owner_id
                                  and r.get("old_trade_id") == owner_row.get("trade_id")
-                                 and r.get("old_exit_order_id") == fill.order_id
+                                 and r.get("old_exit_order_id") in {
+                                     fill.order_id, root_exit_id}
                                  and str(r.get("status", "")).upper()
                                      == "PENDING_EXIT"), None)
-                if reversal is None or (role not in {
-                        "EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"}
-                        and role):
+                if role == "REVERSAL_EXIT" and reversal is None:
                     return False
                 broker_rows = env.broker.positions()
                 for row in broker_rows or []:

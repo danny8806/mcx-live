@@ -125,7 +125,7 @@
       "exit_enabled": true,
       "reversal_enabled": true,
       "sl_enabled": true,
-      "quantity": 100
+      "quantity": 1
     },
     "silver_01": {
       "instrument": "SILVERM",
@@ -140,7 +140,7 @@
       "exit_enabled": true,
       "reversal_enabled": true,
       "sl_enabled": true,
-      "quantity": 100
+      "quantity": 1
     },
     "silver_02": {
       "instrument": "SILVERM",
