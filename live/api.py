@@ -408,8 +408,25 @@ def _adopt_broker_position(body: dict) -> dict:
                                 detail="requested SILVERM 15m signal candle is not present in completed candles")
         idx = closed.index(candle)
         if idx == 0:
-            raise HTTPException(status_code=409,
-                                detail="prior candle is unavailable for stop calculation")
+            history_fn = getattr(adapter, "fetch_historical_candles", None)
+            if callable(history_fn):
+                try:
+                    signal_day = datetime.fromtimestamp(
+                        candle_timestamp, timezone.utc).date()
+                    today = datetime.now(timezone.utc).date()
+                    history = history_fn("SILVERM", "15", signal_day, today) or []
+                    by_start = {float(c[0]): c for c in [*history, *closed]}
+                    closed = sorted(by_start.values(), key=lambda c: float(c[0]))
+                    candle = next((c for c in closed
+                                   if float(c[0]) == candle_timestamp), None)
+                    idx = closed.index(candle) if candle is not None else 0
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"historical candle check for the structural stop failed: {exc}")
+            if candle is None or idx == 0:
+                raise HTTPException(status_code=409,
+                                    detail="prior candle is unavailable for stop calculation")
         candle_end = candle_timestamp + 900.0
         fill_time_text = (broker_trade.get("exchangeTime")
                           or broker_trade.get("createTime") or "")

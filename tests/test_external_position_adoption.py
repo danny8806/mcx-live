@@ -19,7 +19,8 @@ CANDLE_TS = 1790745300.0
 FILL_TS = 1790746333.0
 
 
-def _adoption_runtime(tmp_path, monkeypatch, *, live_price=229107.0):
+def _adoption_runtime(tmp_path, monkeypatch, *, live_price=229107.0,
+                      omit_prior_from_recent_window=False):
     root = Path(__file__).resolve().parents[1]
     config = json.loads((root / "config" / "live_settings.json").read_text())
     for key, filename in (
@@ -75,11 +76,15 @@ def _adoption_runtime(tmp_path, monkeypatch, *, live_price=229107.0):
                      228895.0, 467.0]
     newer_closed = [1790746200.0, 228895.0, 229140.0, 228700.0,
                     228871.0, 300.0]
+    recent_closed = ([signal_candle, newer_closed] if omit_prior_from_recent_window
+                     else [prior, signal_candle, newer_closed])
     env.data_adapter = SimpleNamespace(fetch_candle_state=lambda *_args: {
-        "closed": [prior, signal_candle, newer_closed],
+        "closed": recent_closed,
         "forming": [1790747100.0, 228871.0, 229140.0,
                     228732.0, live_price, 300.0],
     })
+    if omit_prior_from_recent_window:
+        env.data_adapter.fetch_historical_candles = lambda *_args: [prior, signal_candle]
     persistence = PersistenceManager(
         state_path=str(tmp_path / "live-state.json"),
         db_path=str(tmp_path / "live.db"), execution_mode="LIVE")
@@ -143,6 +148,23 @@ def test_import_refuses_position_after_stop_cross_without_creating_trade(
         assert exc.value.status_code == 409
         assert not env.runtimes.require("silver_01").position_manager.open_positions
         assert not persistence.get_trades("silver_01")
+        assert not broker._orders
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_import_fetches_prior_candle_when_recent_window_does_not_include_it(
+        tmp_path, monkeypatch):
+    engine, env, broker, persistence = _adoption_runtime(
+        tmp_path, monkeypatch, omit_prior_from_recent_window=True)
+    try:
+        result = live_api._adopt_broker_position({
+            "strategy_id": "silver_01", "broker_order_id": BROKER_ORDER,
+            "signal_candle_timestamp": CANDLE_TS})
+        assert result["adopted"] is True
+        assert result["stop_price"] == 228100.0
+        assert result["position"]["sl_state"] == "ARMED"
         assert not broker._orders
     finally:
         engine.stop()
