@@ -1,4 +1,7 @@
-from portfolio.position_manager import Position, PositionManager, PositionSide, PositionStatus
+from portfolio.position_manager import (
+    Position, PositionManager, PositionSide, PositionStatus,
+    merge_durable_open_position_rows,
+)
 
 
 def test_restore_round_trips_open_position_lifecycle_and_broker_links():
@@ -74,3 +77,56 @@ def test_restore_round_trips_closed_position_lifecycle_and_broker_links():
     assert actual.sl_protected_at == 1790745400.0
     assert actual.position_generation == 4
     assert actual.lifecycle_id == "L-CLOSED"
+
+
+def test_durable_open_position_row_hydrates_missing_runtime_links():
+    snapshot = {
+        "open_positions": {
+            "P-OPEN": {
+                "position_id": "P-OPEN",
+                "strategy_id": "silver_01",
+                "instrument": "SILVERM",
+                "side": "LONG",
+                "quantity": 1,
+                "average_entry": 228940.0,
+                "entry_timestamp": 1790745300.0,
+                "stop_price": 228100.0,
+                "entry_order_id": None,
+                "sl_state": None,
+                "position_generation": 0,
+                "exit_started": False,
+            }
+        },
+        "closed_positions": [],
+    }
+    durable = [{
+        "position_id": "P-OPEN",
+        "entry_order_id": "IMPORT-24826093037104",
+        "sl_state": "ARMED",
+        "sl_trigger_price": None,
+        "sl_protected_at": 1790748544.93531,
+        "position_generation": 1,
+        "exit_started": False,
+    }]
+
+    merged = merge_durable_open_position_rows(snapshot, durable)
+    restored = PositionManager()
+    restored.restore(merged)
+    actual = restored.open_positions[0]
+
+    assert actual.entry_order_id == "IMPORT-24826093037104"
+    assert actual.sl_state == "ARMED"
+    assert actual.sl_protected_at == 1790748544.93531
+    assert actual.position_generation == 1
+    assert snapshot["open_positions"]["P-OPEN"]["entry_order_id"] is None
+
+
+def test_durable_row_does_not_overwrite_newer_runtime_order_link():
+    snapshot = {
+        "open_positions": {
+            "P-OPEN": {"position_id": "P-OPEN", "entry_order_id": "NEWER-ORDER"}
+        }
+    }
+    merged = merge_durable_open_position_rows(
+        snapshot, [{"position_id": "P-OPEN", "entry_order_id": "OLDER-ORDER"}])
+    assert merged["open_positions"]["P-OPEN"]["entry_order_id"] == "NEWER-ORDER"

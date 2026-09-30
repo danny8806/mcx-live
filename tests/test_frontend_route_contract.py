@@ -9,10 +9,10 @@ def test_frontend_api_roots_are_served_by_live_backend():
     frontend_api = (workspace / "dashboard-ui/src/lib/api.ts").read_text(
         encoding="utf-8")
     frontend_roots = set(re.findall(r"/api/[a-zA-Z0-9_/-]+", frontend_api))
-    backend_paths = {
-        route.path for route in create_live_app().routes
-        if getattr(route, "path", None)
-    }
+    # FastAPI's newer router implementation stores included routers as lazy
+    # route entries without a direct ``path`` attribute. OpenAPI resolves the
+    # complete registered path table across both eager and lazy routers.
+    backend_paths = set(create_live_app().openapi().get("paths", {}))
 
     unmatched = sorted(
         root for root in frontend_roots

@@ -53,7 +53,10 @@ from execution.broker_router import BrokerEventRouter
 from execution.fee_model import MCXFeeModel
 from execution.live.market_health import MarketDataHealthMonitor
 from execution.order_manager import OrderManager, OrderManagerFacade
-from portfolio.position_manager import PositionManager, PositionManagerFacade, Position
+from portfolio.position_manager import (
+    PositionManager, PositionManagerFacade, Position,
+    merge_durable_open_position_rows,
+)
 from portfolio.pnl import PNLEngine
 from portfolio.account import AccountEngine
 from monitoring.health import HealthMonitor, SystemStatus
@@ -1737,6 +1740,16 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         positions_state = saved_state.get("positions")
         if positions_state:
             try:
+                persistence = getattr(env, "persistence", None)
+                get_open_positions = getattr(persistence, "get_open_positions", None)
+                if callable(get_open_positions):
+                    try:
+                        positions_state = merge_durable_open_position_rows(
+                            positions_state, get_open_positions())
+                    except Exception:
+                        log.exception(
+                            "[Engine] durable open-position hydration failed; "
+                            "restoring the runtime snapshot as-is")
                 env.position_manager.restore(positions_state)
             except Exception:
                 pass

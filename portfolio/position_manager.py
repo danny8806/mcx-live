@@ -132,6 +132,51 @@ class Position:
         }
 
 
+def merge_durable_open_position_rows(snapshot: dict, rows: list[dict]) -> dict:
+    """Fill missing runtime lifecycle fields from canonical open-position rows.
+
+    The engine snapshot is the primary restart state, while SQLite is the
+    durable owner for broker order links and SL lifecycle metadata. Older
+    snapshots can omit those fields; merge only missing values so newer
+    runtime state is not overwritten by an older database write.
+    """
+    state = dict(snapshot or {})
+    open_positions = {
+        key: dict(value or {})
+        for key, value in (state.get("open_positions") or {}).items()
+    }
+    by_id = {
+        str(row.get("position_id")): row
+        for row in (rows or [])
+        if row and row.get("position_id")
+    }
+    durable_fields = (
+        "entry_order_id", "exit_order_id", "sl_state", "sl_trigger_price",
+        "sl_protected_at", "stop_price", "entry_signal_id", "exit_signal_id",
+        "trade_id", "lifecycle_id",
+    )
+    for position in open_positions.values():
+        durable = by_id.get(str(position.get("position_id") or ""))
+        if durable is None:
+            continue
+        for field_name in durable_fields:
+            if position.get(field_name) in (None, "") and durable.get(field_name) not in (None, ""):
+                position[field_name] = durable[field_name]
+        try:
+            position["position_generation"] = max(
+                int(position.get("position_generation") or 0),
+                int(durable.get("position_generation") or 0),
+            )
+        except (TypeError, ValueError):
+            pass
+        # This flag is monotonic while a position is open. Preserve a durable
+        # in-progress exit if a prior runtime snapshot predates the DB write.
+        if durable.get("exit_started"):
+            position["exit_started"] = True
+    state["open_positions"] = open_positions
+    return state
+
+
 class PositionManager:
     """Manages open positions for all strategies.
     
