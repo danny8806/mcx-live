@@ -60,6 +60,7 @@ _push_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _events_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _live_test_cycle_lock = threading.Lock()
 _live_test_entry_signal_id: Optional[str] = None
+_broker_position_adoption_lock = threading.Lock()
 
 _frontend_dist = Path(__file__).resolve().parent.parent / "dashboard-ui" / "dist"
 _frontend_available = _frontend_dist.exists()
@@ -279,6 +280,269 @@ async def _handle_command(msg: dict, websocket: WebSocket):
     await websocket.send_text(json.dumps({"type": "command_result", "data": result}, default=str))
 
 
+def _adopt_broker_position(body: dict) -> dict:
+    """Import an exact filled Dhan order as a locally tracked position."""
+    from execution.models import Fill, Order, OrderState
+    from strategies.intent import entry_levels
+    from strategies.types import Signal, SignalType, freeze_signal_context
+
+    if not _engine or not _persistence:
+        raise HTTPException(status_code=503, detail="live engine unavailable")
+    if not _broker_position_adoption_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="position adoption already running")
+    try:
+        strategy_id = str(body.get("strategy_id") or "")
+        broker_order_id = str(body.get("broker_order_id") or "")
+        try:
+            candle_timestamp = float(body.get("signal_candle_timestamp"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422,
+                                detail="signal_candle_timestamp is required")
+        env = _engine.live
+        strategy_cfg = (_engine.config.get("strategies", {}) or {}).get(strategy_id)
+        strategy = (getattr(env, "strategies", {}) or {}).get(strategy_id)
+        runtime = env.runtimes.require(strategy_id)
+        if (not strategy_cfg or not strategy or strategy_cfg.get("instrument") != "SILVERM"
+                or not bool(strategy_cfg.get("enabled"))
+                or str(strategy_cfg.get("fast_timeframe", "")).lower() != "15m"):
+            raise HTTPException(status_code=409,
+                                detail="selected strategy is not an enabled SILVERM 15m strategy")
+        if not broker_order_id:
+            raise HTTPException(status_code=422, detail="broker_order_id is required")
+
+        # Repeated requests are idempotent and return the already-imported row.
+        for existing in (getattr(env.execution_engine, "_orders", {}) or {}).values():
+            if str(getattr(existing, "_broker_order_id", "")) == broker_order_id:
+                pos = next((p for p in runtime.position_manager.get_positions_by_strategy(
+                    strategy_id) if p.instrument == "SILVERM" and p.is_open), None)
+                if pos is None:
+                    raise HTTPException(status_code=409,
+                                        detail="imported order exists without its open position")
+                return {"adopted": True, "already_adopted": True,
+                        "broker_order_id": broker_order_id,
+                        "position": pos.snapshot()}
+
+        broker = env.broker
+        day_orders_fn = getattr(broker, "day_order_book", None)
+        tradebook_fn = getattr(broker, "tradebook", None)
+        if not callable(day_orders_fn) or not callable(tradebook_fn):
+            raise HTTPException(status_code=503,
+                                detail="Dhan orderbook/tradebook reconciliation unavailable")
+        day_orders = day_orders_fn() or []
+        broker_order = next((o for o in day_orders
+                             if str(o.get("broker_order_id") or "") == broker_order_id), None)
+        if (broker_order is None or broker_order.get("status") != "filled"
+                or str(broker_order.get("side") or "").upper() != "BUY"
+                or int(broker_order.get("quantity") or 0) != 1
+                or int(broker_order.get("filled_quantity") or 0) != 1
+                or str(broker_order.get("security_id") or "") != "483080"):
+            raise HTTPException(status_code=409,
+                                detail="Dhan order is not a filled SILVERM BUY for quantity 1")
+
+        trades = tradebook_fn() or []
+        order_trades = [t for t in trades
+                        if str(t.get("orderId") or t.get("order_id") or "")
+                        == broker_order_id
+                        and str(t.get("securityId") or t.get("security_id") or "")
+                        == "483080"]
+        if len(order_trades) != 1:
+            raise HTTPException(status_code=409,
+                                detail="expected one exact Dhan exchange fill for this order")
+        broker_trade = order_trades[0]
+        broker_fill_id = str(broker_trade.get("exchangeTradeId")
+                             or broker_trade.get("tradeId") or "")
+        fill_price = float(broker_trade.get("tradedPrice") or 0.0)
+        fill_qty = int(broker_trade.get("tradedQuantity") or 0)
+        if (not broker_fill_id or fill_price <= 0 or fill_qty != 1
+                or str(broker_trade.get("transactionType") or "").upper() != "BUY"):
+            raise HTTPException(status_code=409,
+                                detail="Dhan tradebook fill identity/side/quantity is invalid")
+        if _persistence.fill_by_broker_fill_id(broker_fill_id):
+            raise HTTPException(status_code=409,
+                                detail="Dhan exchange fill is already in the local ledger")
+
+        # Confirm that this is still the instrument's complete open net and
+        # that no more recent fill superseded the selected manual entry.
+        broker_rows = broker.positions() or []
+        nets = {(str(r.get("side") or "").upper(), abs(int(r.get("quantity") or 0)))
+                for r in broker_rows if r.get("instrument") == "SILVERM"
+                and int(r.get("quantity") or 0) != 0}
+        if nets != {("LONG", 1)}:
+            raise HTTPException(status_code=409,
+                                detail=f"current Dhan SILVERM net does not equal this 1-lot LONG: {sorted(nets)}")
+        all_silver_trades = [t for t in trades
+                             if str(t.get("securityId") or t.get("security_id") or "")
+                             == "483080"]
+        if not all_silver_trades:
+            raise HTTPException(status_code=409, detail="Dhan SILVERM tradebook is empty")
+        latest_trade = max(all_silver_trades,
+                           key=lambda t: str(t.get("exchangeTime") or t.get("createTime") or ""))
+        latest_order_id = str(latest_trade.get("orderId") or latest_trade.get("order_id") or "")
+        if latest_order_id != broker_order_id:
+            raise HTTPException(status_code=409,
+                                detail="a later SILVERM tradebook fill exists; refusing stale adoption")
+        signed_tradebook_qty = sum(
+            (1 if str(t.get("transactionType") or "").upper() == "BUY" else -1)
+            * int(t.get("tradedQuantity") or 0) for t in all_silver_trades)
+        if signed_tradebook_qty != 1:
+            raise HTTPException(status_code=409,
+                                detail="Dhan tradebook net does not prove a single remaining long")
+        for rt in env.runtimes.all():
+            sid = rt.strategy_id
+            if any(p.instrument == "SILVERM" and p.is_open
+                   for p in rt.position_manager.get_positions_by_strategy(sid)):
+                raise HTTPException(status_code=409,
+                                    detail="a local SILVERM position already exists")
+
+        adapter = getattr(env, "data_adapter", None)
+        if adapter is None:
+            raise HTTPException(status_code=503, detail="REST candle adapter unavailable")
+        candle_state = adapter.fetch_candle_state("SILVERM", "15") or {}
+        closed = candle_state.get("closed") or []
+        if len(closed) < 2:
+            raise HTTPException(status_code=409,
+                                detail="two completed 15m candles are required for the structural stop")
+        candle = next((c for c in closed if float(c[0]) == candle_timestamp), None)
+        latest_closed = max(closed, key=lambda c: float(c[0]))
+        if candle is None or float(latest_closed[0]) != candle_timestamp:
+            raise HTTPException(status_code=409,
+                                detail="requested signal candle is not the latest completed SILVERM 15m candle")
+        idx = closed.index(candle)
+        if idx == 0:
+            raise HTTPException(status_code=409,
+                                detail="prior candle is unavailable for stop calculation")
+        candle_end = candle_timestamp + 900.0
+        fill_time_text = (broker_trade.get("exchangeTime")
+                          or broker_trade.get("createTime") or "")
+        try:
+            from zoneinfo import ZoneInfo
+            fill_time = datetime.strptime(
+                str(fill_time_text), "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=ZoneInfo("Asia/Kolkata")).timestamp()
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=409,
+                                detail="Dhan fill timestamp cannot be verified")
+        if not (candle_end <= fill_time <= candle_end + 900.0):
+            raise HTTPException(status_code=409,
+                                detail="Dhan fill is outside the selected candle's trigger window")
+
+        o, h, low, close = map(float, candle[1:5])
+        prev = closed[idx - 1]
+        trigger, stop = entry_levels("LONG", h, low,
+                                     float(prev[2]), float(prev[3]))
+        if stop <= 0 or trigger <= stop:
+            raise HTTPException(status_code=409,
+                                detail="signal-candle trigger/stop levels are invalid")
+        forming = candle_state.get("forming") or []
+        live_price = float(forming[4]) if len(forming) > 4 else 0.0
+        if live_price <= stop:
+            raise HTTPException(status_code=409,
+                                detail="current broker candle is at/below the long stop; adoption halted")
+
+        from strategies.types import SignalExecutionContext
+        signal = Signal(
+            signal_type=SignalType.LONG, instrument="SILVERM",
+            strategy_id=strategy_id, timestamp=candle_timestamp,
+            trigger_price=trigger, stop_price=stop, quantity=1, side="LONG",
+            metadata={
+                "executed": True, "entry_price": fill_price,
+                "external_position_import": True,
+                "external_position_source": "dhan_tradebook_operator_reconcile",
+                "broker_order_id": broker_order_id,
+                "broker_fill_id": broker_fill_id,
+                "signal_reason": "operator_attributed_to_latest_closed_15m_candle",
+                "signal_candle_start": candle_timestamp,
+                "signal_candle_open": o, "signal_candle_high": h,
+                "signal_candle_low": low, "signal_candle_close": close,
+                "trigger_level": trigger,
+            })
+        freeze_signal_context(signal, timestamp=candle_timestamp, open_=o,
+                              high=h, low=low, close=close)
+
+        execution = env.execution_engine
+        local_order_id = f"IMPORT-{broker_order_id}"
+        order = Order(
+            order_id=local_order_id, strategy_id=strategy_id,
+            instrument="SILVERM", side="BUY", quantity=1,
+            order_type=str(broker_order.get("order_type") or "LIMIT").upper(),
+            price=fill_price, planned_entry_price=trigger, planned_sl=stop,
+            planned_order_type="EXTERNAL_DHAN_FILL", order_role="ENTRY",
+            state=OrderState.FILLED, filled_quantity=1,
+            average_fill_price=fill_price, created_at=fill_time,
+            updated_at=fill_time, reason="operator_imported_existing_dhan_position",
+            multiplier=float(_engine.config.instrument("SILVERM").get("multiplier", 1.0)),
+            entry_signal_id=signal.signal_id, trade_id="",
+            lifecycle_id="", position_generation=0)
+        order._broker_order_id = broker_order_id
+        order.parent_signal_id = signal.signal_id
+        order.correlation_id = None  # Dhan's manual-order correlation is NA.
+
+        _engine._persist_signal(signal, "EXTERNAL_POSITION_IMPORT", env_name="live")
+        lifecycle = runtime.lifecycle
+        trade = lifecycle.create_trade_from_signal(
+            signal, strategy_id=strategy_id, strategy_name=strategy_id,
+            instrument="SILVERM", quantity=1,
+            multiplier=order.multiplier,
+            signal_reason="operator_imported_existing_dhan_position",
+            entry_reason="external_dhan_position_import")
+        if trade is None:
+            raise HTTPException(status_code=409,
+                                detail="lifecycle rejected external position trade")
+        order.trade_id = trade.trade_id
+        order.lifecycle_id = trade.trade_id
+        order.position_generation = runtime.position_manager.allocate_generation(
+            strategy_id, "SILVERM")
+        order.planned_sl = stop
+        if not lifecycle.register_order(trade.trade_id, local_order_id, role="ENTRY"):
+            raise HTTPException(status_code=409,
+                                detail="lifecycle rejected imported broker order")
+        with execution._lock:
+            if local_order_id in execution._orders:
+                raise HTTPException(status_code=409,
+                                    detail="imported local order id already exists")
+            execution._orders[local_order_id] = order
+        _engine._persist_order(order, signal, env_name="live")
+
+        fill = Fill(
+            fill_id=f"DHAN-{broker_fill_id}", order_id=local_order_id,
+            instrument="SILVERM", side="BUY", quantity=1,
+            price=fill_price, timestamp=fill_time,
+            strategy_id=strategy_id, multiplier=order.multiplier,
+            entry_signal_id=signal.signal_id, trade_id=trade.trade_id,
+            lifecycle_id=trade.trade_id,
+            position_generation=order.position_generation)
+        fill.broker_order_id = broker_order_id
+        fill.broker_fill_id = broker_fill_id
+        fill.broker_trade_id = broker_fill_id
+        fill.cumulative_filled_quantity = 1
+        _engine._handle_fill(fill, signal.signal_id, env_name="live")
+
+        position = next((p for p in runtime.position_manager.get_positions_by_strategy(
+            strategy_id) if p.instrument == "SILVERM" and p.is_open), None)
+        if position is None or str(position.sl_state).upper() != "ARMED":
+            raise HTTPException(status_code=500,
+                                detail="broker fill imported but local position/SL did not arm")
+        order.position_id = position.position_id
+        order.parent_position_id = position.position_id
+        order.position_generation = position.position_generation
+        _engine._persist_order(order, signal, env_name="live")
+        _persistence.save_state(_engine.snapshot("live"))
+        return {
+            "adopted": True, "already_adopted": False,
+            "source": "Dhan tradebook and current broker net",
+            "broker_order_id": broker_order_id,
+            "broker_fill_id": broker_fill_id,
+            "position": position.snapshot(),
+            "signal_candle": {"timestamp": candle_timestamp,
+                              "open": o, "high": h, "low": low,
+                              "close": close},
+            "trigger_price": trigger, "stop_price": stop,
+            "broker_order_sent": False,
+        }
+    finally:
+        _broker_position_adoption_lock.release()
+
+
 def create_live_app(live_engine=None) -> FastAPI:
     """Build the LIVE FastAPI app bound to a LiveEngine.
 
@@ -346,6 +610,25 @@ def create_live_app(live_engine=None) -> FastAPI:
             "event_bus": _bus.get_stats() if _bus is not None else None,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    @app.post("/api/live/reconcile/adopt-broker-position")
+    async def adopt_broker_position(request: Request, body: dict):
+        """Import one operator-identified, already-filled Dhan entry locally.
+
+        This never submits, modifies, or cancels a broker order. It is
+        loopback-only and refuses adoption unless Dhan's filled order, its
+        exchange trade, the current net position, the selected completed
+        candle, and the strategy/instrument/quantity all agree. The strategy's
+        existing candle rule supplies the stop; no stop is guessed.
+        """
+        try:
+            peer = ipaddress.ip_address(
+                request.client.host if request.client else "")
+        except ValueError:
+            raise HTTPException(status_code=403, detail="loopback caller required")
+        if not peer.is_loopback:
+            raise HTTPException(status_code=403, detail="loopback caller required")
+        return await asyncio.to_thread(_adopt_broker_position, body)
 
     @app.post("/api/live/test-order-cycle")
     async def live_test_order_cycle(request: Request, body: dict):

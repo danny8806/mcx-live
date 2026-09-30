@@ -1,0 +1,147 @@
+"""External broker-position import uses verified fills and real candle stops."""
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
+
+from core.trade_close import TradeCloseManager
+from execution.live.broker_client import StubLiveBroker
+from persistence.manager import PersistenceManager
+from trading_engine import TradingEngine
+from live import api as live_api
+
+
+BROKER_ORDER = "24826093037104"
+BROKER_FILL = "240073750"
+CANDLE_TS = 1790745300.0
+FILL_TS = 1790746333.0
+
+
+def _adoption_runtime(tmp_path, monkeypatch, *, live_price=229107.0):
+    root = Path(__file__).resolve().parents[1]
+    config = json.loads((root / "config" / "live_settings.json").read_text())
+    for key, filename in (
+        ("live_db_path", "live.db"),
+        ("live_state_path", "live-state.json"),
+        ("db_path", "paper.db"),
+        ("state_path", "paper-state.json"),
+    ):
+        config["system"][key] = str(tmp_path / filename)
+    config["live"]["broker"] = "stub"
+    config["live"]["gate"] = "ON"
+    config["live"]["live_trading_enabled"] = True
+    config["strategies"] = {
+        "silver_01": dict(config["strategies"]["silver_01"], quantity=1,
+                           enabled=True, live_gate="ON")
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+
+    engine = TradingEngine(config_path=str(config_path), live_only=True)
+    env = engine.live
+    broker = StubLiveBroker(gate_enabled=True)
+    broker.positions = lambda: [
+        {"strategy_id": "silver_01", "instrument": "SILVERM",
+         "side": "LONG", "quantity": 1},
+        {"strategy_id": "silver_02", "instrument": "SILVERM",
+         "side": "LONG", "quantity": 1},
+    ]
+    broker.day_order_book = lambda: [{
+        "broker_order_id": BROKER_ORDER, "status": "filled",
+        "side": "BUY", "quantity": 1, "filled_quantity": 1,
+        "average_fill_price": 228940.0, "order_type": "LIMIT",
+        "security_id": "483080",
+    }]
+    broker.tradebook = lambda: [
+        {"orderId": "older-buy", "securityId": "483080",
+         "transactionType": "BUY", "tradedQuantity": 1,
+         "tradedPrice": 229144.0, "exchangeTradeId": "older-fill",
+         "exchangeTime": "2026-09-30 10:15:38"},
+        {"orderId": "older-sell", "securityId": "483080",
+         "transactionType": "SELL", "tradedQuantity": 1,
+         "tradedPrice": 228208.0, "exchangeTradeId": "older-exit",
+         "exchangeTime": "2026-09-30 10:46:12"},
+        {"orderId": BROKER_ORDER, "securityId": "483080",
+         "transactionType": "BUY", "tradedQuantity": 1,
+         "tradedPrice": 228940.0, "exchangeTradeId": BROKER_FILL,
+         "exchangeTime": "2026-09-30 11:02:13"},
+    ]
+    env.broker = broker
+    env.execution_engine.broker = broker
+    prior = [1790744400.0, 228900.0, 229140.0, 228349.0, 228374.0, 316.0]
+    signal_candle = [CANDLE_TS, 228374.0, 228900.0, 228100.0,
+                     228895.0, 467.0]
+    env.data_adapter = SimpleNamespace(fetch_candle_state=lambda *_args: {
+        "closed": [prior, signal_candle],
+        "forming": [1790746200.0, 228871.0, 229140.0,
+                    228732.0, live_price, 300.0],
+    })
+    persistence = PersistenceManager(
+        state_path=str(tmp_path / "live-state.json"),
+        db_path=str(tmp_path / "live.db"), execution_mode="LIVE")
+    engine.set_persistence(persistence, env_name="live")
+    env.trade_close_manager = TradeCloseManager(
+        position_manager=env.position_manager,
+        pnl_engines=env.pnl_engines,
+        account_engines=env.account_engines,
+        global_account=env.account_engine,
+        risk_engine=env.risk_engine,
+        persistence=persistence,
+        event_store=env.event_store,
+        telegram=engine.telegram,
+        event_callback=engine._event_callback,
+        trade_ledger=env.trade_ledger,
+    )
+    runtime = env.runtimes.require("silver_01")
+    runtime.position_manager  # assert this strategy runtime exists
+    monkeypatch.setattr(live_api, "_engine", engine)
+    monkeypatch.setattr(live_api, "_persistence", persistence)
+    return engine, env, broker, persistence
+
+
+def test_imports_exact_dhan_fill_and_arms_candle_stop_once(tmp_path, monkeypatch):
+    engine, env, broker, persistence = _adoption_runtime(tmp_path, monkeypatch)
+    body = {"strategy_id": "silver_01", "broker_order_id": BROKER_ORDER,
+            "signal_candle_timestamp": CANDLE_TS}
+    try:
+        result = live_api._adopt_broker_position(body)
+        assert result["adopted"] is True
+        assert result["broker_order_sent"] is False
+        assert result["trigger_price"] == 228900.0
+        assert result["stop_price"] == 228100.0
+        assert result["position"]["side"] == "LONG"
+        assert result["position"]["quantity"] == 1
+        assert result["position"]["average_entry"] == 228940.0
+        assert result["position"]["sl_state"] == "ARMED"
+        assert len(env.runtimes.require("silver_01").position_manager.open_positions) == 1
+        assert len(persistence.get_open_positions("silver_01")) == 1
+        assert persistence.fill_by_broker_fill_id(BROKER_FILL)
+        assert not broker._orders  # import did not submit a second Dhan order
+
+        duplicate = live_api._adopt_broker_position(body)
+        assert duplicate["already_adopted"] is True
+        assert len(persistence.get_fills()) == 1
+        assert len(persistence.get_trades("silver_01")) == 1
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_import_refuses_position_after_stop_cross_without_creating_trade(
+        tmp_path, monkeypatch):
+    engine, env, broker, persistence = _adoption_runtime(
+        tmp_path, monkeypatch, live_price=228000.0)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            live_api._adopt_broker_position({
+                "strategy_id": "silver_01", "broker_order_id": BROKER_ORDER,
+                "signal_candle_timestamp": CANDLE_TS})
+        assert exc.value.status_code == 409
+        assert not env.runtimes.require("silver_01").position_manager.open_positions
+        assert not persistence.get_trades("silver_01")
+        assert not broker._orders
+    finally:
+        engine.stop()
+        persistence.close()
