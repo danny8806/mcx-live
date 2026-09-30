@@ -6,9 +6,12 @@ import { api } from "../lib/api";
 import { connectDashboardSocket } from "../lib/realtime";
 
 export type DataState = "loading" | "live" | "stale" | "empty" | "error";
+type SnapshotKey = "overview" | "strategies" | "positions" | "orders" | "fills" | "trades" | "marketData";
+type SnapshotState = "loading" | "live" | "error";
 
 interface DataContextType {
   connected: boolean;
+  snapshotStatus: Record<SnapshotKey, SnapshotState>;
   overview: any;
   goldOverview: any;
   silverOverview: any;
@@ -50,6 +53,7 @@ type Selector<T> = (state: DataContextType) => T;
  *  an `undefined` slice on the very first render (before the sync effect runs). */
 const DEFAULT_STATE: DataContextType = {
   connected: false,
+  snapshotStatus: { overview: "loading", strategies: "loading", positions: "loading", orders: "loading", fills: "loading", trades: "loading", marketData: "loading" },
   overview: null, goldOverview: null, silverOverview: null,
   strategies: [], positions: [], orders: [], fills: [], trades: [],
   pnl: null, pnlByInstrument: {},
@@ -96,6 +100,7 @@ function extractVal(obj: any, key: string): any {
 
 export function DataProvider({ children }: { children: ReactNode }) {
   const [connected, setConnected] = useState(false);
+  const [snapshotStatus, setSnapshotStatus] = useState<Record<SnapshotKey, SnapshotState>>(DEFAULT_STATE.snapshotStatus);
   const [overview, setOverview] = useState<any>(null);
   const [goldOverview, setGoldOverview] = useState<any>(null);
   const [silverOverview, setSilverOverview] = useState<any>(null);
@@ -135,6 +140,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const fetchOverview = useCallback(async () => {
     try {
       const d = await api.overview() as any;
+      if (!d || d.error) throw new Error(d?.error || "No overview payload");
       safe(setOverview)({
         execution_mode: extractVal(d, "execution_mode") ?? null,
         total_equity: extractVal(d, "total_equity") ?? 0,
@@ -151,19 +157,14 @@ export function DataProvider({ children }: { children: ReactNode }) {
         active_strategies_count: extractVal(d, "active_strategies_count") ?? 0,
         kill_switch: extractVal(d, "kill_switch") ?? false,
       });
+      setSnapshotStatus((previous) => ({ ...previous, overview: "live" }));
     } catch (e: any) {
+      setSnapshotStatus((previous) => ({ ...previous, overview: "error" }));
       setLastError(`overview: ${e?.message || e}`);
       // Only set defaults when WS is NOT active — avoid overwriting
       // live WS data with zeros on a transient REST failure.
-      if (!wsActiveRef.current) {
-        safe(setOverview)({
-          execution_mode: null, total_equity: 0, starting_capital: 0,
-          today_pnl: 0, total_net_pnl: 0, realized_pnl: 0,
-          unrealized_pnl: 0, margin_used: 0, available_margin: 0,
-          open_positions_count: 0, active_orders_count: 0,
-          active_strategies_count: 0, kill_switch: false,
-        });
-      }
+      // Keep the last known snapshot (or null on first load). A failed request
+      // must never be rendered as a valid all-zero account state.
     }
   }, [safe]);
 
@@ -178,44 +179,57 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const fetchStrategies = useCallback(async () => {
     try {
       const d = await api.strategies() as any;
+      if (!Array.isArray(d?.strategies)) throw new Error(d?.error || "Invalid strategy payload");
+      setSnapshotStatus((previous) => ({ ...previous, strategies: "live" }));
       if (wsActiveRef.current) return;
-      safe(setStrategies)(Array.isArray(d?.strategies) ? d.strategies : []);
-    } catch (e: any) { setLastError(`strategies: ${e?.message || e}`); }
+      safe(setStrategies)(d.strategies);
+    } catch (e: any) { setSnapshotStatus((previous) => ({ ...previous, strategies: "error" })); setLastError(`strategies: ${e?.message || e}`); }
   }, [safe]);
 
   const fetchPositions = useCallback(async () => {
     try {
       const d = await api.positions() as any;
+      if (!Array.isArray(d?.positions)) throw new Error(d?.error || "Invalid position payload");
+      setSnapshotStatus((previous) => ({ ...previous, positions: "live" }));
       if (wsActiveRef.current) return;
-      safe(setPositions)(Array.isArray(d?.positions) ? d.positions : []);
-    } catch (e: any) { setLastError(`positions: ${e?.message || e}`); }
+      safe(setPositions)(d.positions);
+    } catch (e: any) { setSnapshotStatus((previous) => ({ ...previous, positions: "error" })); setLastError(`positions: ${e?.message || e}`); }
   }, [safe]);
 
   const fetchOrders = useCallback(async () => {
     try {
       const d = await api.orders() as any;
-      safe(setOrders)(Array.isArray(d?.orders) ? d.orders : []);
-    } catch (e: any) { setLastError(`orders: ${e?.message || e}`); }
+      if (!Array.isArray(d?.orders)) throw new Error(d?.error || "Invalid order payload");
+      safe(setOrders)(d.orders);
+      setSnapshotStatus((previous) => ({ ...previous, orders: "live" }));
+    } catch (e: any) { setSnapshotStatus((previous) => ({ ...previous, orders: "error" })); setLastError(`orders: ${e?.message || e}`); }
   }, [safe]);
 
   const fetchFills = useCallback(async () => {
     try {
       const d = await api.fills() as any;
-      safe(setFills)(Array.isArray(d?.fills) ? d.fills : []);
-    } catch (e: any) { setLastError(`fills: ${e?.message || e}`); }
+      if (!Array.isArray(d?.fills)) throw new Error(d?.error || "Invalid fill payload");
+      safe(setFills)(d.fills);
+      setSnapshotStatus((previous) => ({ ...previous, fills: "live" }));
+    } catch (e: any) { setSnapshotStatus((previous) => ({ ...previous, fills: "error" })); setLastError(`fills: ${e?.message || e}`); }
   }, [safe]);
 
   const fetchTrades = useCallback(async () => {
     try {
       const d = await api.trades() as any;
-      safe(setTrades)(Array.isArray(d?.trades) ? d.trades : []);
-    } catch (e: any) { setLastError(`trades: ${e?.message || e}`); }
+      if (!Array.isArray(d?.trades)) throw new Error(d?.error || "Invalid trade payload");
+      safe(setTrades)(d.trades);
+      setSnapshotStatus((previous) => ({ ...previous, trades: "live" }));
+    } catch (e: any) {
+      setSnapshotStatus((previous) => ({ ...previous, trades: "error" }));
+      setLastError(`trades: ${e?.message || e}`);
+    }
   }, [safe]);
 
   const fetchPnl = useCallback(async () => {
     try {
       const d = await api.pnl() as any;
-      safe(setPnl)(d?.portfolio ?? null);
+      safe(setPnl)(d?.portfolio ? { ...d.portfolio, execution_mode: d.execution_mode ?? null } : null);
       safe(setPnlByInstrument)(d?.by_instrument ?? {});
     } catch (e: any) { setLastError(`pnl: ${e?.message || e}`); }
   }, [safe]);
@@ -280,7 +294,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, [safe]);
 
   const fetchMarketData = useCallback(async () => {
-    try { safe(setMarketData)(await api.marketData()); } catch (e: any) { setLastError(`market: ${e?.message || e}`); }
+    try {
+      const data = await api.marketData() as any;
+      if (!data || data.error) throw new Error(data?.error || "Invalid market data payload");
+      safe(setMarketData)(data);
+      setSnapshotStatus((previous) => ({ ...previous, marketData: "live" }));
+    } catch (e: any) { setSnapshotStatus((previous) => ({ ...previous, marketData: "error" })); setLastError(`market: ${e?.message || e}`); }
   }, [safe]);
 
   const refresh = useCallback((key?: string) => {
@@ -370,10 +389,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
                 realized_charges: snap.realized_charges ?? 0,
               }));
               safe(setStrategies)(list);
+              setSnapshotStatus((previous) => ({ ...previous, strategies: "live" }));
             }
             if (s?.positions) {
               const openPos = s.positions?.open_positions ?? {};
               safe(setPositions)(Object.values(openPos) as any[]);
+              setSnapshotStatus((previous) => ({ ...previous, positions: "live" }));
             }
           }
           if (msg.type === "events") {
@@ -388,12 +409,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, [safe]);
 
   const contextValue = useMemo<DataContextType>(() => ({
-    connected, overview, goldOverview, silverOverview, strategies, positions,
+    connected, snapshotStatus, overview, goldOverview, silverOverview, strategies, positions,
     orders, fills, trades, pnl, pnlByInstrument, risk, indicators, htf,
     healthComponents, overallHealth, reconciliation, settings, audit,
     alerts, equityCurve, marketData, wsEvents, wsState, refresh, lastError,
   }), [
-    connected, overview, goldOverview, silverOverview, strategies, positions,
+    connected, snapshotStatus, overview, goldOverview, silverOverview, strategies, positions,
     orders, fills, trades, pnl, pnlByInstrument, risk, indicators, htf,
     healthComponents, overallHealth, reconciliation, settings, audit,
     alerts, equityCurve, marketData, wsEvents, wsState, refresh, lastError,

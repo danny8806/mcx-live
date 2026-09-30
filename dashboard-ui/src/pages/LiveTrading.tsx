@@ -1,192 +1,118 @@
+import { Activity, ArrowDownRight, ArrowUpRight, CircleCheck, Clock3, ShieldAlert, Waypoints } from "lucide-react";
+import { formatINR, formatTimestamp, pnlColor, safeINR, safeNum } from "../lib/utils";
 import { useDataSelector } from "../store/DataProvider";
-import { formatINR, pnlColor, statusDot, formatTimestamp, safeNum, safeINR } from "../lib/utils";
 
-const panelStyle: React.CSSProperties = { background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", overflow: "hidden" };
-const header: React.CSSProperties = { padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", fontSize: "10px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" };
+const activeOrderStates = new Set(["submitted", "acknowledged", "partially_filled", "partial", "partially filled", "pending", "open", "transit", "part_traded"]);
+
+function orderState(order: any): string {
+  return String(order.state ?? order.status ?? order.order_status ?? "").trim().toLowerCase().replace(/[ -]+/g, "_");
+}
+
+function StateTag({ children, kind = "neutral" }: { children: React.ReactNode; kind?: "good" | "bad" | "warn" | "neutral" }) {
+  return <span className={`state-tag ${kind}`}><i/>{children}</span>;
+}
+
+function Value({ label, value, emphasis }: { label: string; value: React.ReactNode; emphasis?: string }) {
+  return <div className="desk-value"><small>{label}</small><strong className={emphasis}>{value}</strong></div>;
+}
 
 export default function LiveTrading() {
   const overview = useDataSelector<any>((s) => s.overview);
   const strategies = useDataSelector<any[]>((s) => s.strategies);
   const positions = useDataSelector<any[]>((s) => s.positions);
+  const orders = useDataSelector<any[]>((s) => s.orders);
   const fills = useDataSelector<any[]>((s) => s.fills);
-  const goldOverview = useDataSelector<any>((s) => s.goldOverview);
-  const silverOverview = useDataSelector<any>((s) => s.silverOverview);
   const marketData = useDataSelector<any>((s) => s.marketData);
-  if (!overview) return <div style={{ padding: "20px", color: "var(--text-muted)" }}>Loading...</div>;
+  const gold = useDataSelector<any>((s) => s.goldOverview);
+  const silver = useDataSelector<any>((s) => s.silverOverview);
+  const connected = useDataSelector<boolean>((s) => s.connected);
+  const snapshotStatus = useDataSelector<any>((s) => s.snapshotStatus);
+  const lastError = useDataSelector<string | null>((s) => s.lastError);
+  if (!overview || snapshotStatus.overview !== "live") return <div className="desk-unavailable"><ShieldAlert size={21}/><div><strong>Current account snapshot unavailable</strong><p>The dashboard has not received a successful account snapshot, so positions, triggers, and P&amp;L cannot be confirmed.</p>{lastError && <small>{lastError}</small>}</div></div>;
 
-  const openPositions = positions.filter((p: any) => p.is_open);
-  const ltpFor = (instrument: string) => Number(
-    marketData?.instruments?.[instrument]?.ltp
-      ?? (instrument === "GOLDM" ? goldOverview?.ltp : undefined)
-      ?? (instrument === "SILVERM" ? silverOverview?.ltp : undefined)
-      ?? 0,
-  );
-  // Show instruments supplied by the feed as well as instruments currently
-  // used by strategies/positions. This keeps non-mini contracts (e.g.
-  // GOLDPETAL) visible instead of silently assigning them SILVERM's quote.
-  const instrumentNames = Array.from(new Set([
-    ...Object.keys(marketData?.instruments ?? {}),
-    ...strategies.map((s: any) => s.instrument).filter(Boolean),
-    ...openPositions.map((p: any) => p.instrument).filter(Boolean),
-  ])).sort();
-  const instrumentCards = instrumentNames.map((name) => ({
-    name,
-    ltp: ltpFor(name),
-    strats: strategies.filter((s: any) => s.instrument === name),
-  }));
+  const open = positions.filter((position: any) => position.is_open);
+  const overviewKnown = Boolean(overview.execution_mode && !["UNKNOWN", "UNAVAILABLE"].includes(String(overview.execution_mode).toUpperCase()));
+  const positionsKnown = snapshotStatus.positions === "live";
+  const strategiesKnown = snapshotStatus.strategies === "live";
+  const ordersKnown = snapshotStatus.orders === "live";
+  const fillsKnown = snapshotStatus.fills === "live";
+  const getLtp = (instrument: string) => safeNum(marketData?.instruments?.[instrument]?.ltp ?? (instrument === "GOLDM" ? gold?.ltp : instrument === "SILVERM" ? silver?.ltp : undefined));
+  const instruments = [...new Set([...Object.keys(marketData?.instruments ?? {}), ...strategies.map((s: any) => s.instrument), ...open.map((p: any) => p.instrument)].filter(Boolean))].sort();
+  const activeTriggers = strategiesKnown ? strategies.flatMap((strategy: any) => [
+    strategy.pending_exit_trigger ? { ...strategy.pending_exit_trigger, strategy, triggerKind: "REVERSAL EXIT" } : null,
+    strategy.pending_entry ? { ...strategy.pending_entry, strategy, triggerKind: strategy.pending_entry?.metadata?.is_reversal_entry ? "REVERSAL ENTRY" : "ENTRY" } : null,
+  ].filter(Boolean) as any[]) : [];
+  const workingOrders = orders.filter((order: any) => activeOrderStates.has(orderState(order)));
+  const unclassifiedOrders = orders.filter((order: any) => !activeOrderStates.has(orderState(order)) && !new Set(["created", "filled", "rejected", "cancelled", "canceled", "expired", "complete", "completed"]).has(orderState(order)));
 
-  // Show the next live trigger: reversal exits first, then the opposite entry.
-  const pendingEntries = strategies
-    .filter((s: any) => s.pending_exit_trigger || s.pending_entry)
-    .map((s: any) => ({
-      strategy_id: s.strategy_id,
-      instrument: s.instrument,
-      ltp: ltpFor(s.instrument),
-      ...(s.pending_exit_trigger || s.pending_entry),
-    }));
+  return <div className="live-floor">
+    <section className="desk-hero">
+      <div><div className="eyebrow">REAL-TIME EXECUTION</div><h2>Live execution desk</h2><p>Runtime state, armed triggers, broker orders, open positions, and local stop monitoring.</p></div>
+      <div className="desk-hero-status"><StateTag kind={connected ? "good" : "bad"}>{connected ? "Dashboard socket connected" : "Dashboard socket disconnected"}</StateTag><StateTag kind={marketData?.ws_connected ? "good" : "warn"}>{marketData?.ws_connected ? "Market feed live" : "Market feed unknown"}</StateTag><StateTag kind={overview.execution_mode === "LIVE" ? "bad" : "neutral"}>{overview.execution_mode || "MODE UNKNOWN"}</StateTag></div>
+    </section>
 
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-      <div className="split-grid-2">
-        {instrumentCards.map(({ name, ltp, strats }) => (
-          <div key={name} className="lift animate-fade-in-up" style={{ ...panelStyle, padding: "12px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-              <span style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>
-                {name}
-                <span className={ltp > 0 ? "animate-pulse-dot" : ""} style={{ width: "5px", height: "5px", borderRadius: "50%", background: ltp > 0 ? "var(--green)" : "var(--red)", ["--dot" as any]: ltp > 0 ? "var(--green)" : "var(--red)" }} />
-              </span>
-              <span className="tabular-nums" style={{ fontSize: "20px", fontWeight: 700, color: "var(--text-primary)" }}>
-                {ltp > 0 ? safeINR(ltp) : "—"}
-              </span>
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "4px" }}>
-              {strats.map((s: any) => (
-                <div key={s.strategy_id} style={{ display: "flex", alignItems: "center", gap: "4px", padding: "3px 8px", background: "var(--bg-table-header)", borderRadius: "4px", fontSize: "9px" }}>
-                  <span style={{ width: "4px", height: "4px", borderRadius: "50%", background: statusDot(s.state) }} />
-                  <span style={{ color: "var(--text-secondary)" }}>{s.strategy_id}</span>
-                  {s.position_side && <span style={{ color: s.position_side === "LONG" ? "var(--green)" : "var(--red)", fontWeight: 600 }}>{s.position_side}</span>}
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
-        {instrumentCards.length === 0 && <div style={{ ...panelStyle, padding: "12px", color: "var(--text-muted)", fontSize: "10px" }}>No configured instruments</div>}
-      </div>
+    {overview.kill_switch && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Kill switch is active</b><small>Trading is halted according to the current runtime state.</small></div></div>}
 
-      <div className="lift" style={panelStyle}>
-        <div style={{ ...header, display: "flex", justifyContent: "space-between" }}>
-          <span>OPEN POSITIONS ({openPositions.length})</span>
-          {openPositions.length > 0 && <span style={{ color: pnlColor(overview.unrealized_pnl), fontWeight: 600 }}>{formatINR(overview.unrealized_pnl)}</span>}
-        </div>
-        {openPositions.length === 0 ? (
-          <div className="animate-fade-in-up" style={{ padding: "24px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>No open positions — all flat</div>
-        ) : (
-          <>
-            <div style={{ display: "grid", gridTemplateColumns: "70px 100px 50px 40px 80px 50px 90px", gap: "8px", padding: "5px 12px", fontSize: "9px", color: "var(--text-disabled)", textTransform: "uppercase", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-table-header)", position: "sticky" }}>
-              <span>Instrument</span><span>Strategy</span><span>Side</span><span>Qty</span><span>Entry</span><span>SL</span><span style={{ textAlign: "right" }}>P&L</span>
-            </div>
-            {openPositions.map((p: any) => (
-              <div key={p.position_id} className="hover-row" style={{ display: "grid", gridTemplateColumns: "70px 100px 50px 40px 80px 50px 90px", gap: "8px", padding: "5px 12px", fontSize: "10px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center" }}>
-                <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{p.instrument}</span>
-                <span style={{ color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.strategy_id}</span>
-                <span style={{ color: p.side === "LONG" ? "var(--green)" : "var(--red)", fontWeight: 600 }}>{p.side}</span>
-                <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{p.quantity}</span>
-                <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{safeINR(p.average_entry)}</span>
-                <span className="tabular-nums" style={{ color: "var(--text-muted)" }}>{p.stop_price ? safeINR(p.stop_price) : "—"}</span>
-                <span className="tabular-nums" style={{ color: pnlColor(p.unrealized_pnl), fontWeight: 600, textAlign: "right" }}>
-                  {p.unrealized_pnl >= 0 ? "+" : ""}₹{safeNum(p.unrealized_pnl).toLocaleString("en-IN", { minimumFractionDigits: 2 })}
-                </span>
-              </div>
-            ))}
-          </>
-        )}
-      </div>
+    <section className="desk-metrics">
+      <Value label="Open positions" value={positionsKnown ? open.length : "—"}/>
+      <Value label="Armed triggers" value={strategiesKnown ? activeTriggers.length : "—"}/>
+      <Value label="Working broker orders" value={ordersKnown ? workingOrders.length : "—"}/>
+      <Value label="Engine unrealized P&L" value={overviewKnown ? formatINR(overview.unrealized_pnl) : "—"} emphasis={pnlColor(overview.unrealized_pnl)}/>
+      <Value label="Engine realized P&L" value={overviewKnown ? formatINR(overview.realized_pnl) : "—"} emphasis={pnlColor(overview.realized_pnl)}/>
+      <Value label="Dhan available margin" value={overviewKnown ? safeINR(overview.available_margin) : "—"}/>
+    </section>
 
-      <div className="lift" style={panelStyle}>
-        <div style={{ ...header, display: "flex", justifyContent: "space-between" }}>
-          <span>PENDING ENTRIES ({pendingEntries.length})</span>
-          {pendingEntries.length > 0 && <span style={{ color: "var(--amber)", fontWeight: 600, fontSize: "9px" }}>WAITING FOR TRIGGER</span>}
-        </div>
-        {pendingEntries.length === 0 ? (
-          <div className="animate-fade-in-up" style={{ padding: "20px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>No pending entries</div>
-        ) : (
-          pendingEntries.map((pe: any) => {
-            const isShort = pe.side === "SHORT";
-            const isReversalExit = pe.metadata?.pending_trigger_kind === "REVERSAL_EXIT";
-            const isReversal = Boolean(pe.metadata?.is_reversal_entry || isReversalExit);
-            const exitAction = isShort ? "SELL (Exit Long)" : "BUY (Exit Short)";
-            const enterAction = isShort ? "SELL (Enter Short)" : "BUY (Enter Long)";
-            return (
-              <div key={pe.strategy_id} style={{ borderBottom: "1px solid var(--border-subtle)", padding: "10px 12px" }}>
-                {/* Header row */}
-                <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "8px" }}>
-                  <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                    <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "var(--amber)", animation: "pulse 2s infinite" }} />
-                    <span style={{ color: "var(--text-primary)", fontWeight: 600, fontSize: "11px" }}>{pe.instrument}</span>
-                  </span>
-                  <span style={{ color: "var(--text-muted)", fontSize: "10px" }}>{pe.strategy_id}</span>
-                  <span style={{ color: isShort ? "var(--red)" : "var(--green)", fontWeight: 700, fontSize: "11px" }}>{pe.side} {isReversal ? "REVERSAL" : "ENTRY"}</span>
-                  <span style={{ color: "var(--text-muted)", fontSize: "9px", marginLeft: "auto" }}>Qty: {pe.quantity}</span>
-                </div>
-                {/* The active trigger state and its live market input */}
-                <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
-                  <span style={{ display: "inline-flex", padding: "3px 8px", background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: "4px", fontSize: "9px", color: "var(--amber)" }}>
-                    {isReversalExit ? "REVERSAL EXIT" : isReversal ? "REVERSAL ENTRY" : "ENTRY"} · {pe.trigger_state ?? "ARMED"}
-                  </span>
-                  <span style={{ display: "inline-flex", padding: "3px 8px", border: "1px solid var(--border-subtle)", borderRadius: "4px", fontSize: "9px", color: "var(--text-secondary)" }}>
-                    LTP {pe.ltp > 0 ? safeINR(pe.ltp) : "—"}
-                  </span>
-                  <span style={{ display: "inline-flex", padding: "3px 8px", border: "1px solid var(--border-subtle)", borderRadius: "4px", fontSize: "9px", color: "var(--text-secondary)" }}>
-                    {isReversalExit ? exitAction : enterAction} when {isShort ? "LTP ≤" : "LTP ≥"} {safeINR(pe.trigger_price)}
-                  </span>
-                </div>
-                {/* Signal candle details */}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: "6px", fontSize: "9px", background: "var(--bg-table-header)", padding: "6px 8px", borderRadius: "4px", marginBottom: "6px" }}>
-                  <div><span style={{ color: "var(--text-disabled)" }}>Signal Time: </span><span style={{ color: "var(--text-secondary)" }}>{pe.signal_candle_start ? formatTimestamp(pe.signal_candle_start) : "—"}</span></div>
-                  <div><span style={{ color: "var(--text-disabled)" }}>Created: </span><span style={{ color: "var(--text-secondary)" }}>{pe.created_at ? formatTimestamp(pe.created_at) : "—"}</span></div>
-                  <div><span style={{ color: "var(--text-disabled)" }}>Trigger: </span><span style={{ color: "var(--amber)", fontWeight: 600 }}>{safeINR(pe.trigger_price)}</span></div>
-                  <div><span style={{ color: "var(--text-disabled)" }}>SL: </span><span style={{ color: "var(--text-secondary)" }}>{pe.stop_price ? safeINR(pe.stop_price) : "—"}</span></div>
-                </div>
-                {/* Signal candle OHLC */}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr 1fr 1fr", gap: "4px", fontSize: "9px", padding: "4px 8px" }}>
-                  <div><span style={{ color: "var(--text-disabled)" }}>Open: </span><span style={{ color: "var(--text-secondary)" }}>{pe.signal_candle_open ? safeINR(pe.signal_candle_open) : "—"}</span></div>
-                  <div><span style={{ color: "var(--text-disabled)" }}>High: </span><span style={{ color: "var(--text-secondary)" }}>{pe.signal_candle_high ? safeINR(pe.signal_candle_high) : "—"}</span></div>
-                  <div><span style={{ color: "var(--text-disabled)" }}>Low: </span><span style={{ color: "var(--text-secondary)" }}>{pe.signal_candle_low ? safeINR(pe.signal_candle_low) : "—"}</span></div>
-                  <div><span style={{ color: "var(--text-disabled)" }}>Close: </span><span style={{ color: "var(--text-secondary)" }}>{pe.signal_candle_close ? safeINR(pe.signal_candle_close) : "—"}</span></div>
-                  <div><span style={{ color: "var(--text-disabled)" }}>HTF DEMA-ATR: </span><span style={{ color: "var(--text-secondary)" }}>{pe.signal_htf_dema_atr ? safeINR(pe.signal_htf_dema_atr) : "—"}</span></div>
-                  <div><span style={{ color: "var(--text-disabled)" }}>Mid DEMA-ATR: </span><span style={{ color: "var(--text-secondary)" }}>{pe.signal_mid_dema_atr ? safeINR(pe.signal_mid_dema_atr) : "—"}</span></div>
-                  <div><span style={{ color: "var(--text-disabled)" }}>Fast DEMA-ATR: </span><span style={{ color: "var(--text-secondary)" }}>{pe.signal_fast_dema_atr ? safeINR(pe.signal_fast_dema_atr) : "—"}</span></div>
-                </div>
-                {/* Bars pending */}
-                <div style={{ fontSize: "9px", color: "var(--text-muted)", padding: "4px 8px" }}>
-                  Bars waiting: <span style={{ color: "var(--amber)" }}>{pe.bars_pending ?? 0}</span>
-                </div>
-              </div>
-            );
-          })
-        )}
-      </div>
+    <section className="desk-section">
+      <div className="desk-section-heading"><div><div className="eyebrow">MARKET WATCH</div><h3>Instruments</h3></div><StateTag kind={marketData?.ws_connected ? "good" : "warn"}>{marketData?.ws_connected ? "Feed connected" : "Feed status unknown"}</StateTag></div>
+      <div className="instrument-grid">{instruments.length ? instruments.map((instrument) => {
+        const quote = marketData?.instruments?.[instrument];
+        const ltp = getLtp(instrument);
+        const linked = strategies.filter((strategy: any) => strategy.instrument === instrument);
+        return <article className="instrument-card" key={instrument}><div className="instrument-card-head"><div><span className="instrument-symbol">{instrument}</span><small>{linked.length ? linked.map((strategy: any) => strategy.strategy_id).join(" · ") : "No strategy assigned"}</small></div><StateTag kind={ltp > 0 ? "good" : "warn"}>{ltp > 0 ? "Live price" : "No quote"}</StateTag></div><strong className="instrument-price tabular-nums">{ltp > 0 ? safeINR(ltp) : "—"}</strong><div className="instrument-foot"><span>Last update <b>{quote?.updated_at ? formatTimestamp(quote.updated_at) : quote?.timestamp ? formatTimestamp(quote.timestamp) : "—"}</b></span><span>{linked.length} strategy{linked.length === 1 ? "" : "ies"}</span></div></article>;
+      }) : <div className="empty-state"><div><b>Instrument state is not confirmed.</b><small>No feed or strategy snapshot has arrived.</small></div></div>}</div>
+    </section>
 
-      <div className="lift" style={panelStyle}>
-        <div style={header}>RECENT FILLS ({fills.length})</div>
-        <div style={{ maxHeight: "200px", overflow: "auto" }}>
-          {fills.length === 0 ? (
-            <div className="animate-fade-in-up" style={{ padding: "20px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>No fills yet</div>
-          ) : (
-            fills.slice(0, 20).map((f: any) => (
-              <div key={f.fill_id} className="hover-row" style={{ display: "flex", alignItems: "center", gap: "10px", padding: "4px 12px", fontSize: "10px", borderBottom: "1px solid var(--border-subtle)" }}>
-                <span className="tabular-nums" style={{ color: "var(--text-muted)", width: "55px" }}>{formatTimestamp(f.timestamp)}</span>
-                <span style={{ color: "var(--text-primary)", fontWeight: 500, width: "55px" }}>{f.instrument}</span>
-                <span style={{ color: f.side === "BUY" ? "var(--green)" : "var(--red)", fontWeight: 600 }}>{f.side}</span>
-                <span style={{ color: "var(--text-secondary)" }}>{f.quantity}</span>
-                <span className="tabular-nums" style={{ color: "var(--text-primary)" }}>{safeINR(f.price)}</span>
-                <div style={{ flex: 1 }} />
-                <span style={{ color: "var(--text-muted)", fontSize: "9px" }}>{f.strategy_id}</span>
-              </div>
-            ))
-          )}
-        </div>
-      </div>
+    <section className="desk-section">
+      <div className="desk-section-heading"><div><div className="eyebrow">POSITION EXPOSURE</div><h3>Open positions <span className="count-chip">{positionsKnown ? open.length : "—"}</span></h3></div><div className="source-note">P&amp;L below is the engine’s local calculation</div></div>
+      {open.length === 0 ? <div className="empty-state">{positionsKnown ? <CircleCheck size={18}/> : <ShieldAlert size={18}/>}<div><b>{positionsKnown ? "No open local positions." : "Position state is not confirmed."}</b><small>{positionsKnown ? "No position records are open in the latest runtime snapshot." : "The positions source has not returned successfully. Do not treat this as a confirmed flat account."}</small></div></div> : <div className="position-list">
+        {open.map((position: any) => {
+          const ltp = getLtp(position.instrument);
+          const sl = position.stop_price;
+          const stopState = String(position.sl_state || position.stop_state || "").toUpperCase();
+          const protectedState = stopState.includes("ARM") || stopState === "ACTIVE" || stopState === "MONITORING";
+          return <article className="position-card" key={position.position_id}>
+            <div className="position-card-instrument"><span className={`side-mark ${position.side === "LONG" ? "long" : "short"}`}>{position.side === "LONG" ? <ArrowUpRight size={17}/> : <ArrowDownRight size={17}/>}</span><div><strong>{position.instrument}</strong><small>{position.strategy_id} · {String(position.position_id || "").slice(0, 8)}</small></div></div>
+            <Value label="Quantity" value={position.quantity}/><Value label="Average entry" value={safeINR(position.average_entry)}/><Value label="Market price" value={ltp > 0 ? safeINR(ltp) : "—"}/>
+            <div className="desk-value stop-value"><small>Local stop monitor</small><strong>{sl ? safeINR(sl) : "No stop price"}</strong><StateTag kind={protectedState ? "good" : "warn"}>{protectedState ? stopState : stopState || "STATE NOT EXPOSED"}</StateTag></div>
+            <div className="position-card-pnl"><small>Local unrealized P&amp;L</small><strong style={{ color: pnlColor(position.unrealized_pnl) }}>{formatINR(position.unrealized_pnl)}</strong></div>
+          </article>;
+        })}
+      </div>}
+    </section>
+
+    <section className="desk-section">
+      <div className="desk-section-heading"><div><div className="eyebrow">SIGNAL TO EXECUTION</div><h3>Active trigger queue <span className="count-chip">{strategiesKnown ? activeTriggers.length : "—"}</span></h3></div><span className="source-note">Strategy runtime state · trigger queue is not a broker order</span></div>
+      {!activeTriggers.length ? <div className="empty-state">{strategiesKnown ? <CircleCheck size={18}/> : <ShieldAlert size={18}/>}<div><b>{strategiesKnown ? "No armed entry or reversal trigger." : "Trigger state is not confirmed."}</b><small>{strategiesKnown ? "Latest strategy state contains no pending trigger. Orders already sent to Dhan appear in the working orders panel below." : "No strategy snapshot has arrived, so the empty queue does not prove that no trigger is pending."}</small></div></div> : <div className="trigger-list">{activeTriggers.map((item: any, index: number) => {
+        const side = String(item.side || item.direction || item.strategy?.position_side || "").toUpperCase();
+        const ltp = getLtp(item.strategy.instrument);
+        const triggerPrice = safeNum(item.trigger_price ?? item.trigger);
+        const distance = ltp && triggerPrice ? Math.abs(triggerPrice - ltp) : null;
+        return <article className="trigger-card" key={`${item.strategy.strategy_id}-${item.triggerKind}-${index}`}>
+          <div className="trigger-card-head"><div><span className="trigger-badge">{item.triggerKind}</span><strong>{item.strategy.instrument} · {item.strategy.strategy_id}</strong></div><StateTag kind="warn">{item.trigger_state || "ARMED"}</StateTag></div>
+          <div className="trigger-values"><Value label="Direction" value={side || "—"}/><Value label="Trigger price" value={triggerPrice ? safeINR(triggerPrice) : "—"}/><Value label="Current price" value={ltp ? safeINR(ltp) : "—"}/><Value label="Distance" value={distance === null ? "—" : safeINR(distance)}/><Value label="Stop level" value={item.stop_price ? safeINR(item.stop_price) : "—"}/><Value label="Signal candle" value={item.signal_candle_start ? formatTimestamp(item.signal_candle_start) : "—"}/></div>
+          {(item.signal_candle_open || item.signal_candle_high || item.signal_candle_low || item.signal_candle_close) && <div className="candle-strip">{[["O",item.signal_candle_open],["H",item.signal_candle_high],["L",item.signal_candle_low],["C",item.signal_candle_close]].map(([label,value]: any)=><span key={label}><small>{label}</small><b>{value ? safeINR(value) : "—"}</b></span>)}</div>}
+        </article>;
+      })}</div>}
+    </section>
+
+    <section className="desk-section">
+      <div className="desk-section-heading"><div><div className="eyebrow">DHAN ORDER LIFECYCLE</div><h3>Working broker orders <span className="count-chip">{ordersKnown ? workingOrders.length : "—"}</span></h3></div><span className="source-note">Filled/rejected/cancelled orders are in Orders</span></div>
+      {!ordersKnown ? <div className="empty-state"><ShieldAlert size={18}/><div><b>Broker order state is not confirmed.</b><small>The order source has not returned successfully; the working-order count is unknown.</small></div></div> : workingOrders.length === 0 && unclassifiedOrders.length === 0 ? <div className="empty-state"><CircleCheck size={18}/><div><b>No working broker orders.</b><small>All orders in the latest successful snapshot are terminal.</small></div></div> : <div className="order-list">{[...workingOrders, ...unclassifiedOrders].map((order: any)=><div className="order-row" key={order.order_id}><span><b>{order.instrument}</b><small>{order.strategy_id} · {String(order.order_id || "").slice(0, 12)}</small></span><b className={order.side === "BUY" ? "positive" : "negative"}>{order.side}</b><span>{order.filled_quantity ?? 0} / {order.quantity ?? "—"} filled</span><span>{order.order_type || order.type || "—"}</span><StateTag kind={activeOrderStates.has(orderState(order)) ? "warn" : "neutral"}>{order.state || order.status || order.order_status || "UNCLASSIFIED"}</StateTag></div>)}</div>}
+    </section>
+
+    <div className="desk-bottom-grid">
+      <section className="desk-section"><div className="desk-section-heading"><div><div className="eyebrow">LATEST EXECUTIONS</div><h3>Recent fills</h3></div><Waypoints size={17}/></div>{!fillsKnown ? <div className="empty-state">Fill state is not confirmed.</div> : fills.slice(0,8).length ? <div className="order-list">{fills.slice(0,8).map((fill: any)=><div className="order-row fill-row" key={fill.fill_id}><span><b>{fill.instrument}</b><small>{fill.strategy_id} · {formatTimestamp(fill.timestamp)}</small></span><b className={fill.side === "BUY" ? "positive" : "negative"}>{fill.side}</b><span>{fill.quantity} filled</span><strong className="tabular-nums">{safeINR(fill.price)}</strong></div>)}</div> : <div className="empty-state">No fills in the current snapshot.</div>}</section>
+      <section className="desk-section"><div className="desk-section-heading"><div><div className="eyebrow">ACCOUNT SNAPSHOT</div><h3>Broker and runtime</h3></div><Activity size={17}/></div><div className="account-grid"><Value label="Execution mode" value={overview.execution_mode || "—"}/><Value label="Margin used" value={overviewKnown ? safeINR(overview.margin_used) : "—"}/><Value label="Available margin" value={overviewKnown ? safeINR(overview.available_margin) : "—"}/><Value label="Orders reported" value={ordersKnown ? orders.length : "—"}/><Value label="Updated feed" value={marketData?.updated_at ? formatTimestamp(marketData.updated_at) : "Shown per instrument"}/><Value label="Position source" value={positionsKnown ? "Runtime local state" : "Not confirmed"}/></div><div className="desk-disclaimer"><Clock3 size={14}/>This page labels local engine values explicitly. Broker account P&amp;L and broker positions are available in Operations when returned by Dhan.</div></section>
     </div>
-  );
+  </div>;
 }

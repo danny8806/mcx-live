@@ -126,6 +126,27 @@ def _safe(val, default=0.0):
     return float(val) if val is not None else default
 
 
+def _active_order_count(execution_engine, snapshot: dict) -> int:
+    """Count in-flight orders, not all retained order history."""
+    orders = snapshot.get("orders") if isinstance(snapshot, dict) else None
+    if isinstance(orders, dict):
+        rows = list(orders.values())
+    elif isinstance(orders, (list, tuple)):
+        rows = list(orders)
+    else:
+        retained = getattr(execution_engine, "_orders", {}) or {}
+        rows = list(retained.values()) if isinstance(retained, dict) else []
+
+    active_states = {"created", "submitted", "acknowledged", "partially_filled"}
+    count = 0
+    for order in rows:
+        state = order.get("state") if isinstance(order, dict) else getattr(order, "state", None)
+        state = getattr(state, "value", state)
+        if str(state or "").strip().lower().replace(" ", "_") in active_states:
+            count += 1
+    return count
+
+
 def _get_overview_sync(env=None):
     if not _engine:
         return {"error": "Engine not initialized"}
@@ -205,7 +226,7 @@ def _get_overview_sync(env=None):
             "book_equity": {"value": book_equity, "timestamp": _ts()},
             "book_starting_capital": {"value": book_starting, "timestamp": _ts()},
             "open_positions_count": {"value": len(open_pos), "timestamp": _ts()},
-            "active_orders_count": {"value": orders_snap.get("orders_count", 0), "timestamp": _ts()},
+            "active_orders_count": {"value": _active_order_count(env.execution_engine, orders_snap), "timestamp": _ts()},
             "active_strategies_count": {"value": len(strategies_snap), "timestamp": _ts()},
             "kill_switch": {"value": risk_snap.get("kill_switch_active", False), "timestamp": _ts()},
             "failure_states": _watch_failure_states(env),

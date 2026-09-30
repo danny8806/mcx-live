@@ -240,6 +240,7 @@ function TradeRow({ trade, isExpanded, onToggle }: {
 
 export default function Trades() {
   const trades = useDataSelector<any[]>((s) => s.trades);
+  const tradesStatus = useDataSelector((s) => s.snapshotStatus.trades);
   const [expandedTradeId, setExpandedTradeId] = useState<string | null>(null);
 
   if (!trades) return (
@@ -253,9 +254,13 @@ export default function Trades() {
   return (
     <div className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", overflow: "hidden" }}>
       <div style={{ padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", fontSize: "10px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>
-        TRADEBOOK ({trades.length}) — FULL LIFECYCLE
+        TRADEBOOK ({tradesStatus === "live" ? trades.length : "—"}) — FULL LIFECYCLE
       </div>
-      {trades.length === 0 ? (
+      {tradesStatus !== "live" ? (
+        <div role="status" style={{ padding: "40px", textAlign: "center", color: tradesStatus === "error" ? "var(--red)" : "var(--text-muted)", fontSize: "10px" }}>
+          {tradesStatus === "error" ? "Trade data could not be loaded. The empty list is not confirmed." : "Loading trade data..."}
+        </div>
+      ) : trades.length === 0 ? (
         <div className="animate-fade-in-up" style={{ padding: "40px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>No completed trades recorded</div>
       ) : (
         <>

@@ -113,8 +113,8 @@ export default function Positions() {
           {view === "open" ? "No open positions — all flat" : "No positions in this view"}
         </div>
       ) : (
-        <>
-          <div style={{ display: "grid", gridTemplateColumns: "70px 110px 50px 40px 80px 80px 55px 70px 60px 90px", gap: "8px", padding: "5px 12px", fontSize: "9px", color: "var(--text-disabled)", textTransform: "uppercase", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-table-header)", position: "sticky", top: 0, zIndex: 1 }}>
+        <div className="ledger-grid-viewport">
+          <div className="ledger-grid-head" style={{ display: "grid", gridTemplateColumns: "70px 110px 50px 40px 80px 80px 55px 70px 60px 90px", gap: "8px", padding: "8px 12px", fontSize: "9px", color: "var(--text-disabled)", textTransform: "uppercase", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-table-header)", position: "sticky", top: 0, zIndex: 1 }}>
             <span>Instrument</span><span>Strategy</span><span>Side</span><span>Qty</span><span>Entry</span><span>LTP/Exit</span><span>SL</span><span>Margin</span><span>Status</span><span style={{ textAlign: "right" }}>P&L</span>
           </div>
           {list.map((p: any) => {
@@ -125,7 +125,7 @@ export default function Positions() {
             const expanded = expandedId === p.position_id;
             return (
               <div key={p.position_id}>
-                <div className="hover-row" onClick={() => toggleDetail(p.position_id)} style={{ display: "grid", gridTemplateColumns: "70px 110px 50px 40px 80px 80px 55px 70px 60px 90px", gap: "8px", padding: "5px 12px", fontSize: "10px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center", cursor: "pointer" }}>
+                <div className="ledger-grid-row hover-row" onClick={() => toggleDetail(p.position_id)} style={{ display: "grid", gridTemplateColumns: "70px 110px 50px 40px 80px 80px 55px 70px 60px 90px", gap: "8px", padding: "9px 12px", fontSize: "10px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center", cursor: "pointer" }}>
                   <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{p.instrument}</span>
                   <span style={{ color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.strategy_id}</span>
                   <span style={{ color: p.side === "LONG" ? "var(--green)" : "var(--red)", fontWeight: 600 }}>{p.side}</span>
@@ -178,7 +178,7 @@ export default function Positions() {
               </div>
             );
           })}
-        </>
+        </div>
       )}
     </div>
   );

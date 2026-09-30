@@ -1,7 +1,6 @@
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { DataProvider } from "./store/DataProvider";
 import Layout from "./components/layout/Layout";
-import Overview from "./pages/Overview";
 import LiveTrading from "./pages/LiveTrading";
 import LiveOps from "./pages/LiveOps";
 import Strategies from "./pages/Strategies";
@@ -26,8 +25,8 @@ export default function App() {
       <BrowserRouter>
         <Routes>
           <Route element={<Layout />}>
-            <Route path="/" element={<Overview />} />
-            <Route path="/live" element={<LiveTrading />} />
+            <Route path="/" element={<LiveTrading />} />
+            <Route path="/live" element={<Navigate to="/" replace />} />
             <Route path="/live-ops" element={<LiveOps />} />
             <Route path="/strategies" element={<Strategies />} />
             <Route path="/matrix" element={<StrategyMatrix />} />

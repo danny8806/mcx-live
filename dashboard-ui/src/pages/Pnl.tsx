@@ -63,16 +63,19 @@ export default function Pnl() {
   );
 
   const instruments = Object.entries(pnlByInstrument);
+  const mode = String(pnl.execution_mode ?? "").toUpperCase();
+  const portfolioSource = mode === "LIVE" ? "Account snapshot · live mode" : "Engine account snapshot · paper mode";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+      <div className="pnl-source-banner"><div><strong>{mode || "ENGINE"} P&amp;L SOURCE BREAKDOWN</strong><span>Realized totals come from strategy P&amp;L engines. Unrealized P&amp;L, net P&amp;L, charges, and equity come from the {portfolioSource.toLowerCase()}. These sources can differ while broker and local ledgers reconcile.</span></div><span className="pnl-source-chip">{portfolioSource}</span></div>
       <div className="metric-grid">
         {[
-          ["NET P&L", pnl.net_pnl],
-          ["REALIZED", pnl.realized_pnl],
-          ["UNREALIZED", pnl.unrealized_pnl],
-          ["CHARGES", pnl.charges],
-          ["EQUITY", pnl.equity],
+          ["NET P&L · ACCOUNT SNAPSHOT", pnl.net_pnl],
+          ["REALIZED · STRATEGY LEDGER", pnl.realized_pnl],
+          ["UNREALIZED · ACCOUNT SNAPSHOT", pnl.unrealized_pnl],
+          ["CHARGES · ACCOUNT SNAPSHOT", pnl.charges],
+          ["EQUITY · ACCOUNT SNAPSHOT", pnl.equity],
         ].map(([label, val]) => (
           <div key={String(label)} className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", padding: "10px 12px" }}>
             <div style={{ fontSize: "9px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "4px" }}>{String(label)}</div>
@@ -99,13 +102,13 @@ export default function Pnl() {
         {instruments.length === 0 ? (
           <div className="animate-fade-in-up" style={{ padding: "24px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>No instrument data</div>
         ) : (
-          <>
-            <div style={{ display: "grid", gridTemplateColumns: "80px 1fr 1fr 1fr 60px 50px 50px", gap: "8px", padding: "5px 12px", fontSize: "9px", color: "var(--text-disabled)", textTransform: "uppercase", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-table-header)", position: "sticky", top: 0, zIndex: 1 }}>
+          <div className="ledger-grid-viewport">
+            <div className="ledger-grid-head pnl-grid" style={{ display: "grid", gridTemplateColumns: "100px 1fr 1fr 1fr 70px 60px 70px", gap: "10px", padding: "8px 14px", fontSize: "9px", color: "var(--text-disabled)", textTransform: "uppercase", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-table-header)", position: "sticky", top: 0, zIndex: 1 }}>
               <span>Instrument</span><span style={{ textAlign: "right" }}>Gross</span><span style={{ textAlign: "right" }}>Charges</span><span style={{ textAlign: "right" }}>Net</span><span style={{ textAlign: "right" }}>Trades</span><span style={{ textAlign: "right" }}>Wins</span><span style={{ textAlign: "right" }}>Win%</span>
             </div>
             {instruments.map(([inst, data]: [string, any]) => (
               <div key={inst}>
-                <div className="hover-row" onClick={() => loadInstrument(inst)} style={{ display: "grid", gridTemplateColumns: "80px 1fr 1fr 1fr 60px 50px 50px", gap: "8px", padding: "5px 12px", fontSize: "10px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center", cursor: "pointer" }}>
+                <div className="ledger-grid-row pnl-grid hover-row" onClick={() => loadInstrument(inst)} style={{ display: "grid", gridTemplateColumns: "100px 1fr 1fr 1fr 70px 60px 70px", gap: "10px", padding: "9px 14px", fontSize: "10px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center", cursor: "pointer" }}>
                   <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{inst}</span>
                   <span className="tabular-nums" style={{ color: pnlColor(data.realized_gross), textAlign: "right" }}>{formatINR(data.realized_gross)}</span>
                   <span className="tabular-nums" style={{ color: "var(--text-muted)", textAlign: "right" }}>{formatINR(data.realized_charges)}</span>
@@ -197,7 +200,7 @@ export default function Pnl() {
                 )}
               </div>
             ))}
-          </>
+          </div>
         )}
       </div>
     </div>

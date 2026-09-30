@@ -26,6 +26,17 @@ const rowStyle: React.CSSProperties = {
   fontSize: "10px",
 };
 
+const hiddenSetting = /token|secret|password|credential|api.?key|db.?path|state.?path|file.?path/i;
+function settingLabel(value: string) {
+  return value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+function displaySetting(value: unknown): string {
+  if (typeof value === "boolean") return value ? "Enabled" : "Disabled";
+  if (value === null || value === undefined || value === "") return "Not set";
+  if (typeof value === "object") return "See details";
+  return String(value);
+}
+
 function initialDrafts(settings: any): Record<string, StrategyDraft> {
   const result: Record<string, StrategyDraft> = {};
   for (const [id, cfg] of Object.entries<any>(settings?.strategies ?? {})) {
@@ -45,6 +56,8 @@ function initialDrafts(settings: any): Record<string, StrategyDraft> {
 
 export default function Settings() {
   const settings = useDataSelector<any>((s) => s.settings);
+  const runtimeStrategies = useDataSelector<any[]>((s) => s.strategies);
+  const runtimeConfirmed = runtimeStrategies.length > 0;
   const refresh = useDataSelector<(key?: string) => void>((s) => s.refresh);
   const [drafts, setDrafts] = useState<Record<string, StrategyDraft>>({});
   const [saving, setSaving] = useState<string | null>(null);
@@ -104,7 +117,7 @@ export default function Settings() {
   };
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+    <div className="settings-page" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
       <div style={{ gridColumn: "1 / -1", padding: "8px 12px", borderRadius: "8px", fontSize: "10px", fontWeight: 600, letterSpacing: "0.5px", background: isLive ? "var(--green)" : "var(--amber)", color: "#fff" }}>
         EXECUTION MODE: {isLive ? "LIVE — real orders go to Dhan" : "PAPER — simulated execution"}
       </div>
@@ -122,19 +135,21 @@ export default function Settings() {
             {Object.entries<any>(settings.strategies ?? {}).map(([id, cfg]) => {
               const draft = drafts[id] ?? initialDrafts({ strategies: { [id]: cfg } })[id];
               const message = messages[id];
+              const runtimeActive = runtimeStrategies.some((strategy: any) => strategy.strategy_id === id);
               return (
                 <div key={id} style={{ background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "6px", padding: "10px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
                     <strong style={{ fontSize: "11px", color: "var(--text-primary)" }}>{id} · {cfg.instrument}</strong>
                     <span style={{ color: "var(--text-muted)", fontSize: "9px" }}>{cfg.fast_timeframe} / {cfg.htf_timeframe}</span>
                   </div>
+                  <div className={`settings-runtime-state ${runtimeActive ? "active" : "inactive"}`}><i/>{runtimeActive ? "Attached to running strategy" : runtimeConfirmed ? "Not present in running strategy state; edits disabled" : "Runtime not confirmed; edits disabled"}</div>
                   <div style={rowStyle}>
                     <label htmlFor={`qty-${id}`}>Quantity</label>
-                    <input id={`qty-${id}`} type="number" min={1} step={1} value={draft.quantity} onChange={(event) => updateDraft(id, { quantity: Number(event.target.value) })} style={{ width: "90px", background: "var(--bg-panel)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "4px", padding: "5px 7px" }} />
+                    <input id={`qty-${id}`} type="number" min={1} step={1} disabled={!runtimeActive || saving !== null} value={draft.quantity} onChange={(event) => updateDraft(id, { quantity: Number(event.target.value) })} style={{ width: "90px", background: "var(--bg-panel)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "4px", padding: "5px 7px" }} />
                   </div>
                   <div style={rowStyle}>
                     <label htmlFor={`gate-${id}`}>Live gate</label>
-                    <select id={`gate-${id}`} value={draft.live_gate} onChange={(event) => {
+                    <select id={`gate-${id}`} disabled={!runtimeActive || saving !== null} value={draft.live_gate} onChange={(event) => {
                       const value = event.target.value;
                       const restrictive = value === "CLOSE_ONLY" || value === "EMERGENCY_STOP" || value === "LOCKED";
                       updateDraft(id, {
@@ -155,13 +170,13 @@ export default function Settings() {
                     ["sl_enabled", "Stop monitoring"],
                   ] as const).map(([key, label]) => (
                     <label key={key} style={{ ...rowStyle, justifyContent: "flex-start", cursor: "pointer" }}>
-                      <input type="checkbox" checked={draft[key]} onChange={(event) => updateDraft(id, { [key]: event.target.checked })} />
+                      <input type="checkbox" disabled={!runtimeActive || saving !== null} checked={draft[key]} onChange={(event) => updateDraft(id, { [key]: event.target.checked })} />
                       {label}
                     </label>
                   ))}
                   <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "8px" }}>
-                    <button disabled={saving !== null} onClick={() => saveStrategy(id)} style={{ background: "var(--blue-muted)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "4px", padding: "5px 10px", fontSize: "9px", fontWeight: 600, cursor: saving ? "wait" : "pointer", opacity: saving !== null ? 0.5 : 1 }}>
-                      {saving === id ? "SAVING…" : "SAVE SETTINGS"}
+                    <button disabled={saving !== null || !runtimeActive} onClick={() => saveStrategy(id)} style={{ background: "var(--blue-muted)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "4px", padding: "5px 10px", fontSize: "9px", fontWeight: 600, cursor: saving ? "wait" : "pointer", opacity: saving !== null || !runtimeActive ? 0.5 : 1 }}>
+                      {saving === id ? "SAVING…" : runtimeActive ? "SAVE SETTINGS" : "NOT AVAILABLE"}
                     </button>
                     {message?.text && <span role="status" style={{ color: message.ok ? "var(--green)" : "var(--red)", fontSize: "9px" }}>{message.text}</span>}
                   </div>
@@ -175,20 +190,24 @@ export default function Settings() {
       {sections.map(({ key, label }) => {
         const data = settings[key];
         if (!data) return null;
-        const entries = Object.entries(data).filter(([name]) =>
-          !(isLive && key === "system" && ["db_path", "state_path"].includes(name)));
+        const entries = Object.entries(data).filter(([name]) => !hiddenSetting.test(name));
         return (
-          <div key={key} className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", padding: "12px" }}>
-            <div style={{ fontSize: "10px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "8px" }}>{label}</div>
-            {entries.map(([k, v]) => (
-              <div key={k} style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", padding: "3px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-                <span style={{ color: "var(--text-muted)" }}>{isLive && key === "system" && k === "live_db_path" ? "active_live_db_path" : isLive && key === "system" && k === "live_state_path" ? "active_live_state_path" : k}</span>
-                <span className="tabular-nums" style={{ color: "var(--text-primary)", marginLeft: "8px", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "200px", whiteSpace: "nowrap", textAlign: "right" }}>
-                  {typeof v === "object" ? JSON.stringify(v) : String(v ?? "")}
-                </span>
-              </div>
-            ))}
-          </div>
+          <section key={key} className="settings-summary-card">
+            <div className="settings-summary-heading"><span>{label}</span><small>{entries.length} configured items</small></div>
+            <div className="settings-summary-grid">
+              {entries.map(([name, value]) => {
+                const nested = value && typeof value === "object" && !Array.isArray(value)
+                  ? Object.entries(value as Record<string, unknown>).filter(([child]) => !hiddenSetting.test(child))
+                  : null;
+                return <article className="settings-summary-item" key={name}>
+                  <strong>{settingLabel(name)}</strong>
+                  {nested?.length ? <div className="settings-summary-details">{nested.map(([child, childValue]) => <span key={child}><small>{settingLabel(child)}</small><b>{displaySetting(childValue)}</b></span>)}</div>
+                    : <span>{displaySetting(value)}</span>}
+                </article>;
+              })}
+              {entries.length === 0 && <div className="settings-empty">No displayable settings in this section.</div>}
+            </div>
+          </section>
         );
       })}
     </div>
