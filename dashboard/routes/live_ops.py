@@ -343,12 +343,12 @@ def _get_sync_sync():
     except Exception:
         poller_snap = {}
     service_snap = poller_snap.get("service") or {}
-    poller_stats = stats.get("intervals", {}) or {}
+    poller_intervals = stats.get("intervals", {}) or {}
     last_run = stats.get("last_run", {}) or {}
     stale = {}
     for task in ("orders", "positions", "account", "reconcile"):
         lr = last_run.get(task, 0.0)
-        interval = poller_stats.get(task, 0) or 0
+        interval = poller_intervals.get(task, 0) or 0
         # Stale when more than 2× interval since last successful cycle.
         threshold = max(interval * 3, _STALE_TASK_THRESHOLD_S)
         age = now - lr if lr else None
@@ -369,15 +369,22 @@ def _get_sync_sync():
         "stale_tasks": stale,
         "poller": {
             "running": bool(poller_snap.get("running", False)),
-            "broker_positions_count": poller_stats.get("broker_positions_count", 0),
+            # BrokerSyncService.stats() flattens poller.stats() at the top
+            # level; only polling intervals live under ``intervals``.
+            "broker_positions_count": int(
+                stats.get("broker_positions_count")
+                if stats.get("broker_positions_count") is not None
+                else (poller_snap.get("stats") or {}).get(
+                    "broker_positions_count", 0)
+            ),
             "has_broker_account": bool(poller_snap.get("accounts") or {}),
             "last_position_report": list(poller_snap.get("position_mismatches") or []),
         },
         "polling": {
-            "orders_s": poller_stats.get("orders"),
-            "positions_s": poller_stats.get("positions"),
-            "account_s": poller_stats.get("account"),
-            "reconcile_s": poller_stats.get("reconcile"),
+            "orders_s": poller_intervals.get("orders"),
+            "positions_s": poller_intervals.get("positions"),
+            "account_s": poller_intervals.get("account"),
+            "reconcile_s": poller_intervals.get("reconcile"),
         },
         "last_cycle": stats.get("last_cycle", {}),
     }
@@ -898,61 +905,95 @@ def _get_positions_sync():
         except Exception:
             dhan = []
             mismatches = []
-    local_map: dict[str, dict] = {}
+    local_by_instrument: dict[str, list[dict]] = {}
     pm = getattr(env, "position_manager", None)
     if pm is not None:
         try:
             psnap = pm.snapshot() or {}
             for pos in (psnap.get("open_positions") or {}).values():
                 pos = pos or {}
-                key = (str(pos.get("strategy_id") or ""), str(pos.get("instrument") or ""))
-                local_map[key] = pos
+                instrument = str(pos.get("instrument") or "")
+                quantity = int(pos.get("quantity") or 0)
+                if instrument and quantity > 0 and pos.get("is_open", True):
+                    local_by_instrument.setdefault(instrument, []).append(pos)
         except Exception:
             pass
-    dhan_map: dict[tuple, dict] = {}
+    # Dhan reports net exposure per instrument. DhanRestTransport annotates
+    # that same net row with each configured strategy id, so strategy-scoped
+    # comparison invents a MISSING_LOCAL row for every non-owner strategy.
+    # Deduplicate repeated net exposures at instrument level, like the core
+    # poller, while retaining the raw rows below for diagnostics.
+    dhan_by_instrument: dict[str, list[dict]] = {}
     for p in dhan:
-        key = (str(p.get("strategy_id") or ""), str(p.get("instrument") or ""))
-        if key not in dhan_map:
-            dhan_map[key] = {"side": None, "quantity": 0, "average_entry_price": None,
-                             "realized_profit": 0.0, "unrealized_profit": 0.0, "ltp": None}
-        d = dhan_map[key]
-        d["side"] = d["side"] or (p.get("side") or "").upper() or None
-        d["quantity"] += int(p.get("quantity") or 0)
-        d["average_entry_price"] = p.get("average_entry_price") or d["average_entry_price"]
-        d["realized_profit"] = _num(d["realized_profit"]) + _num(p.get("realized_profit"))
-        d["unrealized_profit"] = _num(d["unrealized_profit"]) + _num(p.get("unrealized_profit"))
-        if p.get("ltp"):
-            d["ltp"] = p.get("ltp")
-    keys = set(local_map) | set(dhan_map)
+        instrument = str(p.get("instrument") or "")
+        quantity = int(p.get("quantity") or 0)
+        if instrument and quantity > 0:
+            dhan_by_instrument.setdefault(instrument, []).append(p)
+    keys = set(local_by_instrument) | set(dhan_by_instrument)
     rows = []
-    for key in sorted(keys, key=lambda k: (k[0], k[1])):
-        sid, inst = key
-        lp = local_map.get(key) or {}
-        dp = dhan_map.get(key)
-        l_side = str(lp.get("side") or "").upper() or None
-        d_side = (dp or {}).get("side")
-        l_qty = int(lp.get("quantity") or 0)
-        d_qty = int((dp or {}).get("quantity") or 0)
-        if dp is not None and (not l_side or l_qty == 0) and (d_side and d_qty > 0):
+    for inst in sorted(keys):
+        local_rows = local_by_instrument.get(inst, [])
+        broker_rows = dhan_by_instrument.get(inst, [])
+        local_signed = sum(
+            int(pos.get("quantity") or 0)
+            * (1 if str(pos.get("side") or "").upper() in ("LONG", "BUY") else -1)
+            for pos in local_rows
+        )
+        local_side = "LONG" if local_signed > 0 else "SHORT" if local_signed < 0 else None
+        local_qty = abs(local_signed)
+
+        broker_nets = {
+            int(p.get("quantity") or 0)
+            * (1 if str(p.get("side") or "").upper() in ("LONG", "BUY") else -1)
+            for p in broker_rows
+        }
+        broker_conflict = len(broker_nets) > 1
+        broker_signed = next(iter(broker_nets)) if len(broker_nets) == 1 else None
+        # Repeated copies of the same instrument-level Dhan row are one
+        # broker exposure. Use the first representative to avoid multiplying
+        # its average price and P&L by the number of configured strategies.
+        dp = broker_rows[0] if broker_rows and not broker_conflict else None
+        d_side = ("LONG" if broker_signed > 0 else "SHORT" if broker_signed < 0
+                  else None) if broker_signed is not None else None
+        d_qty = abs(broker_signed) if broker_signed is not None else 0
+        if broker_conflict:
+            status = "MISMATCH"
+        elif broker_rows and not local_rows and d_qty > 0:
             status = "MISSING_LOCAL"
-        elif not dp and (l_side and l_qty > 0):
+        elif local_rows and not broker_rows and local_qty > 0:
             status = "MISSING_DHAN"
-        elif dp is not None and (l_side == d_side and l_qty == d_qty):
+        elif broker_signed == local_signed:
             status = "MATCHED"
         else:
             status = "MISMATCH"
+        owner_ids = sorted({str(p.get("strategy_id") or "")
+                            for p in local_rows if p.get("strategy_id")})
+        local_side_rows = ([p for p in local_rows
+                            if ((str(p.get("side") or "").upper()
+                                 in ("LONG", "BUY")) == (local_side == "LONG"))]
+                           if local_side is not None else [])
+        local_qty_weight = sum(int(p.get("quantity") or 0) for p in local_side_rows)
+        local_avg = (
+            sum(_num(p.get("average_entry_price") or p.get("average_entry"))
+                * int(p.get("quantity") or 0) for p in local_side_rows)
+            / local_qty_weight
+            if local_qty_weight else None
+        )
+        local_unrealized = sum(_num(p.get("unrealized_pnl")) for p in local_rows)
+        stop_states = {str(p.get("sl_state") or "") for p in local_rows}
         rows.append({
-            "strategy_id": sid,
+            "strategy_id": owner_ids[0] if len(owner_ids) == 1 else None,
+            "local_owners": owner_ids,
             "instrument": inst,
             "status": status,
-            "delta_qty": d_qty - l_qty,
-            "local": {
-                "side": l_side,
-                "quantity": l_qty,
-                "average_entry_price": lp.get("average_entry_price"),
-                "unrealized_pnl": _num(lp.get("unrealized_pnl")),
-                "sl_state": lp.get("sl_state"),
-            } if (l_side and l_qty > 0) else None,
+            "delta_qty": d_qty - local_qty if not broker_conflict else None,
+            "local": ({
+                "side": local_side,
+                "quantity": local_qty,
+                "average_entry_price": local_avg,
+                "unrealized_pnl": local_unrealized,
+                "sl_state": next(iter(stop_states)) if len(stop_states) == 1 else "MULTIPLE",
+            } if local_rows else None),
             "dhan": {
                 "side": d_side,
                 "quantity": d_qty,
@@ -960,7 +1001,9 @@ def _get_positions_sync():
                 "realized_profit": _num((dp or {}).get("realized_profit")),
                 "unrealized_profit": _num((dp or {}).get("unrealized_profit")),
                 "ltp": (dp or {}).get("ltp"),
-            } if dp is not None else None,
+                "mapped_strategy_rows": len(broker_rows),
+                "conflicting_rows": len(broker_rows) if broker_conflict else 0,
+            } if broker_rows else None,
         })
     return {
         "positions": rows,
