@@ -549,6 +549,8 @@ def test_startup_never_arms_a_position_the_broker_holds_the_other_side_of():
     assert [d["reason"] for d in summary["dropped_local"]] == [
         "DB_OPEN_BROKER_NOT_CONFIRMED"]
     assert env.position_manager.open_positions == []
+    assert summary["orphan_exposure"] is True
+    assert summary["broker_only"][0]["instrument"] == "NIFTY"
     # Nothing is monitored, so no tick can ever mint an exit for it.
     assert env.sl_monitor.armed_ids() == []
 
@@ -568,12 +570,16 @@ def test_startup_agrees_on_direction_across_strategies():
         {"S1": FakeStrategy("S1", "NIFTY"), "S2": FakeStrategy("S2", "NIFTY")},
         make_pm([a, b]), broker))
     summary = h.sync_sl_from_broker("LIVE")
-    # Both rows agree the instrument is long, so BOTH local positions are
-    # broker-confirmed and each arms from its OWN stop.
-    assert sorted(u["position_id"] for u in summary["armed"]) == ["P-A", "P-B"]
+    # Dhan exposes one net quantity without strategy ownership. Two local
+    # owners must not each arm against the full broker quantity.
+    assert summary["armed"] == []
     assert summary["dropped_local"] == []
-    assert env.position_manager.get_position("P-A").stop_price == 90.0
-    assert env.position_manager.get_position("P-B").stop_price == 95.0
+    assert summary["orphan_exposure"] is True
+    assert summary["status"] == "protection_incomplete"
+    assert len(summary["ownership_ambiguous"]) == 1
+    assert env.sl_monitor.armed_ids() == []
+    assert env.position_manager.get_position("P-A").is_open is True
+    assert env.position_manager.get_position("P-B").is_open is True
 
 
 def test_startup_never_invents_a_stop():
@@ -583,6 +589,7 @@ def test_startup_never_invents_a_stop():
     env = h.add_env(FakeEnv("LIVE", {"S1": FakeStrategy("S1", "NIFTY")},
                             make_pm([p]), broker))
     summary = h.sync_sl_from_broker("LIVE")
+    assert summary["status"] == "protection_incomplete"
     assert summary["armed"] == []
     assert [u["reason"] for u in summary["unavailable"]] == [SLReject.STOP_MISSING]
     live = env.position_manager.get_position(p.position_id)
@@ -637,8 +644,8 @@ def test_startup_broker_only_position_is_surfaced_not_opened():
     assert env.position_manager.open_positions == []
 
 
-def test_startup_conflicting_broker_nets_are_treated_as_flat():
-    """Two different nets for one securityId cannot both be true."""
+def test_startup_conflicting_broker_nets_are_unresolved_not_flat():
+    """Conflicting broker rows are unknown, never evidence of broker-flat."""
     h = Harness()
     a = make_position(pid="P-A", strategy_id="S1", instrument="NIFTY", stop=90.0)
     broker = FakeBroker([
@@ -648,9 +655,11 @@ def test_startup_conflicting_broker_nets_are_treated_as_flat():
     env = h.add_env(FakeEnv("LIVE", {"S1": FakeStrategy("S1", "NIFTY")},
                             make_pm([a]), broker))
     summary = h.sync_sl_from_broker("LIVE")
+    assert summary["status"] == "failed"
+    assert summary["orphan_exposure"] is True
     assert summary["armed"] == []
-    assert [d["position_id"] for d in summary["dropped_local"]] == ["P-A"]
-    assert env.position_manager.open_positions == []
+    assert summary["dropped_local"] == []
+    assert env.position_manager.get_position("P-A").is_open is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════

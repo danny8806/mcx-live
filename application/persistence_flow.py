@@ -712,6 +712,100 @@ class PersistenceFlowMixin:
             except Exception as e:
                 log.error("[Engine] save_position failed for %s: %s",
                           getattr(position, "position_id", "?"), e)
+
+    def _queue_position_close_persist(self, env, position, source: str,
+                                      error: Exception) -> None:
+        """Retain a broker-confirmed close until its canonical DB write succeeds."""
+        position_id = str(getattr(position, "position_id", "") or "")
+        if not position_id:
+            return
+        queue = getattr(env, "pending_position_close_persist", None)
+        if queue is None:
+            queue = {}
+            env.pending_position_close_persist = queue
+        queue[position_id] = position
+        reconciled = getattr(self, "_reconciled_envs", None)
+        if reconciled is not None:
+            reconciled.discard(getattr(env, "name", ""))
+        log.critical("[Engine] position %s is closed at broker but DB close "
+                     "write is pending (%s): %s", position_id, source, error)
+        try:
+            self.publish_event("position_close_persistence_failed", {
+                "position_id": position_id,
+                "trade_id": getattr(position, "trade_id", None),
+                "strategy_id": getattr(position, "strategy_id", None),
+                "instrument": getattr(position, "instrument", None),
+                "source": source, "error": str(error),
+                "severity": "CRITICAL",
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+        except Exception:
+            pass
+
+    def _retry_position_close_persistence(self, env) -> list[str]:
+        """Retry failed close writes from the periodic broker reconciliation path."""
+        queue = getattr(env, "pending_position_close_persist", None) or {}
+        persistence = getattr(env, "persistence", None)
+        failed = []
+        if queue and persistence is not None:
+            for position_id, position in list(queue.items()):
+                try:
+                    persistence.close_position_record(position)
+                except Exception as exc:
+                    failed.append(str(position_id))
+                    log.error("[Engine] retry close persistence failed for %s: %s",
+                              position_id, exc)
+                    continue
+                queue.pop(position_id, None)
+                try:
+                    self.publish_event("position_close_persistence_recovered", {
+                        "position_id": str(position_id),
+                        "execution_mode": getattr(env, "mode", None),
+                    }, env_name=getattr(env, "name", None))
+                except Exception:
+                    pass
+        elif queue:
+            failed.extend(str(key) for key in queue)
+        env.pending_position_close_persist = queue
+        failed.extend(self._retry_trade_close_persistence(env))
+        return failed
+
+    def _queue_trade_close_persist(self, env, lifecycle, trade_id: str,
+                                   reason: str) -> None:
+        queue = getattr(env, "pending_trade_close_persist", None)
+        if queue is None:
+            queue = {}
+            env.pending_trade_close_persist = queue
+        queue[str(trade_id)] = (lifecycle, reason)
+        reconciled = getattr(self, "_reconciled_envs", None)
+        if reconciled is not None:
+            reconciled.discard(getattr(env, "name", ""))
+        try:
+            self.publish_event("trade_close_persistence_failed", {
+                "trade_id": str(trade_id), "reason": reason,
+                "severity": "CRITICAL",
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+        except Exception:
+            pass
+
+    def _retry_trade_close_persistence(self, env) -> list[str]:
+        queue = getattr(env, "pending_trade_close_persist", None) or {}
+        failed = []
+        for trade_id, (lifecycle, reason) in list(queue.items()):
+            try:
+                if not lifecycle.close_trade_from_broker_reconciliation(
+                        trade_id, reason):
+                    failed.append(str(trade_id))
+                    continue
+            except Exception as exc:
+                failed.append(str(trade_id))
+                log.error("[Engine] retry trade close persistence failed for %s: %s",
+                          trade_id, exc)
+                continue
+            queue.pop(trade_id, None)
+        env.pending_trade_close_persist = queue
+        return failed
     def _calculate_margin(self, instrument: str, price: float, quantity: int) -> float:
         model = self.config.instrument(instrument).get("margin_model", {})
         if model:

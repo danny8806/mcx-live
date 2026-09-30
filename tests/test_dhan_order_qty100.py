@@ -30,7 +30,7 @@ INSTRUMENT = "GOLDM"
 
 INSTRUMENTS = {
     INSTRUMENT: {
-        "security_id": "49215",
+        "security_id": "569003",
         "exchange_segment": "MCX_COMM",
         "multiplier": 10.0,
     }
@@ -106,7 +106,7 @@ def test_the_order_reaching_dhan_is_correct_at_quantity_100():
 
     # Everything else on the wire is correct too.
     assert payload["transactionType"] == "BUY"
-    assert payload["securityId"] == "49215"
+    assert payload["securityId"] == "569003"
     assert payload["exchangeSegment"] == "MCX_COMM"
     assert payload["orderType"] == "LIMIT"
     assert payload["validity"] == "DAY"

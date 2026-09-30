@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from execution.live.sl_monitor import (
     PositionOwnedSLMonitor,
@@ -501,6 +501,13 @@ class SLFlowMixin:
             return {"status": "failed", "error": "unknown_environment",
                     "env": env_name, "armed": [], "unavailable": [],
                     "dropped_local": [], "broker_only": []}
+        # A previous broker-confirmed close may have succeeded in memory while
+        # SQLite was temporarily unavailable. Retry its canonical row update on
+        # every broker reconciliation before allowing the environment to be
+        # considered fully reconciled again.
+        retry_close = getattr(self, "_retry_position_close_persistence", None)
+        if callable(retry_close):
+            retry_close(env)
         broker = getattr(env, "broker", None)
         pm = getattr(env, "position_manager", None)
         if broker is None or pm is None or not hasattr(broker, "positions"):
@@ -533,6 +540,7 @@ class SLFlowMixin:
         # This is the level the broker can actually speak to, and it is the only
         # level at which "the broker says flat" is a real answer.
         broker_net: dict[str, dict] = {}
+        broker_conflicts: list[dict] = []
         for row in broker_positions or []:
             inst = str(row.get("instrument") or "")
             if not inst:
@@ -551,12 +559,35 @@ class SLFlowMixin:
                                     "quantity": abs(signed),
                                     "side": "LONG" if signed > 0 else "SHORT"}
             elif cur["signed"] != signed:
-                # Two different nets for one instrument cannot both be right;
-                # the conservative reading is FLAT, so nothing is armed on it.
+                # Conflicting signed nets are not evidence of FLAT.  Do not
+                # mutate local ownership from an internally contradictory
+                # broker snapshot; the caller will keep execution blocked.
                 log.error("[SL] conflicting broker nets for %s (%s vs %s) — "
-                          "treating as FLAT", inst, cur["signed"], signed)
-                broker_net[inst] = {"instrument": inst, "signed": 0,
-                                    "quantity": 0, "side": "FLAT"}
+                          "snapshot is unresolved", inst, cur["signed"], signed)
+                broker_conflicts.append({
+                    "instrument": inst, "first_signed": cur["signed"],
+                    "conflicting_signed": signed,
+                })
+
+        if broker_conflicts:
+            # In particular, never turn conflicting broker rows into FLAT and
+            # abandon a real local position.  Keep the current book untouched
+            # and fail closed until a consistent broker snapshot arrives.
+            try:
+                self.publish_event("broker_position_snapshot_conflict", {
+                    "conflicts": broker_conflicts,
+                    "severity": "CRITICAL",
+                    "execution_mode": getattr(env, "mode", None),
+                }, env_name=getattr(env, "name", None))
+            except Exception:
+                pass
+            return {
+                "status": "failed", "error": "conflicting_broker_position_rows",
+                "broker_conflicts": broker_conflicts,
+                "orphan_exposure": True, "orphans": broker_conflicts,
+                "armed": [], "unavailable": [], "dropped_local": [],
+                "broker_only": [], "env": env_name,
+            }
 
         # A filled broker exit makes GET /positions flat before the order
         # poller/order-update path necessarily routes its fill.  Do not let
@@ -629,9 +660,34 @@ class SLFlowMixin:
                 }, env_name=getattr(env, "name", None))
 
         # Hand the monitor one clean row per instrument per local position.
+        local_by_instrument: dict[str, list[Any]] = {}
+        for lp in local_positions:
+            local_by_instrument.setdefault(str(lp.instrument), []).append(lp)
+
+        # Dhan exposes a net position per instrument, not a strategy allocation.
+        # Multiple local owners cannot each be assigned the full broker quantity.
+        # If there is more than one same-side local owner, fail closed for that
+        # instrument and require reconciliation instead of arming duplicate SLs.
+        ambiguous_instruments: dict[str, list[Any]] = {}
+        for inst, locals_for_inst in local_by_instrument.items():
+            net = broker_net.get(inst)
+            if not net or net["signed"] == 0:
+                continue
+            matching = [lp for lp in locals_for_inst
+                        if bool(getattr(lp, "is_long", False)) == (net["signed"] > 0)]
+            if len(matching) > 1:
+                ambiguous_instruments[inst] = matching
+
         resolved = []
+        ambiguous_ids = {
+            id(lp) for group in ambiguous_instruments.values() for lp in group
+        }
+        sync_local_positions = []
         for lp in local_positions:
             inst = str(lp.instrument)
+            if id(lp) in ambiguous_ids:
+                continue
+            sync_local_positions.append(lp)
             net = broker_net.get(inst)
             is_long = bool(getattr(lp, "is_long", False))
             # Confirmed means BOTH: the broker holds a net position here AND
@@ -647,10 +703,17 @@ class SLFlowMixin:
                 "side": "LONG" if is_long else "SHORT",
                 "broker_confirmed": confirmed,
             })
-        # A broker position with no local book at all: surfaced, never opened.
-        local_instruments = {str(lp.instrument) for lp in local_positions}
+        # Any broker exposure without one unambiguous local owner is surfaced,
+        # including the case where a stale local row exists for the same symbol
+        # but on the opposite side.
+        locally_owned_instruments = {
+            str(lp.instrument) for lp in sync_local_positions
+            if (net := broker_net.get(str(lp.instrument)))
+            and net["signed"] != 0
+            and ((net["signed"] > 0) == bool(getattr(lp, "is_long", False)))
+        }
         for inst, net in broker_net.items():
-            if inst in local_instruments or net["quantity"] <= 0:
+            if inst in locally_owned_instruments or net["quantity"] <= 0:
                 continue
             resolved.append({
                 "instrument": inst, "strategy_id": "", "side": net["side"],
@@ -658,8 +721,35 @@ class SLFlowMixin:
             })
 
         summary = self._sl_monitor(env).resync_from_broker(
-            resolved, local_positions,
+            resolved, sync_local_positions,
             stop_resolver=self._sl_stop_resolver(env))
+
+        # Preserve ambiguous same-instrument owners for operator resolution,
+        # but disarm their individually-owned stops: the broker net cannot tell
+        # us which local lifecycle owns which contracts.  The corresponding
+        # broker-only record ensures the environment remains blocked.
+        for inst, group in ambiguous_instruments.items():
+            net = broker_net[inst]
+            summary.setdefault("broker_only", []).append({
+                "strategy_id": "", "instrument": inst,
+                "quantity": net["quantity"], "side": net["side"],
+                "reason": "multiple_local_strategy_owners_for_broker_net",
+            })
+            summary.setdefault("ownership_ambiguous", []).append({
+                "instrument": inst,
+                "position_ids": [getattr(lp, "position_id", None) for lp in group],
+                "reason": "broker_net_has_no_strategy_attribution",
+            })
+            for lp in group:
+                self._sl_monitor(env).disarm(str(getattr(lp, "position_id", "")))
+                lp.sl_state = SLState.UNAVAILABLE.value
+                self._persist_position(lp, getattr(env, "name", None))
+                summary.setdefault("unavailable", []).append({
+                    "position_id": getattr(lp, "position_id", None),
+                    "strategy_id": getattr(lp, "strategy_id", None),
+                    "instrument": inst,
+                    "reason": "broker_net_ownership_ambiguous",
+                })
 
         # Reflect the recovered state on the position rows and persist them.
         by_pid = {str(getattr(p, "position_id", "")): p for p in local_positions}
@@ -719,10 +809,44 @@ class SLFlowMixin:
             except Exception as e2:
                 log.error("[SL] could not close stale position %s: %s", pid, e2)
                 stale_position = None
+            if stale_position is not None and getattr(env, "persistence", None) is not None:
+                try:
+                    env.persistence.close_position_record(stale_position)
+                except Exception as e2:
+                    log.error("[SL] stale position close persistence failed for %s: %s",
+                              pid, e2)
+                    self._queue_position_close_persist(
+                        env, stale_position, "broker_flat_reconciliation", e2)
             # A broker/manual close ends the pending reversal lifecycle too;
             # a later fresh strategy signal may create a new entry.
             stale_sid = (entry.get("strategy_id")
                          or getattr(stale_position, "strategy_id", None))
+            if stale_position is not None and stale_position.trade_id:
+                runtime = (getattr(env, "runtimes", None).get(stale_sid)
+                           if getattr(env, "runtimes", None) is not None else None)
+                lifecycle = getattr(runtime, "lifecycle", None)
+                close_trade = getattr(
+                    lifecycle, "close_trade_from_broker_reconciliation", None)
+                if callable(close_trade):
+                    try:
+                        if not close_trade(
+                                stale_position.trade_id,
+                                "BROKER_FLAT_RECONCILIATION"):
+                            self._queue_trade_close_persist(
+                                env, lifecycle, stale_position.trade_id,
+                                "BROKER_FLAT_RECONCILIATION")
+                    except Exception as e2:
+                        log.error("[SL] broker-flat trade close failed for %s: %s",
+                                  stale_position.trade_id, e2)
+                        self._queue_trade_close_persist(
+                            env, lifecycle, stale_position.trade_id,
+                            "BROKER_FLAT_RECONCILIATION")
+                else:
+                    summary.setdefault("trade_close_unresolved", []).append({
+                        "trade_id": stale_position.trade_id,
+                        "position_id": stale_position.position_id,
+                        "reason": "lifecycle_owner_unavailable",
+                    })
             strategy = (getattr(env, "strategies", {}) or {}).get(stale_sid)
             if strategy is not None:
                 pending = getattr(strategy, "pending_entry", None)
@@ -800,7 +924,15 @@ class SLFlowMixin:
                  len(summary.get("armed", [])), len(summary.get("unavailable", [])),
                  len(summary.get("dropped_local", [])),
                  len(summary.get("broker_only", [])))
-        summary["status"] = "reconciled"
+        if (summary.get("unavailable") or summary.get("ownership_ambiguous")
+                or summary.get("trade_close_unresolved")
+                or getattr(env, "pending_position_close_persist", None)
+                or getattr(env, "pending_trade_close_persist", None)):
+            summary["status"] = "protection_incomplete"
+        elif summary.get("orphan_exposure"):
+            summary["status"] = "orphan_exposure"
+        else:
+            summary["status"] = "reconciled"
         summary["env"] = getattr(env, "name", None)
         return summary
 

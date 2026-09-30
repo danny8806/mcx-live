@@ -53,7 +53,7 @@ def test_broker_position_without_local_book_is_flagged_as_orphan_exposure():
         [{"instrument": "GOLDM", "quantity": 100, "side": "LONG"}],
         positions=[])
     summary = h.sync_sl_from_broker("LIVE")
-    assert summary["status"] == "reconciled"
+    assert summary["status"] == "orphan_exposure"
     assert summary["orphan_exposure"] is True
     assert [o["instrument"] for o in summary["orphans"]] == ["GOLDM"]
     assert summary["orphans"][0]["quantity"] == 100
@@ -205,3 +205,20 @@ def test_failed_broker_query_is_never_reported_as_flat():
     assert summary["status"] == "failed"
     assert "orphan_exposure" not in summary, \
         "a failed query must not claim the book is clean"
+
+
+def test_stale_broker_flat_position_is_closed_in_the_canonical_database():
+    pos = make_position(pid="P-DB-CLOSE", instrument="NIFTY", stop=90.0)
+    h, env = _live_env_with([], positions=[pos])
+
+    class Persistence:
+        def __init__(self):
+            self.closed = []
+
+        def close_position_record(self, position):
+            self.closed.append(position.position_id)
+
+    env.persistence = Persistence()
+    summary = h.sync_sl_from_broker("LIVE")
+    assert summary["dropped_local"][0]["position_id"] == "P-DB-CLOSE"
+    assert env.persistence.closed == ["P-DB-CLOSE"]

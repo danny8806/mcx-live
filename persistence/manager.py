@@ -1161,7 +1161,7 @@ class PersistenceManager:
                     last_exit.timestamp, tz=timezone.utc
                 ).isoformat()
         with self._tx() as conn:
-            conn.execute("""
+            cursor = conn.execute("""
                 UPDATE positions SET
                     status='closed',
                     average_exit_price=?,
@@ -1176,6 +1176,13 @@ class PersistenceManager:
                 datetime.now(timezone.utc).isoformat(),
                 position.position_id,
             ))
+            missing_row = cursor.rowcount == 0
+        # A close fill can be recovered after startup reconciliation removed
+        # the in-memory position row.  Preserve that confirmed close by writing
+        # the complete terminal position snapshot rather than silently treating
+        # a zero-row UPDATE as success.
+        if missing_row:
+            self.save_position(position)
 
     def get_open_positions(self, strategy_id: Optional[str] = None) -> list[dict]:
         """Get open position rows from the canonical positions table."""

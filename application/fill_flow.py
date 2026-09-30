@@ -423,6 +423,8 @@ class FillFlowMixin:
                 except Exception as e:
                     log.error("[Engine] close_position_record failed for %s: %s",
                               current.position_id, e)
+                    self._queue_position_close_persist(
+                        env, current, "broker_exit_fill", e)
             lifecycle.register_exit_fill(current.trade_id, fill.fill_id, fill.price,
                 fill.timestamp, exit_signal_id, exit_reason=exit_reason)
             lifecycle.close_trade(current.trade_id, result["gross_pnl"], result["charges"], result["net_pnl"])

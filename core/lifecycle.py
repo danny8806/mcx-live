@@ -853,6 +853,38 @@ class TradeLifecycleManager:
             print(f"[Lifecycle] TRADE CLOSED: {trade_id} | P&L={net_pnl:.2f}", flush=True)
             return True
 
+    def close_trade_from_broker_reconciliation(
+            self, trade_id: str, reason: str = "BROKER_FLAT_RECONCILIATION") -> bool:
+        """Close a locally-open lifecycle when Dhan confirms it is flat.
+
+        This path is for manual/external closes where no attributable exit fill
+        is available.  It deliberately leaves exit price and P&L unset rather
+        than fabricating a fill or reporting a false zero-P&L execution.
+        """
+        with self._lock:
+            trade = self._trade_in_scope(trade_id)
+            if not trade:
+                self._quarantine("close_trade_from_broker_reconciliation",
+                                 trade_id, "cross-strategy or unknown")
+                return False
+            if trade.status == TradeStatus.CLOSED.value:
+                # A prior in-memory close may have failed to persist. Re-run
+                # the idempotent upsert so the retry queue can heal the DB.
+                return self._persist_trade(trade)
+            trade.status = TradeStatus.CLOSED.value
+            trade.exit_reason = str(reason or "BROKER_FLAT_RECONCILIATION")
+            trade.gross_pnl = None
+            trade.charges = None
+            trade.net_pnl = None
+            trade.closed_at = time.time()
+            trade.updated_at = trade.closed_at
+            self._record_event(
+                trade_id, "TRADE_CLOSED_BY_BROKER_RECONCILIATION",
+                payload={"reason": trade.exit_reason,
+                         "exit_fill_available": False,
+                         "pnl_available": False})
+            return self._persist_trade(trade)
+
     # ═══════════════════════════════════════════
     # REVERSAL — atomic old close + new open
     # ═══════════════════════════════════════════
