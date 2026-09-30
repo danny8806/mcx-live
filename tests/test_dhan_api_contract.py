@@ -166,3 +166,27 @@ def test_official_rest_order_array_and_cumulative_fill_fields_are_idempotent():
     assert first["fills"][0]["quantity"] == 1
     assert first["fills"][0]["price"] == 146803.0
     assert len(second["fills"]) == 1  # repeated REST reads do not duplicate fill
+
+
+def test_account_pnl_keeps_dhan_realized_profit_for_flat_positions():
+    class Http:
+        def _get(self, path):
+            if path == "/fundlimit":
+                return {"availabelBalance": 1000, "utilizedAmount": 0}
+            if path == "/positions":
+                return [
+                    {"netQty": 0, "realizedProfit": -9190,
+                     "unrealizedProfit": 0},
+                    {"netQty": 1, "realizedProfit": -25,
+                     "unrealizedProfit": 75},
+                ]
+            raise AssertionError(path)
+
+    broker = DhanRestTransport(client_id="TEST", http=Http())
+
+    account = broker.account_status()
+
+    assert account["realized_pnl"] == -9215
+    assert account["unrealized_pnl"] == 75
+    assert account["net_pnl"] == -9140
+    assert account["realized_pnl_source"] == "dhan_positions_realized_profit"

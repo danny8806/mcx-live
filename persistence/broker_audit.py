@@ -86,7 +86,9 @@ class BrokerAuditStore:
 
         body = {}
         err_type = err_code = err_msg = None
-        if isinstance(response, dict):
+        # Dhan's order book and trade book are arrays; retain their sanitized
+        # rows rather than recording every successful response as `{}`.
+        if isinstance(response, (dict, list, tuple)):
             body = response
         elif error is not None:
             body = getattr(error, "body", None)
@@ -99,6 +101,7 @@ class BrokerAuditStore:
             err_code = getattr(error, "error_code", None) or None
             err_msg = str(error)
 
+        metadata_body = body if isinstance(body, dict) else {}
         fields = {
             "event_id": event_id,
             "action": str(action or "").upper(),
@@ -109,34 +112,34 @@ class BrokerAuditStore:
             "http_status": http_status,
             "request_payload": sanitize_json(request_payload),
             "response_payload": sanitize_json(body),
-            "error_type": _pick(body, "errorType", "omsErrorType", "error_type")
+            "error_type": _pick(metadata_body, "errorType", "omsErrorType", "error_type")
                            or err_type,
-            "error_code": (_pick(body, "errorCode", "omsErrorCode", "error_code")
+            "error_code": (_pick(metadata_body, "errorCode", "omsErrorCode", "error_code")
                            or err_code),
-            "error_message": (_pick(body, "errorMessage", "omsErrorDescription",
+            "error_message": (_pick(metadata_body, "errorMessage", "omsErrorDescription",
                                     "reason", "error_message") or err_msg),
-            "broker_order_id": str(_pick(body, "orderId", "order_id")
+            "broker_order_id": str(_pick(metadata_body, "orderId", "order_id")
                                    or _path_order_id(endpoint) or ""),
-            "exchange_order_id": str(_pick(body, "exchangeOrderId",
+            "exchange_order_id": str(_pick(metadata_body, "exchangeOrderId",
                                            "exchange_order_id") or ""),
             "correlation_id": correlation_id or str(
-                _pick(body, "correlationId", "correlation_id") or ""),
-            "order_status": (_pick(body, "orderStatus", "order_status")
-                             or _pick(body, "status") or ""),
-            "order_type": (_pick(body, "orderType", "order_type") or ""),
-            "transaction_type": (_pick(body, "transactionType",
+                _pick(metadata_body, "correlationId", "correlation_id") or ""),
+            "order_status": (_pick(metadata_body, "orderStatus", "order_status")
+                             or _pick(metadata_body, "status") or ""),
+            "order_type": (_pick(metadata_body, "orderType", "order_type") or ""),
+            "transaction_type": (_pick(metadata_body, "transactionType",
                                        "transaction_type") or ""),
-            "security_id": str(_pick(body, "securityId", "security_id") or ""),
-            "quantity": _to_int(_pick(body, "quantity", "tradedQuantity",
+            "security_id": str(_pick(metadata_body, "securityId", "security_id") or ""),
+            "quantity": _to_int(_pick(metadata_body, "quantity", "tradedQuantity",
                                       "filledQty", "filled_quantity")),
-            "remaining_quantity": _to_int(_pick(body, "remainingQuantity",
+            "remaining_quantity": _to_int(_pick(metadata_body, "remainingQuantity",
                                                 "remaining_quantity")),
-            "price": _to_float(_pick(body, "price", "limitPrice", "limit_price")),
-            "trigger_price": _to_float(_pick(body, "triggerPrice",
+            "price": _to_float(_pick(metadata_body, "price", "limitPrice", "limit_price")),
+            "trigger_price": _to_float(_pick(metadata_body, "triggerPrice",
                                              "trigger_price")),
-            "validity": (_pick(body, "validity") or ""),
-            "product_type": (_pick(body, "productType", "product_type") or ""),
-            "exchange_segment": (_pick(body, "exchangeSegment",
+            "validity": (_pick(metadata_body, "validity") or ""),
+            "product_type": (_pick(metadata_body, "productType", "product_type") or ""),
+            "exchange_segment": (_pick(metadata_body, "exchangeSegment",
                                        "exchange_segment") or ""),
             "execution_mode": self.execution_mode,
         }

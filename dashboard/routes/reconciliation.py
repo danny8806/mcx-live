@@ -97,6 +97,45 @@ def _run_reconciliation_sync():
         except Exception as e:
             results["checks"].append({"name": "lifecycle_identity_consistency", "error": str(e)})
 
+    # Local DB integrity alone cannot detect executions missing from local
+    # history. Include the poller's independent Dhan order-book/trade-book
+    # comparison so broker-only fills turn this endpoint red, not false-green.
+    try:
+        from dashboard.envs import resolve as _resolve_env
+        live_env = _resolve_env(_engine, "live")
+        sync = getattr(live_env, "sync_service", None) if live_env else None
+        sync_stats = sync.stats() if sync is not None else {}
+        broker_report = sync_stats.get("tradebook_reconciliation") or {}
+        if broker_report.get("status") not in (None, "NOT_CHECKED", "UNSUPPORTED"):
+            mismatch_count = int(broker_report.get("mismatch_count") or 0)
+            broker_errors = list(broker_report.get("mismatches") or [])
+            check_ok = broker_report.get("status") == "MATCHED" and mismatch_count == 0
+            results["checks"].append({
+                "name": "broker_tradebook_vs_local_fills",
+                "is_consistent": check_ok,
+                "status": broker_report.get("status"),
+                "mismatch_count": mismatch_count,
+                "mismatches": broker_errors,
+                "checked_at": broker_report.get("checked_at"),
+                "broker_trade_rows": broker_report.get("broker_trade_rows"),
+                "broker_order_rows": broker_report.get("broker_order_rows"),
+            })
+            if not check_ok:
+                results["is_consistent"] = False
+                results["errors"].append({
+                    "type": "BROKER_TRADEBOOK_MISMATCH",
+                    "detail": broker_errors or broker_report.get("error")
+                        or broker_report.get("status"),
+                })
+    except Exception as e:
+        results["checks"].append({
+            "name": "broker_tradebook_vs_local_fills", "error": str(e),
+            "is_consistent": False,
+        })
+        results["is_consistent"] = False
+        results["errors"].append({"type": "BROKER_TRADEBOOK_CHECK_FAILED",
+                                  "detail": str(e)})
+
     # Summary
     total_errors = len(results["errors"])
     total_warnings = len(results["warnings"])

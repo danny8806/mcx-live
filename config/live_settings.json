@@ -189,6 +189,7 @@
     "gate": "ON",
     "broker": "dhan",
     "reconcile_interval_seconds": 0.5,
+    "tradebook_reconcile_interval_seconds": 30.0,
     "order_poll_interval_seconds": 0.5,
     "position_poll_interval_seconds": 0.5,
     "pnl_poll_interval_seconds": 0.5,

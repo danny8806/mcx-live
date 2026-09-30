@@ -21,6 +21,7 @@ def test_default_reconciliation_interval_is_fast_for_broker_flat_release():
         "positions": 0.5,
         "account": 0.5,
         "reconcile": 0.5,
+        "tradebook": 30.0,
     }
 
 

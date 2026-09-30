@@ -353,7 +353,7 @@ def _get_sync_sync():
     poller_intervals = stats.get("intervals", {}) or {}
     last_run = stats.get("last_run", {}) or {}
     stale = {}
-    for task in ("orders", "positions", "account", "reconcile"):
+    for task in ("orders", "positions", "account", "reconcile", "tradebook"):
         lr = last_run.get(task, 0.0)
         interval = poller_intervals.get(task, 0) or 0
         # Stale when more than 2× interval since last successful cycle.
@@ -392,6 +392,7 @@ def _get_sync_sync():
             "positions_s": poller_intervals.get("positions"),
             "account_s": poller_intervals.get("account"),
             "reconcile_s": poller_intervals.get("reconcile"),
+            "tradebook_s": poller_intervals.get("tradebook"),
         },
         "last_cycle": stats.get("last_cycle", {}),
     }
@@ -1070,6 +1071,8 @@ def _get_pnl_sync():
             "unrealized_pnl": d_unr,
             "net_pnl": d_real + d_unr,
             "source": "DHAN (fundlimit+positions)",
+            "realized_pnl_basis": acct.get("realized_pnl_source")
+                or "dhan_positions_realized_profit",
             "last_updated": last_updated,
             "age_seconds": _age(last_updated),
         },
@@ -1078,13 +1081,15 @@ def _get_pnl_sync():
             "unrealized_pnl": round(l_unr, 2),
             "net_pnl": round(l_real + l_unr, 2),
             "source": "engine pnl engines + local position book",
+            "realized_pnl_basis": "local realized_net after recorded charges",
             "generated_at": _ts(),
         },
         "difference": {
             "realized_pnl": round(d_real - l_real, 2),
             "unrealized_pnl": round(d_unr - l_unr, 2),
             "net_pnl": round((d_real + d_unr) - (l_real + l_unr), 2),
-            "note": "positive = broker ahead of local book (charges/timing expected)",
+            "note": ("broker-reported minus local net; bases and fill coverage "
+                     "may differ—check broker_tradebook_vs_local_fills"),
         },
     }
 
@@ -1168,10 +1173,50 @@ def _get_recon_sync():
         "MISSING_LOCAL": 0,
         "MISSING_BROKER": 0,
     }
+    # Include a fresh, read-only comparison against Dhan's day trade book.
+    # DB-only reconciliation cannot see a broker fill that never made it into
+    # the local DB; that exact gap previously produced a false-green result.
+    env = _live_env()
+    sync = getattr(env, "sync_service", None) if env is not None else None
+    broker_report = {}
+    if sync is not None:
+        try:
+            broker_report = (sync.stats() or {}).get(
+                "tradebook_reconciliation", {}) or {}
+        except Exception:
+            broker_report = {}
+    for mismatch in broker_report.get("mismatches", []) or []:
+        rows.append({
+            "broker_order_id": mismatch.get("broker_order_id"),
+            "order_id": None,
+            "strategy_id": None,
+            "instrument": mismatch.get("instrument"),
+            "side": mismatch.get("side"),
+            "local_order_state": None,
+            "broker_cumulative_qty": mismatch.get("broker_quantity", 0),
+            "local_cumulative_qty": mismatch.get("local_quantity", 0),
+            "gap_qty": max(0, int(mismatch.get("broker_quantity", 0) or 0)
+                            - int(mismatch.get("local_quantity", 0) or 0)),
+            "status": "MISMATCH",
+            "mismatch_type": mismatch.get("type"),
+            "correlation_id": mismatch.get("correlation_id"),
+            "broker_average_price": mismatch.get("broker_average_price"),
+            "local_average_price": mismatch.get("local_average_price"),
+            "updated_at": broker_report.get("checked_at"),
+            "source": "DHAN_TRADEBOOK",
+        })
+        counts["MISMATCH"] += 1
+        counts["MISSING_LOCAL"] += int(
+            mismatch.get("type") in {
+                "BROKER_FILL_MISSING_LOCAL", "BROKER_TRADEBOOK_FILL_MISSING"})
+    counts["MISMATCH"] = max(
+        counts["MISMATCH"],
+        sum(1 for row in rows if row.get("status") == "MISMATCH"))
     return {
         "reconciliation": rows,
         "summary": counts,
         "total": len(rows),
+        "broker_tradebook": broker_report,
         "generated_at": _ts(),
     }
 

@@ -483,7 +483,22 @@ class PersistenceManager:
                 ON CONFLICT(fill_id) DO UPDATE SET
                     trade_id=CASE WHEN fills.trade_id IS NULL OR trim(fills.trade_id)=''
                                   THEN excluded.trade_id ELSE fills.trade_id END,
-                    lifecycle_id=COALESCE(fills.lifecycle_id, excluded.trade_id)
+                    lifecycle_id=COALESCE(fills.lifecycle_id, excluded.lifecycle_id,
+                                          excluded.trade_id),
+                    entry_signal_id=COALESCE(fills.entry_signal_id,
+                                             excluded.entry_signal_id),
+                    broker_fill_id=COALESCE(fills.broker_fill_id,
+                                            excluded.broker_fill_id),
+                    broker_order_id=COALESCE(fills.broker_order_id,
+                                             excluded.broker_order_id),
+                    broker_trade_id=COALESCE(fills.broker_trade_id,
+                                             excluded.broker_trade_id),
+                    cumulative_filled_quantity=COALESCE(
+                        excluded.cumulative_filled_quantity,
+                        fills.cumulative_filled_quantity),
+                    position_id=COALESCE(fills.position_id, excluded.position_id),
+                    position_generation=COALESCE(
+                        fills.position_generation, excluded.position_generation)
             """, (
                 fill.get("fill_id"),
                 fill.get("order_id"),

@@ -39,7 +39,7 @@ from strategies.types import StrategyState
 
 log = logging.getLogger(__name__)
 
-_TASKS = ("orders", "positions", "account", "reconcile")
+_TASKS = ("orders", "positions", "account", "reconcile", "tradebook")
 _DEFAULT_INTERVAL = 0.5
 
 # Exit-family order roles: an order whose whole purpose is to REDUCE or close
@@ -196,6 +196,10 @@ class LiveBrokerPoller:
             # Keep this faster than the market/account snapshots; 0.5s stays
             # well inside Dhan's documented non-trading REST request limit.
             "reconcile": _interval(live_cfg, "reconcile_interval_seconds", 0.5),
+            # Daily execution reconciliation is read-only and deliberately
+            # slower than order/position polling to stay within broker limits.
+            "tradebook": _interval(
+                live_cfg, "tradebook_reconcile_interval_seconds", 30.0),
         }
         self.max_retries = int(live_cfg.get("max_retries", 3) or 3)
         self.retry_backoff = float(live_cfg.get("retry_backoff_seconds", 1.0) or 1.0)
@@ -209,13 +213,16 @@ class LiveBrokerPoller:
         self._errors.setdefault("sl_verify", 0)
         self._stats: dict[str, int] = {
             "orders_polled": 0, "positions_polled": 0, "accounts_polled": 0,
-            "reconciles_run": 0, "fills_created": 0, "fills_routed": 0,
+            "reconciles_run": 0, "tradebook_polls": 0,
+            "fills_created": 0, "fills_routed": 0,
             "order_persist_errors": 0, "sl_reconciled": 0,
             "pending_terminalized": 0,
         }
         self._last_broker_positions: list[dict] = []
         self._last_position_report: list[dict] = []
         self._last_account: dict = {}
+        self._last_tradebook_reconciliation: dict = {
+            "status": "NOT_CHECKED", "mismatch_count": 0, "mismatches": []}
 
         if wire_now:
             # Prime every task for immediate execution on start (tests and
@@ -276,7 +283,55 @@ class LiveBrokerPoller:
             return self.poll_account()
         if task == "reconcile":
             return self.poll_reconcile()
+        if task == "tradebook":
+            return self.poll_tradebook_reconciliation()
         return None
+
+    def poll_tradebook_reconciliation(self) -> dict:
+        """Compare broker-confirmed day executions with durable local fills.
+
+        This is diagnostic only: an unmatched fill is surfaced as a mismatch,
+        never silently adopted into an invented trade/signal lineage.
+        """
+        from execution.live.tradebook_reconciliation import compare_tradebook
+
+        self._stats["tradebook_polls"] += 1
+        broker = getattr(self.env, "broker", None)
+        transport = getattr(broker, "_transport", None) or broker
+        order_reader = getattr(transport, "day_order_book", None)
+        trade_reader = getattr(transport, "tradebook", None)
+        if not callable(order_reader) or not callable(trade_reader):
+            self._last_tradebook_reconciliation = {
+                "status": "UNSUPPORTED", "mismatch_count": 0,
+                "mismatches": [], "checked_at": self._clock()}
+            return self._last_tradebook_reconciliation
+        try:
+            broker_orders = list(order_reader() or [])
+            broker_trades = list(trade_reader() or [])
+            persistence = getattr(self.env, "persistence", None)
+            local_orders = (persistence.get_orders() if persistence is not None
+                            and hasattr(persistence, "get_orders") else [])
+            local_fills = (persistence.get_fills() if persistence is not None
+                           and hasattr(persistence, "get_fills") else [])
+            report = compare_tradebook(
+                broker_orders, broker_trades, local_orders, local_fills)
+            report["checked_at"] = self._clock()
+            report["broker_order_rows"] = len(broker_orders)
+            report["broker_trade_rows"] = len(broker_trades)
+            self._last_tradebook_reconciliation = report
+            self._stats["tradebook_mismatches"] = report["mismatch_count"]
+            if report["mismatch_count"]:
+                log.error("[LivePoller:%s] broker tradebook/local fill mismatch: %s",
+                          self.env.name, report["mismatches"])
+            return report
+        except Exception as e:
+            self._errors["tradebook"] += 1
+            self._last_tradebook_reconciliation = {
+                "status": "ERROR", "error": str(e), "mismatch_count": 0,
+                "mismatches": [], "checked_at": self._clock()}
+            log.error("[LivePoller:%s] tradebook reconciliation failed: %s",
+                      self.env.name, e)
+            return self._last_tradebook_reconciliation
 
     def _engine_order_snapshot(self, engine) -> dict:
         """Copy the mutable order book under the engine's state lock."""
@@ -655,6 +710,16 @@ class LiveBrokerPoller:
                 "trade_id": fill.trade_id,
                 "entry_signal_id": fill.entry_signal_id,
                 "broker_fill_id": getattr(fill, "broker_fill_id", None),
+                "broker_order_id": getattr(fill, "broker_order_id", None)
+                    or getattr(order, "_broker_order_id", None),
+                "broker_trade_id": getattr(fill, "broker_trade_id", None),
+                "cumulative_filled_quantity": getattr(
+                    fill, "cumulative_filled_quantity", None),
+                "position_id": getattr(fill, "position_id", None),
+                "lifecycle_id": getattr(fill, "lifecycle_id", None)
+                    or getattr(order, "lifecycle_id", None)
+                    or getattr(order, "trade_id", None),
+                "position_generation": getattr(fill, "position_generation", None),
             })
         except Exception as e:
             self._stats["order_persist_errors"] += 1
@@ -1185,6 +1250,8 @@ class LiveBrokerPoller:
                 "errors": dict(self._errors),
                 "cycle": dict(self._stats),
                 "last_position_report": list(self._last_position_report),
+                "tradebook_reconciliation": dict(
+                    self._last_tradebook_reconciliation),
                 "broker_positions_count": len(self._last_broker_positions),
                 "has_broker_account": bool(self._last_account),
             }

@@ -186,7 +186,7 @@ export default function LiveOps() {
           {data?.funds ? (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0" }}>
               <Stat label="Total Equity" value={`₹${fmt(data.funds.equity)}`} sub={`Dhan funds ${data.funds.fields?.source || ""}`} />
-              <Stat label="Net P&L" value={`₹${fmt(data.funds.net_pnl)}`} />
+              <Stat label="Broker-reported P&L" value={`₹${fmt(data.funds.net_pnl)}`} sub="Dhan positions P&L; local charges shown separately" />
               <Stat label="Used Margin" value={`₹${fmt(data.funds.used_margin)}`} />
               <Stat label="Available Margin" value={`₹${fmt(data.funds.available_margin)}`} />
               <Stat label="Realized P&L" value={`₹${fmt(data.funds.realized_pnl)}`} />
@@ -342,10 +342,10 @@ export default function LiveOps() {
 
         <Panel title="P&L — DHAN vs LOCAL" right={data?.pnl?.dhan && <Age ts={data.pnl.dhan.last_updated} />}>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0" }}>
-            <Stat label="DHAN realized" value={`₹${fmt(data?.pnl?.dhan?.realized_pnl)}`} sub="broker funds+positions" />
+            <Stat label="DHAN realized (reported)" value={`₹${fmt(data?.pnl?.dhan?.realized_pnl)}`} sub="positions realizedProfit" />
             <Stat label="DHAN unrealized" value={`₹${fmt(data?.pnl?.dhan?.unrealized_pnl)}`} />
-            <Stat label="DHAN net" value={`₹${fmt(data?.pnl?.dhan?.net_pnl)}`} />
-            <Stat label="LOCAL realized" value={`₹${fmt(data?.pnl?.local?.realized_pnl)}`} sub="engine pnl engines" />
+            <Stat label="DHAN total (reported)" value={`₹${fmt(data?.pnl?.dhan?.net_pnl)}`} />
+            <Stat label="LOCAL realized net" value={`₹${fmt(data?.pnl?.local?.realized_pnl)}`} sub="after recorded local charges" />
             <Stat label="LOCAL unrealized" value={`₹${fmt(data?.pnl?.local?.unrealized_pnl)}`} sub="local position book" />
             <Stat label="LOCAL net" value={`₹${fmt(data?.pnl?.local?.net_pnl)}`} />
           </div>

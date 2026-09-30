@@ -1350,8 +1350,8 @@ class DhanRestTransport(LiveBrokerClient):
                 or funds.get("availableBalance")
                 or 0.0)
             utilized = float(funds.get("utilizedAmount") or 0.0)
-            # Live broker P&L: aggregate over /positions rows so the account
-            # card shows broker truth, not locally re-derived numbers.
+            # Dhan includes realizedProfit on flat (netQty=0) rows.  Keep
+            # those realized values; only unrealized P&L is position-scoped.
             realized = 0.0
             unrealized = 0.0
             try:
@@ -1362,17 +1362,25 @@ class DhanRestTransport(LiveBrokerClient):
             else:
                 self._audit("POSITIONS", "/positions", "GET",
                             response=pos_rows, http_status=200)
-            try:
-                for row in pos_rows:
-                    if int(row.get("netQty") or 0) == 0:
-                        continue
+            for row in pos_rows if isinstance(pos_rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                try:
                     realized += float(row.get("realizedProfit")
                                       or row.get("realized_profit") or 0.0)
-                    unrealized += float(row.get("unrealizedProfit")
-                                        or row.get("unrealized_profit")
-                                        or row.get("unRealizedProfit") or 0.0)
-            except Exception:
-                pass  # positions poll failure must not kill the funds read
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    net_qty = int(row.get("netQty") or row.get("netQuantity") or 0)
+                except (TypeError, ValueError):
+                    net_qty = 0
+                if net_qty:
+                    try:
+                        unrealized += float(row.get("unrealizedProfit")
+                                            or row.get("unrealized_profit")
+                                            or row.get("unRealizedProfit") or 0.0)
+                    except (TypeError, ValueError):
+                        pass
             return {
                 "mode": "LIVE",
                 "equity": avail + utilized,
@@ -1381,6 +1389,7 @@ class DhanRestTransport(LiveBrokerClient):
                 "realized_pnl": round(realized, 2),
                 "unrealized_pnl": round(unrealized, 2),
                 "net_pnl": round(realized + unrealized, 2),
+                "realized_pnl_source": "dhan_positions_realized_profit",
                 "dhan_client_id": self.client_id,
                 "source": "fundlimit+positions",
             }

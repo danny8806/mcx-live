@@ -64,6 +64,7 @@ def test_poller_takes_the_order_poll_interval_from_the_live_section():
             "position_poll_interval_seconds": 7,
             "pnl_poll_interval_seconds": 9,
             "reconcile_interval_seconds": 11,
+            "tradebook_reconcile_interval_seconds": 17,
         }
     }
     poller = LiveBrokerPoller(SimpleNamespace(name="live"), Config())
@@ -72,6 +73,7 @@ def test_poller_takes_the_order_poll_interval_from_the_live_section():
     assert poller.intervals["positions"] == 7
     assert poller.intervals["account"] == 9
     assert poller.intervals["reconcile"] == 11
+    assert poller.intervals["tradebook"] == 17
 
 
 def test_poller_still_falls_back_to_defaults_when_the_section_is_absent():
