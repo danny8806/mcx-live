@@ -756,6 +756,16 @@ class EnvironmentFactoryMixin:
         strategy_id. This is the ONLY place StrategyRuntime objects are
         created — set_persistence() no longer wipes strategy/position state.
         """
+        if persistence is not None:
+            repair_fill_links = getattr(persistence, "backfill_trade_fill_links", None)
+            if callable(repair_fill_links):
+                try:
+                    repaired = repair_fill_links()
+                    if repaired:
+                        log.warning("[Engine] repaired %d persisted fill/trade links",
+                                    repaired)
+                except Exception as exc:
+                    log.error("[Engine] fill lineage repair failed: %s", exc)
         registry = StrategyRuntimeRegistry()
         for sid, strategy in env.strategies.items():
             lifecycle = TradeLifecycleManager(

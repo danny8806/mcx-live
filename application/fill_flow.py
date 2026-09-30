@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextlib import nullcontext
 from typing import Optional
 
 from execution.models import Fill
@@ -888,6 +889,28 @@ class FillFlowMixin:
         if not callable(broker_flat):
             return False
         flat, detail = broker_flat(env, signal)
+        # The broker query above must stay outside the engine lock, but a newer
+        # candle/reversal can replace this paired entry while the REST call is
+        # in flight. Revalidate ownership and commit the fire + submit handoff
+        # atomically with tick/candle processing.
+        with getattr(self, "_lock", nullcontext()):
+            strategy = (getattr(env, "strategies", {}) or {}).get(strategy_id)
+            current_pending = (getattr(strategy, "pending_entry", None)
+                               if strategy is not None else None)
+            current_signal = getattr(current_pending, "signal", None)
+            if (current_pending is not pending or current_signal is not signal
+                    or getattr(current_signal, "signal_id", None)
+                        != getattr(signal, "signal_id", None)
+                    or current_pending.status not in ("pending", "waiting_for_flat")):
+                return False
+            return self._finish_reversal_entry_after_flat(
+                env, strategy_id, strategy, pending, signal, metadata,
+                flat=flat, detail=detail)
+
+    def _finish_reversal_entry_after_flat(self, env, strategy_id, strategy,
+                                          pending, signal, metadata, *,
+                                          flat: bool, detail: dict) -> bool:
+        """Commit paired-entry state after broker-flat query under engine lock."""
         if not flat:
             pending.status = "waiting_for_flat"
             strategy.state = StrategyState.EXIT_ORDER_SUBMITTED

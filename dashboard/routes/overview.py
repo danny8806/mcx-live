@@ -195,18 +195,22 @@ def _get_overview_sync(env=None):
         unrealized = sum(
             pos.get("unrealized_pnl", 0) for pos in open_pos.values()
         )
+        broker_pnl = None
         if equity_source == "dhan":
-            realized = _safe(broker_account.get("realized_pnl", realized))
-            unrealized = _safe(broker_account.get("unrealized_pnl", unrealized))
+            broker_pnl = {
+                "realized_pnl": _safe(broker_account.get("realized_pnl")),
+                "unrealized_pnl": _safe(broker_account.get("unrealized_pnl")),
+                "source": "dhan_account_snapshot",
+            }
             used_margin = _safe(broker_account.get("used_margin", used_margin))
             available_margin = _safe(broker_account.get("available_margin", available_margin))
             starting = equity
 
-        net_pnl = equity - starting
-        if equity_source == "dhan":
-            # The Dhan account is not a 1.2M starting-capital book; net P&L is
-            # the broker's own realized+unrealized total.
-            net_pnl = _safe(broker_account.get("realized_pnl", 0)) + _safe(broker_account.get("unrealized_pnl", 0))
+        # P&L cards are the local strategy ledger (the same values returned by
+        # /api/pnl). Broker figures are exposed separately because Dhan's
+        # fund-limit response may omit realized trading P&L while positions
+        # and the local ledger already reflect closed fills.
+        net_pnl = realized + unrealized
 
         # Coerce non-finite daily_pnl to 0 so a NaN/inf value can't poison the API.
         _daily = risk_snap.get("daily_pnl", 0)
@@ -221,6 +225,7 @@ def _get_overview_sync(env=None):
             "total_net_pnl": {"value": net_pnl, "timestamp": _ts()},
             "realized_pnl": {"value": realized, "timestamp": _ts()},
             "unrealized_pnl": {"value": unrealized, "timestamp": _ts()},
+            "broker_pnl": broker_pnl,
             "margin_used": {"value": used_margin, "timestamp": _ts()},
             "available_margin": {"value": available_margin, "timestamp": _ts()},
             "book_equity": {"value": book_equity, "timestamp": _ts()},

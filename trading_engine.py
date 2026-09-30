@@ -1409,12 +1409,46 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             if env.broker is None or env.execution_engine is None:
                 continue
             from execution.live.broker_sync import BrokerSyncService
-            handle_fill = lambda fill, sid, is_exit, _env=env: self._handle_fill(
-                fill, sid, is_exit=is_exit, env_name=_env.name)
-            on_reconcile = lambda _env=env: self._reconcile_strategy_positions(
-                _env.name)
-            reset_strategy_fn = lambda sid, _env=env: self._reset_strategy_state(
-                sid, env_name=_env.name)
+            def handle_fill(fill, sid, is_exit, _env=env):
+                # REST/WS fill application mutates the same strategy, order,
+                # and position state as tick-trigger submission. Serialize it
+                # with the market callbacks so a late fill/reset cannot erase
+                # a just-fired trigger between crossing and broker POST.
+                with self._lock:
+                    return self._handle_fill(
+                        fill, sid, is_exit=is_exit, env_name=_env.name)
+
+            def on_reconcile(_env=env):
+                # Reconciliation performs broker REST reads; its state-changing
+                # portions acquire the engine lock after those reads so a slow
+                # response cannot stall market ticks and trigger processing.
+                return self._reconcile_strategy_positions(_env.name)
+            def reset_strategy_fn(sid, *, signal_id=None, trade_id=None, _env=env):
+                # Poller terminal-order cleanup races tick/candle callbacks.
+                # Serialize the ownership check and reset with those callbacks,
+                # and only release state if this exact terminal order still
+                # owns the strategy (a newer pending/fired signal wins).
+                with self._lock:
+                    strategy = _env.strategies.get(sid)
+                    if signal_id is not None and strategy is not None:
+                        pending = getattr(strategy, "pending_entry", None)
+                        pending_signal_id = getattr(
+                            getattr(pending, "signal", None), "signal_id", None)
+                        fired_signal_id = getattr(
+                            strategy, "_last_fired_trigger_signal_id", None)
+                        current_trade_id = getattr(strategy, "current_trade_id", None)
+                        if pending is not None:
+                            owns = str(pending_signal_id or "") == str(signal_id)
+                        elif fired_signal_id:
+                            owns = str(fired_signal_id) == str(signal_id)
+                        elif trade_id and current_trade_id:
+                            owns = str(current_trade_id) == str(trade_id)
+                        else:
+                            owns = False
+                        if not owns:
+                            return False
+                    self._reset_strategy_state(sid, env_name=_env.name)
+                    return True
             env.sync_service = BrokerSyncService(
                 env,
                 self.config,
@@ -1423,6 +1457,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 handle_fill=handle_fill,
                 on_reconcile=on_reconcile,
                 reset_strategy_fn=reset_strategy_fn,
+                state_lock=self._lock,
             )
             # Order Watcher — continuous broker+market+intent observation with
             # REST-verified recovery (WS fast path → targeted REST verify →
@@ -2141,15 +2176,17 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                     sl_summary = self.sync_sl_from_broker(env_name=env.name)
                 except Exception as e:
                     sl_summary = {"status": "failed", "error": str(e)}
-                if sl_summary.get("status") == "reconciled" and not \
-                        sl_summary.get("orphan_exposure"):
-                    if env.name not in self._reconciled_envs:
-                        log.info("[Engine] broker position state re-established "
-                                 "for %s — entries re-enabled", env.name)
-                    self._reconciled_envs.add(env.name)
-                else:
-                    # An unattributable broker position keeps the gate shut too.
-                    self._reconciled_envs.discard(env.name)
+                with self._lock:
+                    if sl_summary.get("status") == "reconciled" and not \
+                            sl_summary.get("orphan_exposure"):
+                        if env.name not in self._reconciled_envs:
+                            log.info("[Engine] broker position state re-established "
+                                     "for %s — entries re-enabled", env.name)
+                        self._reconciled_envs.add(env.name)
+                    else:
+                        # A stale/incomplete snapshot keeps entry admission shut
+                        # until the next broker-authoritative pass is consistent.
+                        self._reconciled_envs.discard(env.name)
                 if sl_summary.get("status") == "reconciled" and not \
                         sl_summary.get("orphan_exposure"):
                     # The old reversal exit may be filled before Dhan's
@@ -2222,10 +2259,27 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         brokers_positions = getattr(getattr(env, "broker", None), "positions", None)
         if not callable(brokers_positions):
             return
+        with self._lock:
+            before_fingerprint = self._sl_reconciliation_fingerprint(env)
         try:
             broker_rows = list(brokers_positions() or [])
         except Exception:
             broker_rows = []
+        # The optional auto-resolution path also consumes a slow broker REST
+        # snapshot. Never let an older flat/open response close or adopt over a
+        # position/order transition that completed while that request ran.
+        with self._lock:
+            if self._sl_reconciliation_fingerprint(env) != before_fingerprint:
+                self.publish_event("reconciliation_snapshot_discarded", {
+                    "reason": "local_lifecycle_changed_during_broker_query",
+                    "execution_mode": env.mode,
+                }, env_name=env.name)
+                return
+            return self._resolve_broker_positions_snapshot(
+                env, live_cfg, broker_rows)
+
+    def _resolve_broker_positions_snapshot(self, env, live_cfg,
+                                           broker_rows: list) -> None:
         broker_map = {}
         for r in broker_rows:
             key = (r.get("strategy_id"), r.get("instrument"))

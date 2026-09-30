@@ -76,6 +76,7 @@ class BrokerSyncService:
         handle_fill: Optional[Callable] = None,
         on_reconcile: Optional[Callable] = None,
         reset_strategy_fn: Optional[Callable] = None,
+        state_lock=None,
         wire_now: bool = False,
     ):
         self.env = env
@@ -96,7 +97,7 @@ class BrokerSyncService:
         self._poller = LiveBrokerPoller(
             env, config, clock=clock, wire_now=wire_now,
             handle_fill=handle_fill, on_reconcile=on_reconcile,
-            reset_strategy_fn=reset_strategy_fn,
+            reset_strategy_fn=reset_strategy_fn, state_lock=state_lock,
         )
 
         # ── optional WS feed ──────────────────────────────────────────

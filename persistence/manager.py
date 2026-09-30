@@ -352,6 +352,38 @@ class PersistenceManager:
                 trade.get("exit_type"),
                 trade.get("stop_price"),
             ))
+            self._link_trade_fill_ids(conn, trade)
+
+    @staticmethod
+    def _link_trade_fill_ids(conn, trade: dict) -> int:
+        """Attach persisted fills using the trade's exact fill identities."""
+        trade_id = str(trade.get("trade_id") or "")
+        strategy_id = str(trade.get("strategy_id") or "")
+        if not trade_id or not strategy_id:
+            return 0
+        changed = 0
+        for key in ("entry_fill_id", "exit_fill_id"):
+            fill_id = str(trade.get(key) or "")
+            if not fill_id:
+                continue
+            cur = conn.execute(
+                "UPDATE fills SET trade_id=?, lifecycle_id=COALESCE(lifecycle_id, ?) "
+                "WHERE fill_id=? AND strategy_id=? "
+                "AND (trade_id IS NULL OR trim(trade_id)='' OR trade_id=?)",
+                (trade_id, trade_id, fill_id, strategy_id, trade_id),
+            )
+            changed += cur.rowcount
+        return changed
+
+    def backfill_trade_fill_links(self) -> int:
+        """Repair blank fill links only when a trade names that exact fill."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT trade_id, strategy_id, entry_fill_id, exit_fill_id "
+                "FROM trades WHERE (entry_fill_id IS NOT NULL AND entry_fill_id!='') "
+                "OR (exit_fill_id IS NOT NULL AND exit_fill_id!='')"
+            ).fetchall()
+            return sum(self._link_trade_fill_ids(conn, dict(row)) for row in rows)
 
     def save_order(self, order: dict) -> None:
         """Save order to database."""
@@ -448,7 +480,10 @@ class PersistenceManager:
                     broker_trade_id, cumulative_filled_quantity,
                     position_id, lifecycle_id, position_generation
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(fill_id) DO NOTHING
+                ON CONFLICT(fill_id) DO UPDATE SET
+                    trade_id=CASE WHEN fills.trade_id IS NULL OR trim(fills.trade_id)=''
+                                  THEN excluded.trade_id ELSE fills.trade_id END,
+                    lifecycle_id=COALESCE(fills.lifecycle_id, excluded.trade_id)
             """, (
                 fill.get("fill_id"),
                 fill.get("order_id"),
@@ -848,6 +883,7 @@ class PersistenceManager:
                 fill.get("broker_trade_id"), fill.get("cumulative_filled_quantity"),
                 self.execution_mode,
             ))
+            self._link_trade_fill_ids(conn, trade)
 
     def save_event(self, event: dict) -> None:
         """Save event to audit log (stamped with the environment mode)."""

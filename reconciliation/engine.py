@@ -143,7 +143,8 @@ class ReconciliationEngine:
             lambda: self._check_duplicate_fills(db_fills, result),
             lambda: self._check_duplicate_orders(db_orders, result),
             lambda: self._check_db_vs_memory_orders(db_orders, mem_orders, result),
-            lambda: self._check_db_vs_memory_fills(db_fills, mem_fills, result),
+            lambda: self._check_db_vs_memory_fills(
+                db_fills, mem_fills, db_trades, result),
             lambda: self._check_price_sanity(db_fills, db_trades, result),
         ]:
             try:
@@ -492,13 +493,21 @@ class ReconciliationEngine:
         self,
         db_fills: list[dict],
         mem_fills: dict[str, dict],
+        db_trades: Optional[list[dict]],
         result: ReconciliationResult,
     ) -> None:
-        """Compare database fills against in-memory fills."""
+        """Compare fills without treating durable closed history as RAM loss."""
         db_ids = {f.get("fill_id") for f in db_fills}
         mem_ids = set(mem_fills.keys())
 
-        missing_in_mem = db_ids - mem_ids
+        closed_trade_fill_ids = {
+            fill_id
+            for trade in (db_trades or [])
+            if str(trade.get("status") or "").lower() == "closed"
+            for fill_id in (trade.get("entry_fill_id"), trade.get("exit_fill_id"))
+            if fill_id
+        }
+        missing_in_mem = db_ids - mem_ids - closed_trade_fill_ids
         extra_in_mem = mem_ids - db_ids
 
         if missing_in_mem:

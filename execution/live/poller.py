@@ -27,8 +27,10 @@ kill the worker), and safe to call directly from tests via :meth:`poll_once`.
 from __future__ import annotations
 
 import logging
+import inspect
 import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -48,20 +50,67 @@ _EXIT_ROLES = ("EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT")
 _TERMINAL_ORDER_STATES = ("rejected", "canceled", "cancelled", "expired")
 
 
+def _reset_strategy_if_owned(reset_fn, strategy_id, *, signal_id=None,
+                             trade_id=None) -> None:
+    """Call ownership-aware reset callbacks without masking callback errors."""
+    try:
+        inspect.signature(reset_fn).bind(
+            strategy_id, signal_id=signal_id, trade_id=trade_id)
+    except (TypeError, ValueError):
+        reset_fn(strategy_id)
+    else:
+        reset_fn(strategy_id, signal_id=signal_id, trade_id=trade_id)
+
+
 def _terminal_entry_matches_pending(strategy, order) -> bool:
     """Whether a terminal entry order owns the strategy's current trigger.
 
     Historical rejected orders remain in the restored execution book. Their
-    cleanup must never reset a newer, separately armed signal.
+    cleanup must never reset a newer, separately armed or just-fired signal.
+    ``on_tick`` clears ``pending_entry`` before SignalFlow submits the fired
+    signal, so a missing pending entry is not evidence that every historical
+    terminal order owns the strategy.
     """
     pending = getattr(strategy, "pending_entry", None)
-    if pending is None:
-        return True
-    pending_signal_id = getattr(getattr(pending, "signal", None), "signal_id", None)
     order_signal_id = (getattr(order, "entry_signal_id", None)
                        or getattr(order, "parent_signal_id", None))
-    return bool(pending_signal_id and order_signal_id
-                and str(pending_signal_id) == str(order_signal_id))
+    if pending is not None:
+        pending_signal_id = getattr(
+            getattr(pending, "signal", None), "signal_id", None)
+        return bool(pending_signal_id and order_signal_id
+                    and str(pending_signal_id) == str(order_signal_id))
+
+    # The trigger has fired and pending_entry is intentionally None during
+    # the tick -> order-submit handoff. Keep ownership on the fired signal id
+    # so a 500 ms poll of an older rejected order cannot clear its permit.
+    fired_signal_id = getattr(strategy, "_last_fired_trigger_signal_id", None)
+    if fired_signal_id:
+        return bool(order_signal_id
+                    and str(order_signal_id) == str(fired_signal_id))
+
+    # After restart, the fired-id cache may not be present. The current trade
+    # id is the durable fallback for an entry already being tracked; never
+    # treat missing lineage as ownership.
+    current_trade_id = getattr(strategy, "current_trade_id", None)
+    order_trade_id = getattr(order, "trade_id", None)
+    return bool(current_trade_id and order_trade_id
+                and str(current_trade_id) == str(order_trade_id))
+
+
+def _has_active_market_fallback_child(engine_orders: dict, order) -> bool:
+    """A canceled entry LIMIT is not terminal while its MARKET child is live."""
+    parent_id = getattr(order, "order_id", None)
+    if not parent_id:
+        return False
+    active = {"created", "submitted", "acknowledged", "partially_filled"}
+    return any(
+        getattr(candidate, "original_order_id", None) == parent_id
+        and str(getattr(candidate, "order_type", "") or "").upper() == "MARKET"
+        and str(getattr(candidate, "order_role", "") or "").upper()
+            in {"FALLBACK_MARKET", "ENTRY", "REVERSAL_ENTRY"}
+        and str(getattr(getattr(candidate, "state", None), "value",
+                        getattr(candidate, "state", "")) or "").lower() in active
+        for candidate in (engine_orders or {}).values())
 
 
 def _has_market_fallback_child(engine_orders: dict, order) -> bool:
@@ -121,6 +170,7 @@ class LiveBrokerPoller:
         handle_fill: Optional[Callable] = None,
         on_reconcile: Optional[Callable] = None,
         reset_strategy_fn: Optional[Callable] = None,
+        state_lock=None,
         wire_now: bool = False,
     ):
         self.env = env
@@ -134,6 +184,7 @@ class LiveBrokerPoller:
         # reset_strategy_fn(strategy_id) — resets strategy state to FLAT
         # (TradingEngine._reset_strategy_state wrapped with env lock).
         self._reset_strategy_fn = reset_strategy_fn
+        self._state_lock = state_lock or threading.RLock()
 
         live_cfg = as_dict(config).get("live", {}) or {}
         self.intervals = {
@@ -227,6 +278,28 @@ class LiveBrokerPoller:
             return self.poll_reconcile()
         return None
 
+    def _engine_order_snapshot(self, engine) -> dict:
+        """Copy the mutable order book under the engine's state lock."""
+        with self._state_lock:
+            return dict(getattr(engine, "_orders", {}) or {})
+
+    def _position_book_fingerprint(self, position_manager) -> tuple:
+        """Fingerprint local ownership around a slow broker positions read."""
+        with self._state_lock:
+            rows = []
+            for position in list(getattr(
+                    position_manager, "open_positions", []) or []):
+                rows.append((
+                    str(getattr(position, "position_id", "")),
+                    str(getattr(position, "trade_id", "")),
+                    bool(getattr(position, "is_open", False)),
+                    str(getattr(position, "instrument", "")),
+                    bool(getattr(position, "is_long", False)),
+                    int(getattr(position, "quantity", 0) or 0),
+                    str(getattr(position, "position_generation", "")),
+                ))
+            return tuple(sorted(rows))
+
     # ── single cycles (idempotent; callable directly in tests) ────────
 
     def poll_orders(self) -> list:
@@ -257,7 +330,7 @@ class LiveBrokerPoller:
         # already terminal are skipped.  Runs BEFORE the empty-statuses guard
         # because the in-memory broker book is empty right after a restart,
         # and the sweep actively probes each stranded row's broker order.
-        engine_orders = getattr(engine, "_orders", {})
+        engine_orders = self._engine_order_snapshot(engine)
         self._terminalize_pending_from_broker(statuses)
         # F3 — an exit the broker ended WITHOUT closing the position must
         # re-arm the local SL.  Runs BEFORE the empty-statuses guard for the
@@ -268,23 +341,35 @@ class LiveBrokerPoller:
         if not statuses:
             return []
         applied: list = []
-        for fill in engine.apply_broker_statuses(statuses):
-            self._stats["fills_created"] += 1
-            routed = False
-            if router is not None:
-                try:
-                    routed = bool(router.route_fill(
-                        fill,
-                        lambda f, es, ix: self._route_fill(f, es, is_exit=ix),
-                        entry_signal_id=getattr(fill, "entry_signal_id", None),
-                    ))
-                except Exception as e:
-                    self._errors["orders"] += 1
-                    log.error("[LivePoller:%s] fill route failed for %s: %s",
-                              self.env.name, fill.fill_id, e)
-            if routed:
-                self._stats["fills_routed"] += 1
-                applied.append(fill)
+        # Broker status application mutates Order objects and can create fills;
+        # serialize this local state transition with concurrent submit/fill
+        # callbacks. Network I/O above remains outside the lock.
+        # Keep broker-order state application and the resulting fill-to-position
+        # transition in one critical section. Releasing the lock between these
+        # steps exposes an intermediate state (broker order FILLED, local
+        # position not yet created/closed) to candle and SL callbacks.
+        fills_to_persist = []
+        with self._state_lock:
+            broker_fills = engine.apply_broker_statuses(statuses)
+            for fill in broker_fills:
+                self._stats["fills_created"] += 1
+                routed = False
+                if router is not None:
+                    try:
+                        routed = bool(router.route_fill(
+                            fill,
+                            lambda f, es, ix: self._route_fill(f, es, is_exit=ix),
+                            entry_signal_id=getattr(fill, "entry_signal_id", None),
+                        ))
+                    except Exception as e:
+                        self._errors["orders"] += 1
+                        log.error("[LivePoller:%s] fill route failed for %s: %s",
+                                  self.env.name, fill.fill_id, e)
+                if routed:
+                    self._stats["fills_routed"] += 1
+                    applied.append(fill)
+                fills_to_persist.append(fill)
+        for fill in fills_to_persist:
             self._upgrade_dbs_order_row(fill)
         # Phase 6 — persist any order whose state flipped to REJECTED, CANCELLED
         # or EXPIRED during apply_broker_statuses (no fill is produced for
@@ -294,12 +379,18 @@ class LiveBrokerPoller:
         # Dhan-linked state: when an ENTRY order is rejected/cancelled by the
         # broker, reset the strategy state back to FLAT so it is never stuck
         # in ENTRY_TRIGGERED with no Dhan fill to confirm the position.
-        engine_orders = getattr(engine, "_orders", {})
+        engine_orders = self._engine_order_snapshot(engine)
         strategies = getattr(self.env, "strategies", {}) or {}
         for order in list(engine_orders.values()):
             if order.state.value in ("rejected", "canceled", "cancelled", "expired"):
                 self._persist_order_state(order)
                 role = (getattr(order, "order_role", "") or "").upper()
+                if (role in ("ENTRY", "REVERSAL_ENTRY")
+                        and _has_active_market_fallback_child(engine_orders, order)):
+                    # The LIMIT was cancelled as the first half of the
+                    # cancel-confirm-MARKET fallback. It no longer owns the
+                    # strategy reset while its MARKET child is still active.
+                    continue
                 if role in ("EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"):
                     if _has_market_fallback_child(engine_orders, order):
                         # The watcher canceled this LIMIT as the first half of
@@ -307,18 +398,20 @@ class LiveBrokerPoller:
                         # the reversal entry while its child MARKET owns exit.
                         continue
                     position_id = getattr(order, "parent_position_id", None)
-                    position = next((p for p in getattr(
-                        self.env.position_manager, "open_positions", [])
-                        if p.position_id == position_id
-                        and p.trade_id == (getattr(order, "lifecycle_id", None)
-                                           or getattr(order, "trade_id", None))
-                        and p.position_generation == getattr(
-                            order, "position_generation", None)), None)
+                    with self._state_lock:
+                        position = next((p for p in getattr(
+                            self.env.position_manager, "open_positions", [])
+                            if p.position_id == position_id
+                            and p.trade_id == (getattr(order, "lifecycle_id", None)
+                                               or getattr(order, "trade_id", None))
+                            and p.position_generation == getattr(
+                                order, "position_generation", None)), None)
+                        if position is not None:
+                            position.exit_started = False
+                            strat = strategies.get(order.strategy_id)
+                            if strat is not None:
+                                strat.stop_exit_submitted = False
                     if position is not None:
-                        position.exit_started = False
-                        strat = strategies.get(order.strategy_id)
-                        if strat is not None:
-                            strat.stop_exit_submitted = False
                         try:
                             persistence = getattr(self.env, "persistence", None)
                             if persistence is not None:
@@ -327,38 +420,43 @@ class LiveBrokerPoller:
                             pass
                     if role == "REVERSAL_EXIT":
                         self._settle_reversal_terminal(order, engine_orders)
-                        strat = strategies.get(order.strategy_id)
-                        if strat is not None:
-                            pending = getattr(strat, "pending_entry", None)
-                            pending_signal = getattr(pending, "signal", None)
-                            pending_signal_id = getattr(pending_signal, "signal_id", None)
-                            if pending_signal_id:
-                                persistence = getattr(self.env, "persistence", None)
-                                if persistence is not None:
-                                    try:
-                                        persistence.terminalize_pending_order(
-                                            str(pending_signal_id), status="resolved",
-                                            reason="reversal_exit_ended_without_close")
-                                    except Exception as exc:
-                                        log.error("[LivePoller:%s] failed to retire reversal "
-                                                  "entry %s: %s", self.env.name,
-                                                  pending_signal_id, exc)
-                                registry = getattr(self.env, "pending_triggers", None)
-                                if registry is not None:
-                                    registry.remove_signal(str(pending_signal_id))
-                            strat.pending_entry = None
-                            strat.pending_exit_trigger = None
-                            if position is not None:
-                                strat.position_side = (
-                                    "LONG" if getattr(position, "is_long", False)
-                                    else "SHORT")
-                                strat.state = (StrategyState.LONG_POSITION
-                                               if position.is_long
-                                               else StrategyState.SHORT_POSITION)
-                            strat._last_fired_trigger_signal_id = None
-                            if hasattr(strat, "_fired_trigger_signal_ids"):
-                                strat._fired_trigger_signal_ids.clear()
-                            strat.stop_exit_submitted = False
+                        # Reversal cleanup can invalidate a just-fired paired
+                        # entry. Serialize it with tick -> SignalFlow handling,
+                        # so either the entry submits first or the terminal old
+                        # exit retires it before it can fire; no half-interleave.
+                        with self._state_lock:
+                            strat = strategies.get(order.strategy_id)
+                            if strat is not None:
+                                pending = getattr(strat, "pending_entry", None)
+                                pending_signal = getattr(pending, "signal", None)
+                                pending_signal_id = getattr(pending_signal, "signal_id", None)
+                                if pending_signal_id:
+                                    persistence = getattr(self.env, "persistence", None)
+                                    if persistence is not None:
+                                        try:
+                                            persistence.terminalize_pending_order(
+                                                str(pending_signal_id), status="resolved",
+                                                reason="reversal_exit_ended_without_close")
+                                        except Exception as exc:
+                                            log.error("[LivePoller:%s] failed to retire reversal "
+                                                      "entry %s: %s", self.env.name,
+                                                      pending_signal_id, exc)
+                                    registry = getattr(self.env, "pending_triggers", None)
+                                    if registry is not None:
+                                        registry.remove_signal(str(pending_signal_id))
+                                strat.pending_entry = None
+                                strat.pending_exit_trigger = None
+                                if position is not None:
+                                    strat.position_side = (
+                                        "LONG" if getattr(position, "is_long", False)
+                                        else "SHORT")
+                                    strat.state = (StrategyState.LONG_POSITION
+                                                   if position.is_long
+                                                   else StrategyState.SHORT_POSITION)
+                                strat._last_fired_trigger_signal_id = None
+                                if hasattr(strat, "_fired_trigger_signal_ids"):
+                                    strat._fired_trigger_signal_ids.clear()
+                                strat.stop_exit_submitted = False
                 if role.startswith("ENTRY") or role in ("REVERSAL_ENTRY", "FALLBACK_MARKET"):
                     # The POST may have been accepted as PENDING and rejected
                     # only on a later broker status poll. Settle the canonical
@@ -410,11 +508,15 @@ class LiveBrokerPoller:
                         continue  # stale terminal order from an older trade
                     try:
                         if self._reset_strategy_fn is not None:
-                            self._reset_strategy_fn(order.strategy_id)
+                            _reset_strategy_if_owned(
+                                self._reset_strategy_fn, order.strategy_id,
+                                signal_id=(getattr(order, "entry_signal_id", None)
+                                           or getattr(order, "parent_signal_id", None)),
+                                trade_id=getattr(order, "trade_id", None))
                     except Exception as e:
                         log.error("[LivePoller:%s] reset_strategy_state failed for %s: %s",
                                   self.env.name, order.strategy_id, e)
-        self._terminalize_pending_entries(engine_orders.values(), statuses)
+        self._terminalize_pending_entries(tuple(engine_orders.values()), statuses)
         self._terminalize_pending_from_broker(statuses)
         # Order Watcher — continuous broker+market+intent observation with
         # priority-safe recovery (WAIT/REPRICE/CANCEL/LOCK/MARKET-fallback).
@@ -598,6 +700,19 @@ class LiveBrokerPoller:
         return changed
 
     def _release_terminal_exits(self) -> int:
+        # Recovery mutates the same position stop/exit latches as live ticks.
+        # The routine only performs local reads and persistence writes, so keep
+        # its ownership check and re-arm atomic with tick/exit callbacks.
+        with getattr(self, "_state_lock", nullcontext()):
+            worker = getattr(self, "_release_terminal_exits_locked", None)
+            if callable(worker):
+                return worker()
+            # A few unit fixtures bind this method directly to a SimpleNamespace
+            # rather than constructing LiveBrokerPoller; retain that supported
+            # test seam while production instances use the bound method above.
+            return LiveBrokerPoller._release_terminal_exits_locked(self)
+
+    def _release_terminal_exits_locked(self) -> int:
         """Re-arm the position-owned SL for exits the broker ended unclosed.
 
         An exit order that reaches REJECTED / CANCELLED / EXPIRED while its
@@ -877,7 +992,9 @@ class LiveBrokerPoller:
             if (self._reset_strategy_fn is not None and not has_position
                     and (trade_settled or matching_pending)):
                 try:
-                    self._reset_strategy_fn(row.get("strategy_id"))
+                    _reset_strategy_if_owned(
+                        self._reset_strategy_fn, row.get("strategy_id"),
+                        signal_id=signal_id)
                 except Exception as exc:
                     log.error("[LivePoller:%s] reset after not-found failed: %s",
                               self.env.name, exc)
@@ -941,15 +1058,15 @@ class LiveBrokerPoller:
         broker = getattr(self.env, "broker", None)
         if broker is None or not hasattr(broker, "positions"):
             return []
+        pm = getattr(self.env, "position_manager", None)
+        before_fingerprint = self._position_book_fingerprint(pm)
         try:
             bpos = list(broker.positions() or [])
         except Exception as e:
             self._errors["positions"] += 1
             log.error("[LivePoller:%s] positions failed: %s", self.env.name, e)
             return []
-        self._last_broker_positions = bpos
         report: list[dict] = []
-        pm = getattr(self.env, "position_manager", None)
         # Dhan positions are instrument-level, but DhanRestTransport expands
         # each net row to every configured strategy on that instrument. Compare
         # one broker net to the aggregate local net once; per-strategy
@@ -966,24 +1083,37 @@ class LiveBrokerPoller:
 
         local_by_instrument: dict[str, list[dict]] = {}
         if pm is not None:
-            try:
-                open_positions = list(pm.open_positions)
-            except Exception:
-                open_positions = []
-            for position in open_positions:
-                if not getattr(position, "is_open", False):
-                    continue
-                instrument = str(getattr(position, "instrument", "") or "")
-                quantity = int(getattr(position, "quantity", 0) or 0)
-                if not instrument or quantity <= 0:
-                    continue
-                signed = quantity if getattr(position, "is_long", False) else -quantity
-                local_by_instrument.setdefault(instrument, []).append({
-                    "strategy_id": getattr(position, "strategy_id", None),
-                    "side": "LONG" if signed > 0 else "SHORT",
-                    "quantity": quantity,
-                    "signed_quantity": signed,
-                })
+            # Freeze one coherent local-net view. The broker call above remains
+            # concurrent; this lock only covers the inexpensive in-memory copy.
+            with self._state_lock:
+                if self._position_book_fingerprint(pm) != before_fingerprint:
+                    # The broker result spans a local fill/exit transition. It
+                    # cannot be compared meaningfully with the newer book, so
+                    # retain the last coherent diagnostic until the next poll.
+                    self._stats["position_snapshots_discarded"] = (
+                        self._stats.get("position_snapshots_discarded", 0) + 1)
+                    return list(self._last_position_report)
+                self._last_broker_positions = bpos
+                try:
+                    open_positions = list(pm.open_positions)
+                except Exception:
+                    open_positions = []
+                for position in open_positions:
+                    if not getattr(position, "is_open", False):
+                        continue
+                    instrument = str(getattr(position, "instrument", "") or "")
+                    quantity = int(getattr(position, "quantity", 0) or 0)
+                    if not instrument or quantity <= 0:
+                        continue
+                    signed = quantity if getattr(position, "is_long", False) else -quantity
+                    local_by_instrument.setdefault(instrument, []).append({
+                        "strategy_id": getattr(position, "strategy_id", None),
+                        "side": "LONG" if signed > 0 else "SHORT",
+                        "quantity": quantity,
+                        "signed_quantity": signed,
+                    })
+        else:
+            self._last_broker_positions = bpos
 
         for instrument in sorted(set(broker_by_instrument) | set(local_by_instrument)):
             broker_rows = broker_by_instrument.get(instrument, set())

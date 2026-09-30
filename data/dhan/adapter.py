@@ -147,6 +147,10 @@ class DhanDataAdapter:
                         "ltp": tick["ltp"],
                         "ltq": tick.get("ltq", 0),
                         "timestamp": tick["event_timestamp"],
+                        # Dhan LTT is exchange event time and can differ from
+                        # the VPS clock (timezone/clock skew). Keep a separate
+                        # local receipt clock for freshness decisions.
+                        "receive_timestamp": tick.get("receive_timestamp") or time.time(),
                         "cumvol": tick.get("cumvol"),
                     }
 

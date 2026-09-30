@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -813,40 +814,44 @@ class PersistenceFlowMixin:
         return price * quantity * self.config.instrument(instrument).get("multiplier", 1.0) * 0.065
     def _reset_strategy_state(self, strategy_id: str, keep_pending: bool = False,
                               env_name: Optional[str] = None) -> None:
-        env = self._env_for(env_name)
-        strategy = env.strategies.get(strategy_id)
-        if strategy:
-            keep = keep_pending and strategy.pending_entry is not None
-            strategy._cancel_trigger(getattr(strategy, "pending_exit_trigger", None))
-            strategy.pending_exit_trigger = None
-            if keep:
-                pen = strategy.pending_entry
-                pen.status = "pending"
-                if pen.signal is not None:
-                    md = pen.signal.metadata or {}
-                    md.update(pending=True, triggered=False, trigger_state="ARMED")
-                    pen.signal.metadata = md
-                strategy.state = (StrategyState.PENDING_LONG if pen.side == "LONG"
-                                  else StrategyState.PENDING_SHORT)
-            else:
-                strategy.state = StrategyState.FLAT
-            strategy.position_side = strategy.stop_price = None
-            strategy.current_position_id = None
-            strategy.position_generation = None
-            strategy.position_quantity = None
-            # The stop-out re-fire guard lifts once the position actually
-            # closes: the strategy is flat again, so later stop exits (new
-            # trades) are evaluated normally.
-            setattr(strategy, "stop_exit_submitted", False)
-            strategy._last_fired_trigger_signal_id = None
-            strategy._fired_trigger_signal_ids.clear()
-            if not keep:
-                strategy._cancel_trigger(strategy.pending_entry)
-                strategy.pending_entry = None
-            strategy.current_trade_id = None
-            registry = getattr(env, "pending_triggers", None)
-            if registry is not None:
-                registry.sync_strategy(strategy)
-        runtime = env.runtimes.get(strategy_id) if env.runtimes is not None else None
-        if runtime is not None:
-            runtime.current_trade_id = None
+        # This helper is reached by market callbacks, broker fills, and
+        # reconciliation. Make clearing a fired permit atomic with trigger
+        # evaluation/submission regardless of the caller's thread.
+        with getattr(self, "_lock", nullcontext()):
+            env = self._env_for(env_name)
+            strategy = env.strategies.get(strategy_id)
+            if strategy:
+                keep = keep_pending and strategy.pending_entry is not None
+                strategy._cancel_trigger(getattr(strategy, "pending_exit_trigger", None))
+                strategy.pending_exit_trigger = None
+                if keep:
+                    pen = strategy.pending_entry
+                    pen.status = "pending"
+                    if pen.signal is not None:
+                        md = pen.signal.metadata or {}
+                        md.update(pending=True, triggered=False, trigger_state="ARMED")
+                        pen.signal.metadata = md
+                    strategy.state = (StrategyState.PENDING_LONG if pen.side == "LONG"
+                                      else StrategyState.PENDING_SHORT)
+                else:
+                    strategy.state = StrategyState.FLAT
+                strategy.position_side = strategy.stop_price = None
+                strategy.current_position_id = None
+                strategy.position_generation = None
+                strategy.position_quantity = None
+                # The stop-out re-fire guard lifts once the position actually
+                # closes: the strategy is flat again, so later stop exits (new
+                # trades) are evaluated normally.
+                setattr(strategy, "stop_exit_submitted", False)
+                strategy._last_fired_trigger_signal_id = None
+                strategy._fired_trigger_signal_ids.clear()
+                if not keep:
+                    strategy._cancel_trigger(strategy.pending_entry)
+                    strategy.pending_entry = None
+                strategy.current_trade_id = None
+                registry = getattr(env, "pending_triggers", None)
+                if registry is not None:
+                    registry.sync_strategy(strategy)
+            runtime = env.runtimes.get(strategy_id) if env.runtimes is not None else None
+            if runtime is not None:
+                runtime.current_trade_id = None

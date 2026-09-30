@@ -488,6 +488,53 @@ class SLFlowMixin:
 
     # ── startup / crash recovery ────────────────────────────────────────
 
+    @staticmethod
+    def _sl_reconciliation_fingerprint(env) -> tuple:
+        """Identify local lifecycle changes that invalidate an in-flight REST snapshot."""
+        pm = getattr(env, "position_manager", None)
+        positions = []
+        for position in list(getattr(pm, "open_positions", []) or []):
+            positions.append((
+                str(getattr(position, "position_id", "")),
+                str(getattr(position, "trade_id", "")),
+                bool(getattr(position, "is_open", False)),
+                str(getattr(position, "instrument", "")),
+                bool(getattr(position, "is_long", False)),
+                int(getattr(position, "quantity", 0) or 0),
+                str(getattr(position, "position_generation", "")),
+                str(getattr(position, "stop_price", "")),
+                str(getattr(position, "sl_state", "")),
+                str(getattr(position, "exit_order_id", "")),
+                bool(getattr(position, "exit_started", False)),
+            ))
+        execution = getattr(env, "execution_engine", None)
+        orders = []
+        for order_id, order in list(
+                (getattr(execution, "_orders", {}) or {}).items()):
+            state = getattr(order, "state", None)
+            orders.append((
+                str(order_id), str(getattr(state, "value", state)),
+                int(getattr(order, "filled_quantity", 0) or 0),
+                str(getattr(order, "trade_id", "")),
+                str(getattr(order, "parent_position_id", "")),
+            ))
+        strategies = []
+        for strategy_id, strategy in sorted(
+                (getattr(env, "strategies", {}) or {}).items()):
+            pending = getattr(strategy, "pending_entry", None)
+            pending_signal = getattr(pending, "signal", None)
+            state = getattr(strategy, "state", None)
+            strategies.append((
+                str(strategy_id), str(getattr(state, "value", state)),
+                str(getattr(pending_signal, "signal_id", "")),
+                str(getattr(pending, "status", "")),
+                str(getattr(strategy, "current_trade_id", "")),
+                str(getattr(strategy, "current_position_id", "")),
+                str(getattr(strategy, "position_side", "")),
+                bool(getattr(strategy, "stop_exit_submitted", False)),
+            ))
+        return tuple(sorted(positions)), tuple(sorted(orders)), tuple(strategies)
+
     def sync_sl_from_broker(self, env_name: Optional[str] = None) -> dict:
         """INVARIANT 9 — arm the SL only from broker-confirmed positions.
 
@@ -514,6 +561,12 @@ class SLFlowMixin:
             return {"status": "failed", "error": "broker_unavailable",
                     "env": env_name, "armed": [], "unavailable": [],
                     "dropped_local": [], "broker_only": []}
+        state_lock = getattr(self, "_lock", None)
+        if state_lock is not None:
+            with state_lock:
+                before_fingerprint = self._sl_reconciliation_fingerprint(env)
+        else:
+            before_fingerprint = self._sl_reconciliation_fingerprint(env)
         try:
             broker_positions = broker.positions() or []
         except Exception as e:
@@ -525,6 +578,30 @@ class SLFlowMixin:
             return {"status": "failed", "error": f"broker_query_failed: {e}",
                     "env": env_name, "armed": [], "unavailable": [],
                     "dropped_local": [], "broker_only": []}
+
+        # Broker I/O stays outside the state lock. Apply this response only
+        # after taking the same lock used by tick, fill, and trigger paths so
+        # reconciliation cannot close/re-arm a position midway through an SL
+        # or reversal transition.
+        worker = getattr(self, "_sync_sl_from_broker_snapshot", None)
+        if callable(worker):
+            if state_lock is not None:
+                with state_lock:
+                    if self._sl_reconciliation_fingerprint(env) != before_fingerprint:
+                        return {
+                            "status": "stale_snapshot",
+                            "error": "local_lifecycle_changed_during_broker_query",
+                            "env": getattr(env, "name", env_name),
+                            "armed": [], "unavailable": [],
+                            "dropped_local": [], "broker_only": [],
+                        }
+                    return worker(env, env_name, broker_positions)
+            return worker(env, env_name, broker_positions)
+        return SLFlowMixin._sync_sl_from_broker_snapshot(
+            self, env, env_name, broker_positions)
+
+    def _sync_sl_from_broker_snapshot(self, env, env_name, broker_positions) -> dict:
+        pm = getattr(env, "position_manager", None)
 
         # Local open positions across every strategy.
         local_positions = []

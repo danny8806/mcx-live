@@ -6,7 +6,9 @@ position, fill-routing and SL components, and replace only the broker with the
 deterministic in-memory implementation. All persistence is isolated in tmp_path.
 """
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,8 +18,10 @@ from core.timeframe_engine import Bar
 from execution.live.broker_client import StubLiveBroker
 from execution.models import OrderState
 from execution.live.order_watcher import OrderWatcher
+from execution.live.poller import LiveBrokerPoller
 from persistence.manager import PersistenceManager
 from portfolio.position_manager import Position, PositionSide
+from strategies.types import PendingEntry
 from trading_engine import TradingEngine
 
 
@@ -300,6 +304,461 @@ def test_fresh_candle_trigger_entry_reversal_and_sl_full_runtime_cycle(tmp_path)
         assert final_position.sl_state == "ARMED"
         assert env.sl_monitor.armed_ids() == [final_position.position_id]
     finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_live_reversal_entry_retries_after_broker_position_endpoint_lags_exit_fill(tmp_path):
+    """A filled reversal exit must retain and later submit its paired entry.
+
+    Dhan may publish the exit fill before its positions endpoint reports flat.
+    The first activation attempt must fail closed without losing the armed
+    durable entry; a later flat confirmation must submit that entry once.
+    """
+    engine, env, broker, persistence = _runtime(tmp_path)
+    strategy = env.strategies["gold_02"]
+    try:
+        entry = _long_candle_signal(engine, env, broker, strategy)
+        _fire_and_submit(engine, env, broker, strategy, entry)
+        old_position = env.position_manager.open_positions[0]
+        assert old_position.is_long
+
+        strategy._prev_fast_close = 100.0
+        strategy._prev_htf_value = 100.0
+        strategy._prev_fast_high = 103.0
+        strategy._prev_fast_low = 99.0
+        _live_price(engine, env, broker, 99.0)
+        reversal_exit = strategy.on_bar(
+            Bar("GOLDM", "15m", 3, 4, 100, 101, 96, 99, 1),
+            SimpleNamespace(htf_value=100.0), 100.0)
+        assert reversal_exit is not None
+        paired_entry = strategy.pending_entry.signal
+        engine._process_signal(reversal_exit, "live")
+        _live_price(engine, env, broker, reversal_exit.trigger_price)
+        assert strategy.on_tick(reversal_exit.trigger_price, time.time()) is reversal_exit
+
+        # Simulate the broker's positions endpoint lagging an already-confirmed
+        # exit fill. The close must be applied locally, while the reversal leg
+        # remains durably armed and no overlapping entry is submitted yet.
+        actual_positions = broker.positions
+        broker.positions = lambda: [{
+            "strategy_id": "gold_02", "instrument": "GOLDM",
+            "side": "LONG", "quantity": 1,
+        }]
+        engine._process_signal(reversal_exit, "live")
+        orders = list(env.execution_engine._orders.values())
+        assert [order.order_role for order in orders] == ["ENTRY", "REVERSAL_EXIT"]
+        assert not env.position_manager.open_positions
+        assert strategy.pending_entry is not None
+        assert strategy.pending_entry.signal is paired_entry
+        assert strategy.pending_entry.status == "waiting_for_flat"
+
+        # Once broker position state catches up, the retry path must send the
+        # paired opposite entry exactly once through the normal live pipeline.
+        broker.positions = actual_positions
+        # Exercise the real periodic reconciliation hook that retries parked
+        # reversal entries after Dhan's position endpoint catches up.
+        engine._reconcile_strategy_positions("live")
+        orders = list(env.execution_engine._orders.values())
+        assert [order.order_role for order in orders] == [
+            "ENTRY", "REVERSAL_EXIT", "REVERSAL_ENTRY"]
+        assert orders[-1].entry_signal_id == paired_entry.signal_id
+        assert orders[-1].state == OrderState.FILLED
+        assert strategy.pending_entry is None
+        new_position = env.position_manager.open_positions[0]
+        assert new_position.is_open and not new_position.is_long
+        assert new_position.sl_state == "ARMED"
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_new_reversal_replaces_parked_entry_while_flat_query_is_in_flight(tmp_path):
+    """A slow broker-flat read must not submit a superseded reversal entry."""
+    engine, env, broker, persistence = _runtime(tmp_path)
+    strategy = env.strategies["gold_02"]
+    try:
+        old_signal = _long_candle_signal(engine, env, broker, strategy)
+        old_signal.side = "SHORT"
+        old_signal.metadata["is_reversal_entry"] = True
+        old_pending = PendingEntry(
+            signal=old_signal, trigger_price=old_signal.trigger_price,
+            side="SHORT", status="waiting_for_flat")
+        strategy.pending_entry = old_pending
+        processed = []
+        engine._process_signal = lambda signal, env_name=None: processed.append(signal)
+
+        # Simulate the market callback replacing the pending reversal during
+        # the REST position query. The broker query itself is outside the
+        # engine lock, and the post-query ownership check must reject the old
+        # candidate instead of firing it over the newer signal.
+        newer_signal = _long_candle_signal(
+            engine, env, broker, strategy, start=3, high=105)
+        newer_signal.side = "SHORT"
+        newer_signal.metadata["is_reversal_entry"] = True
+        newer_pending = PendingEntry(
+            signal=newer_signal, trigger_price=newer_signal.trigger_price,
+            side="SHORT", status="waiting_for_flat")
+
+        def broker_flat_replaces_pending(_env, _signal):
+            with engine._lock:
+                strategy.pending_entry = newer_pending
+            return True, {"positions": []}
+
+        engine._broker_flat_for_entry = broker_flat_replaces_pending
+        assert engine._activate_reversal_entry_after_flat(env, "gold_02") is False
+        assert strategy.pending_entry is newer_pending
+        assert strategy.pending_entry.signal is newer_signal
+        assert strategy.pending_entry.status == "waiting_for_flat"
+        assert processed == []
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_historical_rejection_poll_cannot_erase_fired_gold_entry_before_submit(tmp_path):
+    """Reproduce the live poller race that rejected GOLDM before Dhan POST.
+
+    The new trigger has fired and ``pending_entry`` is None, while an old
+    rejected order remains in the execution book. Polling that old order must
+    not clear the new signal's fired ownership before SignalFlow submits it.
+    """
+    engine, env, broker, persistence = _runtime(tmp_path)
+    strategy = env.strategies["gold_02"]
+    try:
+        signal = _long_candle_signal(engine, env, broker, strategy)
+        engine._process_signal(signal, "live")
+
+        old_terminal = SimpleNamespace(
+            order_id="LIVE-OLD-REJECTED",
+            strategy_id="gold_02",
+            state=OrderState.REJECTED,
+            order_role="ENTRY",
+            entry_signal_id="old-signal-id",
+            parent_signal_id="old-signal-id",
+            trade_id="old-trade-id",
+        )
+        env.execution_engine._orders[old_terminal.order_id] = old_terminal
+
+        _live_price(engine, env, broker, signal.trigger_price)
+        fired = strategy.on_tick(signal.trigger_price, time.time())
+        assert fired is signal
+        assert strategy.pending_entry is None
+        assert strategy.is_fired_trigger_signal(signal.signal_id)
+
+        # Run the actual poller order cycle in the narrow tick -> submit gap.
+        broker.order_statuses = lambda: {"unrelated-terminal": {}}
+        poller = LiveBrokerPoller(env, config=engine.config)
+        poller._terminalize_pending_from_broker = lambda _statuses: None
+        poller._release_terminal_exits = lambda: 0
+        poller._persist_order_state = lambda _order: None
+        poller._settle_terminal_entry_lifecycle = lambda _order: None
+        poller._terminalize_pending_entries = lambda *_args: None
+        poller._terminalize_pending_from_broker = lambda *_args: None
+        env.execution_engine.apply_broker_statuses = lambda _statuses: []
+        poller.poll_orders()
+
+        assert strategy.is_fired_trigger_signal(signal.signal_id)
+        engine._process_signal(fired, "live")
+
+        submitted = [
+            order for order in env.execution_engine._orders.values()
+            if getattr(order, "entry_signal_id", None) == signal.signal_id
+        ]
+        assert len(submitted) == 1
+        assert submitted[0].state == OrderState.FILLED
+        assert submitted[0]._broker_order_id
+        assert broker._orders
+        position = env.position_manager.open_positions[0]
+        assert position.is_long and position.sl_state == "ARMED"
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_poller_reset_rechecks_order_ownership_under_engine_lock(tmp_path):
+    """A newer trigger arriving after poller classification must win atomically."""
+    engine, env, broker, persistence = _runtime(tmp_path)
+    strategy = env.strategies["gold_02"]
+    try:
+        current = _long_candle_signal(engine, env, broker, strategy)
+        engine._process_signal(current, "live")
+        engine._start_live_pollers()
+        assert env.sync_service._poller._state_lock is engine._lock
+        reset = env.sync_service._poller._reset_strategy_fn
+
+        # This reproduces the time-of-check/time-of-use window: the poller had
+        # classified an older rejected signal as a terminal entry, then a new
+        # signal became the strategy's owner before reset acquired the engine
+        # lock. The callback must refuse the stale reset.
+        assert reset("gold_02", signal_id="older-signal",
+                     trade_id="older-trade") is False
+        assert strategy.pending_entry.signal is current
+        assert strategy.state.value.startswith("pending")
+        assert reset("gold_02", signal_id=current.signal_id) is True
+        assert strategy.pending_entry is None
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_live_poller_fill_and_strategy_reset_share_engine_lock(tmp_path):
+    """Broker fills and resets serialize with the trigger-to-submit path."""
+    engine, env, _broker, persistence = _runtime(tmp_path)
+    try:
+        engine.config._config["live"]["order_ws"]["enabled"] = False
+        engine._start_live_pollers()
+        poller = env.sync_service._poller
+        entered = {"fill": threading.Event(), "reconcile": threading.Event()}
+        engine._handle_fill = lambda *_args, **_kwargs: entered["fill"].set()
+        strategy = env.strategies["gold_02"]
+        strategy._register_fired_trigger("trigger-to-preserve")
+        entered["reset"] = threading.Event()
+        def reset_strategy():
+            engine._reset_strategy_state("gold_02", env_name="live")
+            entered["reset"].set()
+
+        for label, callback in (
+                ("fill", lambda: poller._handle_fill(None, "gold_02", False)),
+                ("reset", reset_strategy)):
+            with engine._lock:
+                worker = threading.Thread(target=callback, daemon=True)
+                worker.start()
+                assert not entered[label].wait(0.05)
+                if label == "reset":
+                    assert strategy.is_fired_trigger_signal("trigger-to-preserve")
+            worker.join(timeout=1)
+            assert entered[label].is_set()
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_live_candle_trigger_fill_stop_and_reconciliation_race_in_parallel(tmp_path):
+    """Stress the live callback graph with trigger/poller/SL work in parallel.
+
+    Uses only the funded in-memory broker. Each phase launches concurrent
+    duplicate market callbacks alongside order, position, account, and
+    reconciliation polling; assertions inspect the final lifecycle invariants,
+    not the particular thread that wins the engine lock.
+    """
+    engine, env, broker, persistence = _runtime(tmp_path)
+    strategy = env.strategies["gold_02"]
+    errors = []
+    try:
+        engine._running = True
+        signal = _long_candle_signal(engine, env, broker, strategy)
+        engine._process_signal(signal, "live")
+        _live_price(engine, env, broker, signal.trigger_price)
+
+        poller = LiveBrokerPoller(
+            env, config=engine.config,
+            handle_fill=lambda fill, sid, is_exit: engine._handle_fill(
+                fill, sid, is_exit=is_exit, env_name="live"),
+            on_reconcile=lambda: engine._reconcile_strategy_positions("live"),
+            state_lock=engine._lock,
+        )
+        tick_handler = engine._make_tick_handler(strategy, "live")
+        tick_event = SimpleNamespace(
+            instrument="GOLDM", ltp=signal.trigger_price, timestamp=time.time())
+        replacement_signals = []
+
+        def completed_retest_candles():
+            # A completed candle first retests the DEMA, then crosses above it
+            # again with a newer high. It replaces the still-armed trigger if
+            # the tick callback has not already fired that original trigger.
+            for bar in (
+                    Bar("GOLDM", "15m", 3, 4, 101, 102, 99, 100, 1),
+                    Bar("GOLDM", "15m", 4, 5, 100, 105, 99, 101, 1)):
+                with engine._lock:
+                    replacement = strategy.on_bar(
+                        bar, SimpleNamespace(htf_value=100.0), 100.0)
+                    if replacement is not None:
+                        replacement_signals.append(replacement)
+                        engine._bind_signal_position(
+                            replacement, strategy, "live")
+                        engine._process_signal(replacement, "live")
+
+        def run_parallel(callbacks):
+            barrier = threading.Barrier(len(callbacks))
+
+            def invoke(callback):
+                try:
+                    barrier.wait(timeout=3)
+                    callback()
+                except BaseException as exc:  # retain worker failures for assertions
+                    errors.append(exc)
+
+            with ThreadPoolExecutor(max_workers=len(callbacks)) as pool:
+                futures = [pool.submit(invoke, cb) for cb in callbacks]
+                for future in futures:
+                    future.result(timeout=8)
+
+        entry_callbacks = [lambda: tick_handler(tick_event) for _ in range(8)]
+        entry_callbacks += [poller.poll_orders for _ in range(3)]
+        entry_callbacks += [poller.poll_positions for _ in range(2)]
+        entry_callbacks += [poller.poll_reconcile for _ in range(2)]
+        entry_callbacks += [poller.poll_account]
+        entry_callbacks.append(completed_retest_candles)
+        run_parallel(entry_callbacks)
+        assert not errors
+
+        entry_orders = [order for order in env.execution_engine._orders.values()
+                        if getattr(order, "order_role", "").upper()
+                        in ("ENTRY", "FALLBACK_MARKET")]
+        if not entry_orders:
+            # The candle replacement won the lock race; the concurrent 103
+            # tick correctly stayed below its newer 105 trigger. Fire that
+            # owner now so the remainder of this test covers its full fill/SL
+            # lifecycle as well.
+            assert replacement_signals
+            active = strategy.pending_entry
+            assert active is not None
+            assert active.signal is replacement_signals[-1]
+            assert active.trigger_price == 105.0
+            _live_price(engine, env, broker, active.trigger_price)
+            replacement_tick = SimpleNamespace(
+                instrument="GOLDM", ltp=active.trigger_price,
+                timestamp=time.time())
+            tick_handler(replacement_tick)
+            entry_orders = [order for order in env.execution_engine._orders.values()
+                            if getattr(order, "order_role", "").upper()
+                            in ("ENTRY", "FALLBACK_MARKET")]
+        assert len(entry_orders) == 1
+        assert entry_orders[0].state == OrderState.FILLED
+        assert len(env.position_manager.open_positions) == 1
+        position = env.position_manager.open_positions[0]
+        assert position.is_open and position.sl_state == "ARMED"
+        assert env.sl_monitor.armed_ids() == [position.position_id]
+
+        # Dhan WS health is represented by a deterministic connected feed;
+        # every concurrent stop tick is valid and crosses this position's own
+        # stop. Pollers race the same close and must not create another exit.
+        engine.data_adapter.ws = SimpleNamespace(
+            connected=True, _last_tick_time=time.time(), _stats={"tick": 0},
+            is_stale=lambda: False)
+        stop_tick = {
+            "instrument": "GOLDM", "ltp": position.stop_price - 1.0,
+            "event_timestamp": time.time(), "receive_timestamp": time.time(),
+            "volume": 1,
+        }
+        exit_callbacks = [lambda: engine._on_tick(stop_tick) for _ in range(8)]
+        exit_callbacks += [poller.poll_orders for _ in range(3)]
+        exit_callbacks += [poller.poll_positions for _ in range(2)]
+        exit_callbacks += [poller.poll_reconcile for _ in range(2)]
+        exit_callbacks += [poller.poll_account]
+        run_parallel(exit_callbacks)
+        assert not errors
+
+        exit_orders = [order for order in env.execution_engine._orders.values()
+                       if getattr(order, "order_role", "").upper() == "EXIT"]
+        assert len(exit_orders) == 1
+        assert exit_orders[0].state == OrderState.FILLED
+        assert not env.position_manager.open_positions
+        assert not env.sl_monitor.armed_ids()
+        assert strategy.state.value == "flat"
+        assert not poller._last_position_report
+    finally:
+        engine._running = False
+        engine.stop()
+        persistence.close()
+
+
+def test_stale_flat_broker_snapshot_cannot_erase_concurrent_filled_entry(tmp_path):
+    """Discard REST position truth captured before a concurrent local fill."""
+    engine, env, broker, persistence = _runtime(tmp_path)
+    strategy = env.strategies["gold_02"]
+    query_started = threading.Event()
+    release_query = threading.Event()
+    result = []
+    errors = []
+    original_positions = broker.positions
+
+    def delayed_flat_snapshot():
+        query_started.set()
+        if not release_query.wait(timeout=3):
+            raise TimeoutError("test did not release delayed position response")
+        return []  # stale: the test fills an entry before this response arrives
+
+    broker.positions = delayed_flat_snapshot
+    # This scenario isolates stale reconciliation. The ordinary entry path
+    # must not make a second broker.positions() request through the optional
+    # exit-first gate while the controlled reconciliation request is paused.
+    engine.config._config["live"]["exit_first"]["enabled"] = False
+
+    def reconcile_from_stale_response():
+        try:
+            result.append(engine.sync_sl_from_broker(env_name="live"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=reconcile_from_stale_response, daemon=True)
+    try:
+        worker.start()
+        assert query_started.wait(timeout=2)
+
+        signal = _long_candle_signal(engine, env, broker, strategy)
+        _fire_and_submit(engine, env, broker, strategy, signal)
+        position = env.position_manager.open_positions[0]
+        assert position.is_open and position.sl_state == "ARMED"
+
+        release_query.set()
+        worker.join(timeout=4)
+        assert not worker.is_alive()
+        assert not errors
+        assert result[0]["status"] == "stale_snapshot"
+        assert env.position_manager.open_positions == [position]
+        assert strategy.current_position_id == position.position_id
+        assert position.sl_state == "ARMED"
+        assert env.sl_monitor.armed_ids() == [position.position_id]
+    finally:
+        release_query.set()
+        broker.positions = original_positions
+        engine.stop()
+        persistence.close()
+
+
+def test_optional_auto_resolver_discards_broker_snapshot_older_than_new_fill(tmp_path):
+    """The opt-in mirror resolver must apply the same stale-read guard."""
+    engine, env, broker, persistence = _runtime(tmp_path)
+    strategy = env.strategies["gold_02"]
+    query_started = threading.Event()
+    release_query = threading.Event()
+    errors = []
+
+    def delayed_flat_snapshot():
+        query_started.set()
+        if not release_query.wait(timeout=3):
+            raise TimeoutError("test did not release delayed position response")
+        return []
+
+    broker.positions = delayed_flat_snapshot
+    engine.config._config["live"]["exit_first"]["enabled"] = False
+
+    def resolve_from_stale_response():
+        try:
+            engine._resolve_broker_positions(
+                env, {"reconcile_auto_resolve": True})
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=resolve_from_stale_response, daemon=True)
+    try:
+        worker.start()
+        assert query_started.wait(timeout=2)
+        signal = _long_candle_signal(engine, env, broker, strategy)
+        _fire_and_submit(engine, env, broker, strategy, signal)
+        position = env.position_manager.open_positions[0]
+
+        release_query.set()
+        worker.join(timeout=4)
+        assert not worker.is_alive()
+        assert not errors
+        assert env.position_manager.open_positions == [position]
+        assert position.is_open and position.sl_state == "ARMED"
+        assert strategy.current_position_id == position.position_id
+    finally:
+        release_query.set()
         engine.stop()
         persistence.close()
 

@@ -109,6 +109,13 @@ def _age(ts: Optional[float], now: Optional[float] = None) -> Optional[float]:
     return (now if now is not None else _ts()) - ts
 
 
+def _tick_age_seconds(ltp_info: Optional[dict], now: Optional[float] = None):
+    """Use local receipt time for freshness; event LTT remains audit metadata."""
+    if not ltp_info:
+        return None
+    return _age(_epoch(ltp_info.get("receive_timestamp")), now)
+
+
 def _mask_client_id(cid) -> str:
     cid = str(cid or "")
     if len(cid) <= 4:
@@ -459,6 +466,7 @@ def _candles_sync(force: bool = False):
                     ltp_info = {
                         "ltp": _num(raw.get("ltp")),
                         "timestamp": _epoch(raw.get("timestamp")),
+                        "receive_timestamp": _epoch(raw.get("receive_timestamp")),
                         "ltq": raw.get("ltq"),
                     }
             except Exception:
@@ -469,7 +477,10 @@ def _candles_sync(force: bool = False):
             "exchange_segment": ix.get("exchange_segment"),
             "instrument_type": ix.get("instrument"),
             "ltp": ltp_info,
-            "ltp_age_seconds": _age((ltp_info or {}).get("timestamp"), now),
+            # Freshness is based on when this process received the tick. Keep
+            # Dhan's event timestamp above for display/audit only; it is not
+            # comparable to the local clock for stale-feed checks.
+            "ltp_age_seconds": _tick_age_seconds(ltp_info, now),
             "candles": {},
         }
         for tf in tf_list:
@@ -1078,7 +1089,7 @@ def _get_pnl_sync():
     }
 
 
-@router.get("/api/live/pnl")
+@router.get("/api/live/pnl/compare")
 async def get_live_pnl():
     return await asyncio.to_thread(_get_pnl_sync)
 

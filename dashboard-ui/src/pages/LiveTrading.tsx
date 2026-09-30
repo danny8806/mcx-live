@@ -18,6 +18,7 @@ function Value({ label, value, emphasis }: { label: string; value: React.ReactNo
 
 export default function LiveTrading() {
   const overview = useDataSelector<any>((s) => s.overview);
+  const pnl = useDataSelector<any>((s) => s.pnl);
   const strategies = useDataSelector<any[]>((s) => s.strategies);
   const positions = useDataSelector<any[]>((s) => s.positions);
   const orders = useDataSelector<any[]>((s) => s.orders);
@@ -57,8 +58,8 @@ export default function LiveTrading() {
       <Value label="Open positions" value={positionsKnown ? open.length : "—"}/>
       <Value label="Armed triggers" value={strategiesKnown ? activeTriggers.length : "—"}/>
       <Value label="Working broker orders" value={ordersKnown ? workingOrders.length : "—"}/>
-      <Value label="Engine unrealized P&L" value={overviewKnown ? formatINR(overview.unrealized_pnl) : "—"} emphasis={pnlColor(overview.unrealized_pnl)}/>
-      <Value label="Engine realized P&L" value={overviewKnown ? formatINR(overview.realized_pnl) : "—"} emphasis={pnlColor(overview.realized_pnl)}/>
+      <Value label="Local unrealized P&L" value={pnl ? formatINR(pnl.unrealized_pnl) : "—"} emphasis={pnlColor(pnl?.unrealized_pnl)}/>
+      <Value label="Local realized P&L" value={pnl ? formatINR(pnl.realized_pnl) : "—"} emphasis={pnlColor(pnl?.realized_pnl)}/>
       <Value label="Dhan available margin" value={overviewKnown ? safeINR(overview.available_margin) : "—"}/>
     </section>
 

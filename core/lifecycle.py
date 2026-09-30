@@ -1245,6 +1245,14 @@ class TradeLifecycleManager:
                 try:
                     fills = self._persistence.get_fills() if hasattr(self._persistence, 'get_fills') else []
                     for fill in fills:
+                        # Persistence is environment-wide, but this lifecycle
+                        # is strategy-scoped. A different strategy's fill is
+                        # not orphaned merely because it is absent from this
+                        # runtime's identity map.
+                        if (self._strategy_id
+                                and str(fill.get("strategy_id") or "")
+                                != self._strategy_id):
+                            continue
                         fill_id = fill.get("fill_id", "")
                         if fill_id and fill_id not in self._fill_to_trade:
                             warnings.append({"type": "ORPHAN_FILL", "fill_id": fill_id,
@@ -1425,9 +1433,24 @@ class TradeLifecycleManager:
             if not data:
                 return
             for tid, t_data in data.get("trades", {}).items():
-                self._trades[tid] = TradeContext.from_snapshot(t_data)
-            self._signal_to_trade = data.get("signal_to_trade", {})
-            self._order_to_trade = data.get("order_to_trade", {})
-            self._fill_to_trade = data.get("fill_to_trade", {})
-            self._position_to_trade = data.get("position_to_trade", {})
-            self._pending_to_trade = data.get("pending_to_trade", {})
+                # restore_from_db() has already loaded canonical trade rows.
+                # A snapshot may lag a broker-confirmed fill/close, so only
+                # use it to recover a trade that is absent from the DB cache.
+                if tid not in self._trades:
+                    self._trades[tid] = TradeContext.from_snapshot(t_data)
+            # A DB restore runs before snapshot restore. Keep canonical links
+            # already rebuilt from trades when an older snapshot lacks them.
+            for attr, key in (
+                ("_signal_to_trade", "signal_to_trade"),
+                ("_order_to_trade", "order_to_trade"),
+                ("_fill_to_trade", "fill_to_trade"),
+                ("_position_to_trade", "position_to_trade"),
+                ("_pending_to_trade", "pending_to_trade"),
+            ):
+                merged = dict(data.get(key) or {})
+                merged.update(getattr(self, attr, {}) or {})
+                setattr(self, attr, merged)
+            for trade_id, trade in self._trades.items():
+                for fill_id in (trade.entry_fill_id, trade.exit_fill_id):
+                    if fill_id:
+                        self._fill_to_trade.setdefault(fill_id, trade_id)

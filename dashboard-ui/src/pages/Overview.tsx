@@ -180,6 +180,7 @@ export default function Overview() {
   // Per-slice subscriptions: each card only re-renders when ITS slice changes,
   // not on every WS push.
   const overview = useDataSelector<any>((s) => s.overview);
+  const pnl = useDataSelector<any>((s) => s.pnl);
   const goldOverview = useDataSelector((s) => s.goldOverview);
   const silverOverview = useDataSelector((s) => s.silverOverview);
   const strategies = useDataSelector((s) => s.strategies);
@@ -229,15 +230,15 @@ export default function Overview() {
         />
         <MetricCard
           accent
-          label="NET P&L"
-          value={formatINR(overview.total_net_pnl)}
-          sub={`${formatPct((overview.book_starting_capital ?? overview.starting_capital) > 0
-            ? (overview.total_net_pnl / (overview.book_starting_capital ?? overview.starting_capital)) * 100 : 0)} of book capital`}
-          color={pnlColor(overview.total_net_pnl)}
+          label="LOCAL NET P&L"
+          value={pnl ? formatINR(pnl.net_pnl) : "—"}
+          sub={`${formatPct(pnl && (overview.book_starting_capital ?? overview.starting_capital) > 0
+            ? (pnl.net_pnl / (overview.book_starting_capital ?? overview.starting_capital)) * 100 : 0)} of book capital`}
+          color={pnlColor(pnl?.net_pnl)}
         />
         <MetricCard label="BOOK CAPITAL" value={safeINR(overview.book_starting_capital ?? overview.starting_capital)} />
-        <MetricCard label="REALIZED" value={formatINR(overview.realized_pnl)} color={pnlColor(overview.realized_pnl)} />
-        <MetricCard label="UNREALIZED" value={formatINR(overview.unrealized_pnl)} color={pnlColor(overview.unrealized_pnl)} />
+        <MetricCard label="LOCAL REALIZED" value={pnl ? formatINR(pnl.realized_pnl) : "—"} color={pnlColor(pnl?.realized_pnl)} />
+        <MetricCard label="LOCAL UNREALIZED" value={pnl ? formatINR(pnl.unrealized_pnl) : "—"} color={pnlColor(pnl?.unrealized_pnl)} />
         <MetricCard label="TODAY P&L · ENGINE" value={formatINR(overview.today_pnl)} color={pnlColor(overview.today_pnl)} />
         <MetricCard label="MARGIN USED" value={safeINR(overview.margin_used)} sub={`Avail: ${safeINR(overview.available_margin)}`} />
         <MetricCard label="OPEN POSITIONS" value={String(overview.open_positions_count)} />
