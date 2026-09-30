@@ -45,6 +45,11 @@ function TradeRow({ trade, isExpanded, onToggle }: {
   const statusColor = trade.status === "CLOSED" ? "var(--text-muted)" :
     trade.status === "OPEN" ? "var(--green)" :
     trade.status === "PENDING" ? "var(--amber)" : "var(--text-muted)";
+  const priceText = (value: unknown) => {
+    const price = Number(value);
+    return Number.isFinite(price) && price > 0
+      ? `₹${price.toLocaleString("en-IN")}` : "—";
+  };
 
   const [detail, setDetail] = useState<any>(null);
   const [detailBusy, setDetailBusy] = useState(false);
@@ -107,10 +112,10 @@ function TradeRow({ trade, isExpanded, onToggle }: {
           {trade.quantity}
         </span>
         <span className="tabular-nums" style={{ color: "var(--text-secondary)", textAlign: "right" }}>
-          ₹{safeNum(trade.entry_price).toLocaleString("en-IN")}
+          {priceText(trade.entry_price)}
         </span>
         <span className="tabular-nums" style={{ color: "var(--text-secondary)", textAlign: "right" }}>
-          ₹{safeNum(trade.exit_price).toLocaleString("en-IN")}
+          {priceText(trade.exit_price)}
         </span>
         <span className="tabular-nums" style={{ color: pnlColor(Number(trade.gross_pnl)), textAlign: "right" }}>
           {formatINR(safeNum(trade.gross_pnl))}

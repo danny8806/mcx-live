@@ -41,6 +41,8 @@ export default function Reconciliation() {
   const errors: any[] = reconciliation.errors || [];
   const warnings: any[] = reconciliation.warnings || [];
   const isConsistent = reconciliation.is_consistent === true;
+  const hasWarnings = warnings.length > 0;
+  const statusColor = !isConsistent ? "var(--red)" : hasWarnings ? "var(--amber)" : "var(--green)";
   const toText = (x: any): string =>
     typeof x === "string" ? x : (JSON.stringify(x) ?? String(x));
 
@@ -57,11 +59,11 @@ export default function Reconciliation() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
           <span
-            className={isConsistent ? "animate-pulse-dot" : ""}
-            style={{ width: "8px", height: "8px", borderRadius: "50%", background: isConsistent ? "var(--green)" : "var(--red)", ["--dot" as any]: isConsistent ? "var(--green)" : "var(--red)" }}
+            className={isConsistent && !hasWarnings ? "animate-pulse-dot" : ""}
+            style={{ width: "8px", height: "8px", borderRadius: "50%", background: statusColor, ["--dot" as any]: statusColor }}
           />
-          <span style={{ fontSize: "10px", fontWeight: 600, color: isConsistent ? "var(--green)" : "var(--red)" }}>
-            {isConsistent ? "CONSISTENT" : "INCONSISTENT"}
+          <span style={{ fontSize: "10px", fontWeight: 600, color: statusColor }}>
+            {!isConsistent ? "INCONSISTENT" : hasWarnings ? "WARNINGS" : "CONSISTENT"}
           </span>
         </div>
       </div>

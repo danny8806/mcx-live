@@ -56,10 +56,10 @@ class LiveEngine:
     """Own the LIVE app's engine + persistence and its lifecycle."""
 
     def __init__(self, config_path: str = DEFAULT_CONFIG) -> None:
-        self.config_path = str(config_path)
-        resolved = _resolve_live_config(self.config_path)
+        self.config_path = str(_app_path(config_path))
+        self.resolved_config_path = str(_resolve_live_config(self.config_path))
         self.engine: TradingEngine = TradingEngine(
-            config_path=str(resolved), live_only=True)
+            config_path=self.resolved_config_path, live_only=True)
         if not self.engine._live_only:
             raise RuntimeError("LiveEngine requires a live-only engine build")
         if self.engine.paper is not None:

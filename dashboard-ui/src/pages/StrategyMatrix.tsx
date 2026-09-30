@@ -7,7 +7,7 @@ import StrategyCompare from "../components/strategies/StrategyCompare";
 
 type SortKey = "net_pnl" | "win_rate" | "profit_factor" | "max_drawdown" | "trade_count" | null;
 type SortDir = "asc" | "desc";
-type InstrumentFilter = "ALL" | "GOLDM" | "SILVERM";
+type InstrumentFilter = "ALL" | "GOLDM" | "SILVERM" | "GOLDPETAL";
 type StatusFilter = "ALL" | "FLAT" | "IN_POSITION" | "PENDING" | "EXITING";
 type SignalFilter = "ALL" | "LONG" | "SHORT" | "FLAT";
 type PerfFilter = "ALL" | "PROFITABLE" | "LOSING";
@@ -111,7 +111,7 @@ function StrategyRow({
             textAlign: "center",
           }}
         >
-          {side ? `${s.quantity || 1} ${side}` : "0"}
+          {side ? `${s.quantity ?? "—"} ${side}` : "0"}
         </span>
         <span
           style={{
@@ -464,7 +464,7 @@ export default function StrategyMatrix() {
         }}
       >
         <div style={{ display: "flex", gap: 3, marginRight: 6 }}>
-          {(["ALL", "GOLDM", "SILVERM"] as InstrumentFilter[]).map((f) => (
+          {(["ALL", "GOLDM", "SILVERM", "GOLDPETAL"] as InstrumentFilter[]).map((f) => (
             <button
               key={f}
               onClick={() => setInstrumentFilter(f)}

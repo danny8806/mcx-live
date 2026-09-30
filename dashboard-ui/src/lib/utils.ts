@@ -35,10 +35,14 @@ export function formatTimestamp(ts: number): string {
 export function formatDT(ts: any): string {
   if (ts == null || ts === "") return "—";
   let ms: number;
-  if (typeof ts === "number") ms = ts * 1000;
+  if (typeof ts === "number") {
+    if (!Number.isFinite(ts) || ts <= 0) return "—";
+    ms = ts * 1000;
+  }
   else if (typeof ts === "string") {
     ms = Date.parse(ts);
     if (isNaN(ms)) return ts;
+    if (ms <= 0) return "—";
   } else return "—";
   return new Date(ms).toLocaleString("en-IN", {
     day: "2-digit", month: "short",

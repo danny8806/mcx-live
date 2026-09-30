@@ -3,12 +3,20 @@ import { PanelLeftClose } from "lucide-react";
 import { useDataSelector } from "../../store/DataProvider";
 import { safeINR } from "../../lib/utils";
 
-function isMarketOpen(now: Date): boolean {
-  const ist = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-  const day = ist.getDay();
-  if (day === 0 || day === 6) return false;
-  const t = ist.getHours() * 60 + ist.getMinutes();
-  return t >= 540 && t <= 1350;
+function marketSession(now: Date, instrument: any): "OPEN" | "CLOSED" | "UNKNOWN" {
+  const open = String(instrument?.session_open ?? "").match(/^(\d{2}):(\d{2})$/);
+  const close = String(instrument?.session_close ?? "").match(/^(\d{2}):(\d{2})$/);
+  if (!open || !close) return "UNKNOWN";
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata", weekday: "short", hour: "2-digit",
+    minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(now);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  if (values.weekday === "Sat" || values.weekday === "Sun") return "CLOSED";
+  const current = Number(values.hour) * 60 + Number(values.minute);
+  const start = Number(open[1]) * 60 + Number(open[2]);
+  const end = Number(close[1]) * 60 + Number(close[2]);
+  return current >= start && current < end ? "OPEN" : "CLOSED";
 }
 
 function StatusPill({ label, status, color }: { label: string; status: string; color: "green" | "red" | "amber" }) {
@@ -40,6 +48,7 @@ export default function TopBar({ onToggleSidebar }: { onToggleSidebar: () => voi
   const overallHealth = useDataSelector<string>((s) => s.overallHealth);
   const goldOverview = useDataSelector<any>((s) => s.goldOverview);
   const silverOverview = useDataSelector<any>((s) => s.silverOverview);
+  const settings = useDataSelector<any>((s) => s.settings);
   const [time, setTime] = useState(new Date());
 
   useEffect(() => {
@@ -49,7 +58,7 @@ export default function TopBar({ onToggleSidebar }: { onToggleSidebar: () => voi
 
   const ist = time.toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
   const istDate = time.toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", weekday: "short", day: "2-digit", month: "short" });
-  const marketOpen = isMarketOpen(time);
+  const session = marketSession(time, settings?.instruments?.GOLDM);
 
   const goldLtp = goldOverview?.ltp ?? 0;
   const silverLtp = silverOverview?.ltp ?? 0;
@@ -99,7 +108,7 @@ export default function TopBar({ onToggleSidebar }: { onToggleSidebar: () => voi
 
       {divider}
 
-      <StatusPill label="MARKET" status={marketOpen ? "OPEN" : "CLOSED"} color={marketOpen ? "green" : "amber"} />
+      <StatusPill label="MARKET" status={session} color={session === "OPEN" ? "green" : "amber"} />
       <StatusPill label="WS" status={connected ? "LIVE" : "DOWN"} color={connected ? "green" : "red"} />
       <StatusPill label="ENGINE" status={overallHealth === "healthy" ? "RUNNING" : (overallHealth ?? "unknown").toUpperCase()} color={overallHealth === "healthy" ? "green" : "amber"} />
 

@@ -102,6 +102,12 @@ export const api = {
   lifecycleReconcile: () => fetchJSON<any>("/api/trades/lifecycle-reconcile"),
   settings: () => fetchJSON<any>("/api/settings"),
   refreshSettings: () => postJSON<any>("/api/settings/refresh"),
+  updateStrategySettings: (id: string, settings: Record<string, unknown>) =>
+    requestJSON<any>(item("/api/settings/strategies", id), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+    }),
   audit: (params?: Query) => fetchJSON<any>(withQuery("/api/audit", params)),
   liveDashboard: () => fetchJSON<any>("/api/live/dashboard"),
   liveOrders: (params?: Query) => fetchJSON<any>(withQuery("/api/live/orders", params)),

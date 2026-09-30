@@ -223,17 +223,22 @@ export default function Overview() {
       )}
 
       <div className="metric-grid">
-        <MetricCard label="STARTING CAPITAL" value={safeINR(overview.starting_capital)} />
+        <MetricCard
+          label={overview.execution_mode === "LIVE" ? "DHAN ACCOUNT EQUITY" : "STARTING CAPITAL"}
+          value={safeINR(overview.execution_mode === "LIVE" ? overview.total_equity : overview.starting_capital)}
+        />
         <MetricCard
           accent
           label="NET P&L"
           value={formatINR(overview.total_net_pnl)}
-          sub={formatPct(overview.starting_capital > 0 ? (overview.total_net_pnl / overview.starting_capital) * 100 : 0)}
+          sub={`${formatPct((overview.book_starting_capital ?? overview.starting_capital) > 0
+            ? (overview.total_net_pnl / (overview.book_starting_capital ?? overview.starting_capital)) * 100 : 0)} of book capital`}
           color={pnlColor(overview.total_net_pnl)}
         />
+        <MetricCard label="BOOK CAPITAL" value={safeINR(overview.book_starting_capital ?? overview.starting_capital)} />
         <MetricCard label="REALIZED" value={formatINR(overview.realized_pnl)} color={pnlColor(overview.realized_pnl)} />
         <MetricCard label="UNREALIZED" value={formatINR(overview.unrealized_pnl)} color={pnlColor(overview.unrealized_pnl)} />
-        <MetricCard label="TODAY P&L" value={formatINR(overview.today_pnl)} color={pnlColor(overview.today_pnl)} />
+        <MetricCard label="TODAY P&L · ENGINE" value={formatINR(overview.today_pnl)} color={pnlColor(overview.today_pnl)} />
         <MetricCard label="MARGIN USED" value={safeINR(overview.margin_used)} sub={`Avail: ${safeINR(overview.available_margin)}`} />
         <MetricCard label="OPEN POSITIONS" value={String(overview.open_positions_count)} />
         <MetricCard label="ACTIVE STRATEGIES" value={String(overview.active_strategies_count)} />

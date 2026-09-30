@@ -135,11 +135,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const fetchOverview = useCallback(async () => {
     try {
       const d = await api.overview() as any;
-      if (wsActiveRef.current) return;
       safe(setOverview)({
         execution_mode: extractVal(d, "execution_mode") ?? null,
         total_equity: extractVal(d, "total_equity") ?? 0,
         starting_capital: extractVal(d, "starting_capital") ?? 0,
+        book_starting_capital: extractVal(d, "book_starting_capital") ?? 0,
         today_pnl: extractVal(d, "today_pnl") ?? 0,
         total_net_pnl: extractVal(d, "total_net_pnl") ?? 0,
         realized_pnl: extractVal(d, "realized_pnl") ?? 0,
@@ -340,74 +340,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
             safe(setWsState)(s);
             if (s?.account) {
               wsActiveRef.current = true;
-              setOverview((prev: any) => {
-                const base = prev ?? {
-                  execution_mode: null, total_equity: 0, starting_capital: 0,
-                  today_pnl: 0, total_net_pnl: 0, realized_pnl: 0,
-                  unrealized_pnl: 0, margin_used: 0, available_margin: 0,
-                  open_positions_count: 0, active_orders_count: 0,
-                  active_strategies_count: 0, kill_switch: false,
-                };
-                return {
-                  ...base,
-                  execution_mode: s.execution_mode ?? base.execution_mode,
-                  total_equity: s.account.equity ?? base.total_equity,
-                  starting_capital: s.account.starting_capital ?? base.starting_capital,
-                  realized_pnl: s.account.realized_pnl ?? base.realized_pnl,
-                  unrealized_pnl: s.account.unrealized_pnl ?? base.unrealized_pnl,
-                  margin_used: s.account.used_margin ?? base.margin_used,
-                  available_margin: s.account.available_margin ?? base.available_margin,
-                  total_net_pnl: s.account.net_pnl != null
-                    ? s.account.net_pnl
-                    : ((s.account.realized_pnl ?? 0) + (s.account.unrealized_pnl ?? 0)),
-                };
-              });
             }
             if (s?.risk && (s.risk.daily_pnl !== undefined || s.risk.kill_switch_active !== undefined)) {
-              setOverview((prev: any) => {
-                const base = prev ?? {
-                  execution_mode: null, total_equity: 0, starting_capital: 0,
-                  today_pnl: 0, total_net_pnl: 0, realized_pnl: 0,
-                  unrealized_pnl: 0, margin_used: 0, available_margin: 0,
-                  open_positions_count: 0, active_orders_count: 0,
-                  active_strategies_count: 0, kill_switch: false,
-                };
-                return {
-                  ...base,
-                  today_pnl: s.risk.daily_pnl ?? base.today_pnl,
-                  kill_switch: s.risk.kill_switch_active ?? base.kill_switch,
-                };
-              });
-            }
-            if (s?.positions?.open_positions) {
-              setOverview((prev: any) => {
-                const base = prev ?? {
-                  execution_mode: null, total_equity: 0, starting_capital: 0,
-                  today_pnl: 0, total_net_pnl: 0, realized_pnl: 0,
-                  unrealized_pnl: 0, margin_used: 0, available_margin: 0,
-                  open_positions_count: 0, active_orders_count: 0,
-                  active_strategies_count: 0, kill_switch: false,
-                };
-                return {
-                  ...base,
-                  open_positions_count: Object.keys(s.positions.open_positions).length,
-                };
-              });
-            }
-            if (s?.strategies) {
-              setOverview((prev: any) => {
-                const base = prev ?? {
-                  execution_mode: null, total_equity: 0, starting_capital: 0,
-                  today_pnl: 0, total_net_pnl: 0, realized_pnl: 0,
-                  unrealized_pnl: 0, margin_used: 0, available_margin: 0,
-                  open_positions_count: 0, active_orders_count: 0,
-                  active_strategies_count: 0, kill_switch: false,
-                };
-                return {
-                  ...base,
-                  active_strategies_count: Object.keys(s.strategies).length,
-                };
-              });
             }
             if (s?.strategies) {
               const list = Object.entries(s.strategies).map(([name, snap]: [string, any]) => ({
@@ -415,7 +349,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
                 instrument: snap.instrument ?? "",
                 fast_timeframe: snap.fast_timeframe ?? "",
                 htf_timeframe: snap.htf_timeframe ?? "",
-                quantity: snap.quantity ?? 1,
+                quantity: snap.quantity ?? null,
                 enabled: snap.enabled ?? true,
                 state: snap.state ?? "unknown",
                 position_side: snap.position_side,

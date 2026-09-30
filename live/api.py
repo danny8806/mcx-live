@@ -198,6 +198,9 @@ async def lifespan(app: FastAPI):
         kwargs = {}
         if _persistence is not None and "persistence" in mod.init.__code__.co_varnames:
             kwargs["persistence"] = _persistence
+        if mod is settings:
+            kwargs["config_path"] = _live_engine.config_path
+            kwargs["resolved_config_path"] = _live_engine.resolved_config_path
         mod.init(_engine, _bus, **kwargs)
     tasks = [
         asyncio.create_task(_push_updates()),
