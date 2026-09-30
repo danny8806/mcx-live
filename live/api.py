@@ -403,10 +403,9 @@ def _adopt_broker_position(body: dict) -> dict:
             raise HTTPException(status_code=409,
                                 detail="two completed 15m candles are required for the structural stop")
         candle = next((c for c in closed if float(c[0]) == candle_timestamp), None)
-        latest_closed = max(closed, key=lambda c: float(c[0]))
-        if candle is None or float(latest_closed[0]) != candle_timestamp:
+        if candle is None:
             raise HTTPException(status_code=409,
-                                detail="requested signal candle is not the latest completed SILVERM 15m candle")
+                                detail="requested SILVERM 15m signal candle is not present in completed candles")
         idx = closed.index(candle)
         if idx == 0:
             raise HTTPException(status_code=409,

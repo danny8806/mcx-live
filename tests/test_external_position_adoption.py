@@ -73,9 +73,11 @@ def _adoption_runtime(tmp_path, monkeypatch, *, live_price=229107.0):
     prior = [1790744400.0, 228900.0, 229140.0, 228349.0, 228374.0, 316.0]
     signal_candle = [CANDLE_TS, 228374.0, 228900.0, 228100.0,
                      228895.0, 467.0]
+    newer_closed = [1790746200.0, 228895.0, 229140.0, 228700.0,
+                    228871.0, 300.0]
     env.data_adapter = SimpleNamespace(fetch_candle_state=lambda *_args: {
-        "closed": [prior, signal_candle],
-        "forming": [1790746200.0, 228871.0, 229140.0,
+        "closed": [prior, signal_candle, newer_closed],
+        "forming": [1790747100.0, 228871.0, 229140.0,
                     228732.0, live_price, 300.0],
     })
     persistence = PersistenceManager(
