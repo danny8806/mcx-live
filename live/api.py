@@ -415,7 +415,11 @@ def _adopt_broker_position(body: dict) -> dict:
                         candle_timestamp, timezone.utc).date()
                     today = datetime.now(timezone.utc).date()
                     history = history_fn("SILVERM", "15", signal_day, today) or []
-                    by_start = {float(c[0]): c for c in [*history, *closed]}
+                    # Historical REST is the full-day source of truth. When a
+                    # short-window response disagrees for the same timestamp,
+                    # let the historical row win (it carries the complete
+                    # finalized OHLC for the signal candle).
+                    by_start = {float(c[0]): c for c in [*closed, *history]}
                     closed = sorted(by_start.values(), key=lambda c: float(c[0]))
                     candle = next((c for c in closed
                                    if float(c[0]) == candle_timestamp), None)
@@ -559,6 +563,119 @@ def _adopt_broker_position(body: dict) -> dict:
         _broker_position_adoption_lock.release()
 
 
+def _correct_imported_position_stop(body: dict) -> dict:
+    """Recompute one imported open position's local stop from exact Dhan bars.
+
+    This is loopback-only at the route and requires the existing broker fill,
+    open net, local position, and candle timestamp to agree. It never sends a
+    broker order.
+    """
+    from strategies.intent import entry_levels
+    if not _engine or not _persistence:
+        raise HTTPException(status_code=503, detail="live engine unavailable")
+    if not _broker_position_adoption_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="position reconciliation already running")
+    try:
+        strategy_id = str(body.get("strategy_id") or "")
+        broker_order_id = str(body.get("broker_order_id") or "")
+        try:
+            candle_ts = float(body.get("signal_candle_timestamp"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="signal_candle_timestamp is required")
+        env = _engine.live
+        runtime = env.runtimes.require(strategy_id)
+        order = next((o for o in (getattr(env.execution_engine, "_orders", {}) or {}).values()
+                      if str(getattr(o, "_broker_order_id", "")) == broker_order_id), None)
+        position = next((p for p in runtime.position_manager.get_positions_by_strategy(strategy_id)
+                         if p.instrument == "SILVERM" and p.is_open), None)
+        position_side = str(getattr(position.side, "value", position.side)).upper() if position else ""
+        if not order or not position or position_side != "LONG" or int(position.quantity) != 1:
+            raise HTTPException(status_code=409, detail="exact imported open SILVERM LONG position was not found")
+
+        broker_order = next((o for o in (env.broker.day_order_book() or [])
+                             if str(o.get("broker_order_id") or "") == broker_order_id), None)
+        if (not broker_order or broker_order.get("status") != "filled"
+                or int(broker_order.get("filled_quantity") or 0) != 1):
+            raise HTTPException(status_code=409, detail="Dhan no longer confirms the imported filled order")
+        fills = [t for t in (env.broker.tradebook() or [])
+                 if str(t.get("orderId") or t.get("order_id") or "") == broker_order_id
+                 and str(t.get("securityId") or t.get("security_id") or "") == "483080"]
+        if len(fills) != 1 or str(fills[0].get("exchangeTradeId") or fills[0].get("tradeId") or "") != "240073750":
+            raise HTTPException(status_code=409, detail="Dhan tradebook fill no longer matches the imported position")
+        nets = {(str(r.get("side") or "").upper(), abs(int(r.get("quantity") or 0)))
+                for r in (env.broker.positions() or [])
+                if r.get("instrument") == "SILVERM" and int(r.get("quantity") or 0)}
+        if nets != {("LONG", 1)}:
+            raise HTTPException(status_code=409, detail="current Dhan SILVERM net is not exactly LONG 1")
+
+        adapter = env.data_adapter
+        history_fn = getattr(adapter, "fetch_historical_candles", None)
+        if not callable(history_fn):
+            raise HTTPException(status_code=503, detail="Dhan historical candles unavailable")
+        signal_day = datetime.fromtimestamp(candle_ts, timezone.utc).date()
+        candles = history_fn("SILVERM", "15", signal_day,
+                             datetime.now(timezone.utc).date()) or []
+        candles = sorted((c for c in candles if float(c[0]) + 900 <= time.time()),
+                         key=lambda c: float(c[0]))
+        idx = next((i for i, c in enumerate(candles) if float(c[0]) == candle_ts), None)
+        if idx is None or idx == 0:
+            raise HTTPException(status_code=409, detail="signal candle or its preceding candle is unavailable")
+        candle, previous = candles[idx], candles[idx - 1]
+        open_, high, low, close = map(float, candle[1:5])
+        trigger, stop = entry_levels("LONG", high, low,
+                                     float(previous[2]), float(previous[3]))
+        if low != 228100.0 or stop != 228100.0:
+            raise HTTPException(status_code=409, detail={
+                "reason": "Dhan candle does not confirm the requested 228100 stop",
+                "signal_candle": {"timestamp": candle_ts, "open": open_, "high": high,
+                                   "low": low, "close": close},
+                "computed_stop": stop})
+        ltp_fn = getattr(adapter, "get_live_ltp", None)
+        live_ltp = ltp_fn("SILVERM") if callable(ltp_fn) else None
+        ltp = float(live_ltp or getattr(position, "current_mark", 0) or 0)
+        if ltp <= stop:
+            raise HTTPException(status_code=409, detail="current SILVERM price is at/below corrected stop; stop correction halted")
+
+        position.stop_price = stop
+        position.sl_state = "ARMED"
+        position.sl_trigger_price = None
+        if hasattr(order, "planned_sl"):
+            order.planned_sl = stop
+        strategy = env.strategies.get(strategy_id)
+        if strategy is not None:
+            strategy.stop_price = stop
+            strategy.position_side = "LONG"
+        monitor = _engine._sl_monitor(env)
+        if str(monitor.arm(position).value) != "ARMED":
+            raise HTTPException(status_code=500, detail="corrected stop did not arm in the local monitor")
+        _engine._persist_position(position, env_name="live")
+        _engine._persist_order(order, None, env_name="live")
+        _persistence.save_signal({
+            "signal_id": order.entry_signal_id, "strategy_id": strategy_id,
+            "instrument": "SILVERM", "side": "LONG", "signal_type": "ENTRY_LONG",
+            "timestamp": position.entry_timestamp, "trigger_price": trigger,
+            "stop_price": stop, "quantity": 1, "candle_timestamp": candle_ts,
+            "open": open_, "high": high, "low": low, "close": close,
+            "candle_data": {"timestamp": candle_ts, "open": open_, "high": high,
+                            "low": low, "close": close},
+            "signal_metadata": {"external_position_import": True,
+                                "broker_order_id": broker_order_id,
+                                "signal_candle_start": candle_ts,
+                                "signal_candle_high": high,
+                                "signal_candle_low": low,
+                                "trigger_level": trigger},
+        })
+        _persistence.save_state(_engine.snapshot("live"))
+        return {"corrected": True, "broker_order_sent": False,
+                "broker_order_id": broker_order_id, "position_id": position.position_id,
+                "signal_candle": {"timestamp": candle_ts, "open": open_, "high": high,
+                                   "low": low, "close": close},
+                "trigger_price": trigger, "stop_price": stop,
+                "monitor_state": monitor.state_of(position.position_id).value}
+    finally:
+        _broker_position_adoption_lock.release()
+
+
 def create_live_app(live_engine=None) -> FastAPI:
     """Build the LIVE FastAPI app bound to a LiveEngine.
 
@@ -645,6 +762,18 @@ def create_live_app(live_engine=None) -> FastAPI:
         if not peer.is_loopback:
             raise HTTPException(status_code=403, detail="loopback caller required")
         return await asyncio.to_thread(_adopt_broker_position, body)
+
+    @app.post("/api/live/reconcile/correct-imported-position-stop")
+    async def correct_imported_position_stop(request: Request, body: dict):
+        """Correct an imported position's local stop from Dhan's exact candle."""
+        try:
+            peer = ipaddress.ip_address(
+                request.client.host if request.client else "")
+        except ValueError:
+            raise HTTPException(status_code=403, detail="loopback caller required")
+        if not peer.is_loopback:
+            raise HTTPException(status_code=403, detail="loopback caller required")
+        return await asyncio.to_thread(_correct_imported_position_stop, body)
 
     @app.post("/api/live/test-order-cycle")
     async def live_test_order_cycle(request: Request, body: dict):

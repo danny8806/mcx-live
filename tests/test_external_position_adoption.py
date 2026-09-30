@@ -76,7 +76,9 @@ def _adoption_runtime(tmp_path, monkeypatch, *, live_price=229107.0,
                      228895.0, 467.0]
     newer_closed = [1790746200.0, 228895.0, 229140.0, 228700.0,
                     228871.0, 300.0]
-    recent_closed = ([signal_candle, newer_closed] if omit_prior_from_recent_window
+    recent_signal = [CANDLE_TS, 228374.0, 228900.0, 228400.0,
+                     228895.0, 467.0]
+    recent_closed = ([recent_signal, newer_closed] if omit_prior_from_recent_window
                      else [prior, signal_candle, newer_closed])
     env.data_adapter = SimpleNamespace(fetch_candle_state=lambda *_args: {
         "closed": recent_closed,
@@ -165,6 +167,36 @@ def test_import_fetches_prior_candle_when_recent_window_does_not_include_it(
         assert result["adopted"] is True
         assert result["stop_price"] == 228100.0
         assert result["position"]["sl_state"] == "ARMED"
+        assert not broker._orders
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_correct_imported_stop_from_exact_historical_signal_candle(
+        tmp_path, monkeypatch):
+    engine, env, broker, persistence = _adoption_runtime(tmp_path, monkeypatch)
+    try:
+        body = {"strategy_id": "silver_01", "broker_order_id": BROKER_ORDER,
+                "signal_candle_timestamp": CANDLE_TS}
+        live_api._adopt_broker_position(body)
+        runtime = env.runtimes.require("silver_01")
+        position = runtime.position_manager.get_positions_by_strategy("silver_01")[0]
+        order = next(iter(env.execution_engine._orders.values()))
+        position.stop_price = 228349.0
+        order.planned_sl = 228349.0
+        env.sl_monitor = engine._sl_monitor(env)
+        env.sl_monitor.arm(position)
+        prior = [1790744400.0, 228900.0, 229140.0, 228349.0, 228374.0, 316.0]
+        signal = [CANDLE_TS, 228374.0, 228900.0, 228100.0, 228895.0, 467.0]
+        env.data_adapter.fetch_historical_candles = lambda *_args: [prior, signal]
+
+        result = live_api._correct_imported_position_stop(body)
+        assert result["stop_price"] == 228100.0
+        assert result["monitor_state"] == "ARMED"
+        assert position.stop_price == 228100.0
+        assert order.planned_sl == 228100.0
+        assert result["broker_order_sent"] is False
         assert not broker._orders
     finally:
         engine.stop()
