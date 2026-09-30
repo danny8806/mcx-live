@@ -928,7 +928,6 @@ class DhanRestTransport(LiveBrokerClient):
                 "dhanClientId": self.client_id,
                 "orderId": bid,
                 "orderType": order_type_u,
-                "legName": 0,
                 "quantity": int(quantity) if quantity else int(rec.get("quantity") or 0),
                 "price": limit_price,
                 "triggerPrice": float(trigger_price or 0.0),

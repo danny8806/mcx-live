@@ -197,6 +197,8 @@ class FillFlowMixin:
                 current.average_entry = round(new_avg, 4)
                 current.entry_fill_ids.append(fill.fill_id)
                 current.margin = float(getattr(current, "margin", 0.0) or 0.0) + margin
+                entry_order = (env.execution_engine.get_order(fill.order_id)
+                               if env.execution_engine is not None else None)
                 self._persist_fill(fill, trade.trade_id, signal_id, env_name)
                 lifecycle.register_entry_fill(trade.trade_id, fill.fill_id,
                                               current.average_entry, fill.timestamp)
@@ -223,9 +225,12 @@ class FillFlowMixin:
                     "instrument": fill.instrument,
                     "quantity": new_qty, "average_entry": current.average_entry,
                     "execution_mode": env.mode}, env_name=env.name)
-                # Position-owned SL: arm the local monitor on THIS position's
-                # own stop_price.  No broker-side protective order exists.
-                self._arm_position_sl(env, current, source="entry_fill_augment")
+                # Do not arm protection on a partial resting LIMIT fill. The
+                # user's contract is full entry confirmation first; once the
+                # LIMIT is canceled and MARKET fallback starts, protect actual
+                # MARKET fills immediately (including a partial fill).
+                self._protect_entry_fill_if_ready(
+                    env, current, entry_order, source="entry_fill_augment")
                 self._notify_entry_fill(fill, current, env, signal_id)
                 self._sync_strategy_on_entry_fill(
                     env, fill.strategy_id, "LONG" if current.is_long else "SHORT",
@@ -324,9 +329,11 @@ class FillFlowMixin:
                     "position_id": position.position_id, "fill_id": fill.fill_id,
                     "strategy_id": fill.strategy_id, "instrument": fill.instrument,
                     "execution_mode": env.mode}, env_name=env.name)
-                # Position-owned SL: the broker-confirmed entry fill opened THIS
-                # position, so its stop is armed now.  No broker SL order.
-                self._arm_position_sl(env, position, source="entry_fill")
+                # The initial fill may be only part of a still-working LIMIT.
+                # Keep it unarmed until full quantity, or a confirmed MARKET
+                # fallback fill, as requested.
+                self._protect_entry_fill_if_ready(
+                    env, position, entry_order, source="entry_fill")
                 # REVERSAL — the broker-confirmed NEW opposite entry creates
                 # the NEW position; record its fill + SL on the reversal.
                 if getattr(entry_order, "order_role", "") == "REVERSAL_ENTRY":
@@ -435,6 +442,11 @@ class FillFlowMixin:
             )
             self._reset_strategy_state(fill.strategy_id, keep_pending=pending_armed,
                                        env_name=env.name)
+            if (pending_armed and
+                    (sl_role == "REVERSAL_EXIT"
+                     or (exit_reason and "reversal" in exit_reason.lower()))):
+                self._activate_reversal_entry_after_flat(
+                    env, fill.strategy_id)
         env.fill_dedup.mark_processed(fill.fill_id)
 
     def _is_replayable_stale_exit(self, env, fill) -> bool:
@@ -776,6 +788,191 @@ class FillFlowMixin:
         registry = getattr(env, "pending_triggers", None)
         if registry is not None:
             registry.sync_strategy(strat)
+
+    def _activate_reversal_entry_after_flat(self, env, strategy_id: str) -> bool:
+        """Submit the paired reversal entry immediately after confirmed flat.
+
+        The reversal exit trigger owns the timing for the pair. The opposite
+        entry has no second breakout wait: it is submitted only after the old
+        position is filled closed AND Dhan confirms the instrument is flat.
+        """
+        strategy = (getattr(env, "strategies", {}) or {}).get(strategy_id)
+        pending = getattr(strategy, "pending_entry", None) if strategy else None
+        signal = getattr(pending, "signal", None)
+        metadata = getattr(signal, "metadata", None) or {}
+        if (strategy is None or pending is None or signal is None
+                or not metadata.get("is_reversal_entry")
+                or pending.status not in ("pending", "waiting_for_flat")):
+            return False
+
+        pm = getattr(env, "position_manager", None)
+        if pm is not None and any(
+                getattr(position, "instrument", None) == signal.instrument
+                and getattr(position, "is_open", False)
+                for position in (pm.get_positions_by_strategy(strategy_id) or [])):
+            return False
+
+        broker_flat = getattr(self, "_broker_flat_for_entry", None)
+        if not callable(broker_flat):
+            return False
+        flat, detail = broker_flat(env, signal)
+        if not flat:
+            pending.status = "waiting_for_flat"
+            strategy.state = StrategyState.EXIT_ORDER_SUBMITTED
+            metadata.update(pending=True, triggered=False, trigger_state="ARMED")
+            signal.metadata = metadata
+            registry = getattr(env, "pending_triggers", None)
+            if registry is not None:
+                registry.sync_strategy(strategy)
+            self.publish_event("reversal_entry_waiting_for_broker_flat", {
+                "signal_id": signal.signal_id,
+                "strategy_id": strategy_id,
+                "instrument": signal.instrument,
+                "reason": detail.get("reason"),
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+            return False
+
+        execution = getattr(env, "execution_engine", None)
+        prices = getattr(execution, "_current_prices", {}) or {}
+        try:
+            # The exit fill price can be stale by the time Dhan confirms the
+            # position is flat. Never reuse it as the new entry's market price.
+            ltp = float(prices.get(signal.instrument) or 0.0)
+        except (TypeError, ValueError):
+            ltp = 0.0
+        if ltp <= 0:
+            pending.status = "waiting_for_flat"
+            strategy.state = StrategyState.EXIT_ORDER_SUBMITTED
+            self.publish_event("reversal_entry_waiting_for_live_price", {
+                "signal_id": signal.signal_id,
+                "strategy_id": strategy_id,
+                "instrument": signal.instrument,
+                "reason": "no_current_market_price",
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+            return False
+
+        metadata["reversal_entry_trigger_level"] = signal.trigger_price
+        metadata.update(
+            pending=False, triggered=True, trigger_state="FIRED",
+            trigger_ltp=ltp, trigger_source="broker_confirmed_reversal_flat",
+            entry_after_confirmed_reversal_exit=True,
+        )
+        signal.metadata = metadata
+        signal.trigger_price = ltp
+        pending.status = "fired"
+        strategy.pending_entry = None
+        strategy.state = StrategyState.ENTRY_TRIGGERED
+        strategy._register_fired_trigger(signal.signal_id)
+        registry = getattr(env, "pending_triggers", None)
+        if registry is not None:
+            registry.sync_strategy(strategy)
+        self.publish_event("reversal_entry_triggered_after_flat", {
+            "signal_id": signal.signal_id,
+            "strategy_id": strategy_id,
+            "instrument": signal.instrument,
+            "ltp": ltp,
+            "execution_mode": getattr(env, "mode", None),
+        }, env_name=getattr(env, "name", None))
+        self._process_signal(signal, getattr(env, "name", None))
+        return True
+
+    def _protect_entry_fill_if_ready(self, env, position, fill_order,
+                                     *, source: str) -> bool:
+        """Arm the position-owned SL only after entry completion is known.
+
+        A partial MARKET fallback is protected at its actual filled quantity;
+        the order watcher reports the underfill separately and does not retry.
+        """
+        if fill_order is None:
+            # Cannot prove the order chain; fail safe and surface missing
+            # ownership instead of silently treating a partial fill as final.
+            position.sl_state = "ENTRY_FILL_INCOMPLETE"
+            try:
+                self._persist_position(position, getattr(env, "name", None))
+            except Exception as e:
+                log.warning("[Engine] unknown entry position persist failed: %s", e)
+            self.publish_event("entry_fill_completion_unknown", {
+                "position_id": position.position_id,
+                "entry_order_id": getattr(position, "entry_order_id", None),
+                "quantity": int(position.quantity),
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+            return False
+        role = str(getattr(fill_order, "order_role", "") or "").upper()
+        if role == "FALLBACK_MARKET":
+            root_id = getattr(fill_order, "original_order_id", None)
+            root_order = (env.execution_engine.get_order(root_id)
+                          if root_id and env.execution_engine is not None else None)
+            requested = int(getattr(root_order, "quantity", 0)
+                             or getattr(fill_order, "quantity", 0) or 0)
+            if int(position.quantity) < requested:
+                self.publish_event("entry_quantity_underfilled", {
+                    "position_id": position.position_id,
+                    "entry_order_id": root_id,
+                    "market_order_id": getattr(fill_order, "order_id", None),
+                    "requested_quantity": requested,
+                    "filled_position_quantity": int(position.quantity),
+                    "execution_mode": getattr(env, "mode", None),
+                }, env_name=getattr(env, "name", None))
+            return self._arm_position_sl(env, position,
+                                         source="market_fallback_fill")
+
+        engine = getattr(env, "execution_engine", None)
+        root_id = (getattr(fill_order, "original_order_id", None)
+                   or getattr(fill_order, "order_id", None))
+        chain = []
+        for candidate in (getattr(engine, "_orders", {}) or {}).values():
+            candidate_role = str(getattr(candidate, "order_role", "") or "").upper()
+            if candidate_role not in {"ENTRY", "REVERSAL_ENTRY", "FALLBACK_MARKET"}:
+                continue
+            oid = getattr(candidate, "order_id", None)
+            original = getattr(candidate, "original_order_id", None)
+            if oid == root_id or original == root_id:
+                chain.append(candidate)
+        root = next((o for o in chain if getattr(o, "order_id", None) == root_id),
+                    fill_order)
+        target = max(0, int(getattr(root, "quantity", 0) or 0))
+        fallback_filled = any(
+            str(getattr(o, "order_role", "") or "").upper() == "FALLBACK_MARKET"
+            and int(getattr(o, "filled_quantity", 0) or 0) > 0
+            for o in chain)
+        working = any(
+            str(getattr(getattr(o, "state", None), "value", getattr(o, "state", "")))
+            .lower() not in {"filled", "canceled", "cancelled", "rejected", "expired"}
+            for o in chain)
+        if target and int(position.quantity) >= target:
+            return self._arm_position_sl(env, position, source=source)
+        if fallback_filled:
+            return self._arm_position_sl(env, position,
+                                         source="market_fallback_partial_fill")
+        if not working:
+            # Terminal LIMIT without a fallback: protect only what Dhan filled
+            # and alert that the intended quantity was not completed.
+            self.publish_event("entry_quantity_underfilled", {
+                "position_id": position.position_id,
+                "entry_order_id": root_id,
+                "requested_quantity": target,
+                "filled_quantity": int(position.quantity),
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+            return self._arm_position_sl(env, position,
+                                         source="confirmed_terminal_partial_entry")
+        position.sl_state = "ENTRY_FILL_INCOMPLETE"
+        position.sl_protected_at = None
+        try:
+            self._persist_position(position, getattr(env, "name", None))
+        except Exception as e:
+            log.warning("[Engine] pending entry position persist failed: %s", e)
+        self.publish_event("entry_fill_waiting_for_completion", {
+            "position_id": position.position_id,
+            "entry_order_id": root_id,
+            "requested_quantity": target,
+            "filled_quantity": int(position.quantity),
+            "execution_mode": getattr(env, "mode", None),
+        }, env_name=getattr(env, "name", None))
+        return False
     def _notify_entry_fill(self, fill, position, env, signal_id: Optional[str]) -> None:
         try:
             strat_obj = env.strategies.get(fill.strategy_id)

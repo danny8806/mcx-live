@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from core.lifecycle import PendingOrderState, transition_pending_state
-from strategies.types import StrategyState, resolve_order_role
+from strategies.types import (
+    StrategyState, resolve_order_role, restored_trigger_metadata,
+)
 
 log = logging.getLogger("trading_engine")
 
@@ -73,17 +75,23 @@ class PersistenceFlowMixin:
                        env_name: Optional[str] = None) -> None:
         env = self._env_for(env_name)
         if env.persistence:
+            signal_id = (getattr(signal, "signal_id", None)
+                         or getattr(order, "entry_signal_id", None))
+            role = (getattr(order, "order_role", None)
+                    or (resolve_order_role(signal) if signal is not None else None))
             env.persistence.save_order({
                 "order_id": order.order_id, "strategy_id": order.strategy_id,
                 "instrument": order.instrument, "side": order.side, "quantity": order.quantity,
                 "order_type": order.order_type,
-                "price": order.price if order.price is not None else signal.trigger_price,
+                "price": (order.price if order.price is not None else
+                          getattr(signal, "trigger_price", None)
+                          if signal is not None else
+                          getattr(order, "trigger_price", None)),
                 "trigger_price": getattr(order, "trigger_price", None),
                 "planned_entry_price": getattr(order, "planned_entry_price", None),
                 "planned_sl": getattr(order, "planned_sl", None),
                 "planned_order_type": getattr(order, "planned_order_type", None),
-                "order_role": (getattr(order, "order_role", None)
-                               or resolve_order_role(signal)),
+                "order_role": role,
                 "protected_order_id": getattr(order, "protected_order_id", None),
                 "correlation_id": getattr(order, "correlation_id", None),
                 "broker_order_id": getattr(order, "_broker_order_id", None),
@@ -91,9 +99,9 @@ class PersistenceFlowMixin:
                 "average_fill_price": order.average_fill_price,
                 "created_at": datetime.fromtimestamp(order.created_at, tz=timezone.utc).isoformat(),
                 "updated_at": datetime.fromtimestamp(order.updated_at, tz=timezone.utc).isoformat(),
-                "signal_id": signal.signal_id, "trade_id": order.trade_id,
+                "signal_id": signal_id, "trade_id": order.trade_id,
                 "lifecycle_id": getattr(order, "lifecycle_id", None) or order.trade_id,
-                "parent_signal_id": getattr(order, "parent_signal_id", None) or signal.signal_id,
+                "parent_signal_id": getattr(order, "parent_signal_id", None) or signal_id,
                 "position_id": getattr(order, "position_id", None),
                 "parent_position_id": getattr(order, "parent_position_id", None),
                 "position_generation": getattr(order, "position_generation", None),
@@ -273,8 +281,9 @@ class PersistenceFlowMixin:
     def _restore_live_pending_triggers(self, env) -> int:
         """Warm the in-memory trigger index from the LIVE DB before WS starts.
 
-        All durable rows are cached for replay/duplicate-state checks. Only
-        ARMED rows become executable in-memory triggers.
+        Only executable ARMED rows are loaded into the trigger cache; terminal
+        history remains in SQLite and is queried by signal id only when needed
+        to invalidate a stale snapshot trigger.
         """
         registry = getattr(env, "pending_triggers", None)
         persistence = getattr(env, "persistence", None)
@@ -283,7 +292,16 @@ class PersistenceFlowMixin:
         from strategies.types import (PendingEntry, Signal, SignalType,
                                       StrategyState, freeze_signal_context)
         try:
-            rows = persistence.get_pending_orders(execution_mode="LIVE")
+            if hasattr(persistence, "get_pending_order"):
+                # Production restores only executable rows. A single-row
+                # lookup below still catches a terminalized stale RAM signal.
+                rows = persistence.get_pending_orders(
+                    status=PendingOrderState.ARMED.value,
+                    execution_mode="LIVE")
+            else:
+                # Lightweight adapters/test doubles may expose only the
+                # original API; production never loads all historical rows.
+                rows = persistence.get_pending_orders(execution_mode="LIVE")
         except Exception as exc:
             log.error("[Engine] pending trigger restore failed: %s", exc)
             return 0
@@ -301,6 +319,14 @@ class PersistenceFlowMixin:
             current = getattr(strategy, "pending_entry", None)
             signal_id = getattr(getattr(current, "signal", None), "signal_id", None)
             row = rows_by_signal.get(str(signal_id or ""))
+            if (row is None and signal_id and
+                    callable(getattr(persistence, "get_pending_order", None))):
+                try:
+                    row = persistence.get_pending_order(
+                        str(signal_id), execution_mode="LIVE")
+                except Exception as exc:
+                    log.warning("[Engine] pending state lookup failed for %s: %s",
+                                signal_id, exc)
             if row and str(row.get("status", "")).lower() in terminal:
                 strategy._cancel_trigger(current)
                 strategy.pending_entry = None
@@ -309,10 +335,18 @@ class PersistenceFlowMixin:
                 registry.sync_strategy(strategy)
                 log.info("[Engine] discarded terminal startup trigger %s for %s",
                          signal_id, sid)
+            elif (row and str(row.get("status", "")).lower()
+                  == PendingOrderState.ARMED.value and current is not None
+                  and getattr(current.signal, "signal_id", None) == signal_id):
+                current.signal.metadata = restored_trigger_metadata(
+                    current.signal.metadata, active=True)
+                current.status = ("waiting_for_flat"
+                                  if current.status == "waiting_for_flat"
+                                  else "pending")
         for row in rows:
-            registry.cache_live_row(row)
             if str(row.get("status", "")).lower() != PendingOrderState.ARMED.value:
                 continue
+            registry.cache_live_row(row)
             sid = str(row.get("strategy_id") or "")
             strategy = (getattr(env, "strategies", {}) or {}).get(sid)
             signal_id = str(row.get("signal_id") or row.get("pending_order_id") or "")
@@ -331,7 +365,11 @@ class PersistenceFlowMixin:
                     raise ValueError("signal row is missing")
                 side = str(row.get("direction") or row.get("side") or saved.get("side") or "").upper()
                 signal_type = SignalType(side)
-                timestamp = float(row.get("signal_timestamp") or saved.get("signal_timestamp") or 0.0)
+                timestamp = float(
+                    row.get("signal_timestamp")
+                    or saved.get("signal_timestamp")
+                    or saved.get("candle_timestamp")
+                    or 0.0)
                 metadata = {
                     "pending": True, "triggered": False, "trigger_state": "ARMED",
                     "trigger_generation": int(row.get("trigger_generation") or 0),
@@ -352,6 +390,7 @@ class PersistenceFlowMixin:
                     pass
                 if current is not None and getattr(current.signal, "signal_id", None) == signal_id:
                     metadata.update(current.signal.metadata or {})
+                metadata = restored_trigger_metadata(metadata, active=True)
                 signal = Signal(
                     signal_type=signal_type, instrument=str(row.get("instrument") or saved.get("instrument")),
                     strategy_id=sid, timestamp=timestamp,
@@ -399,6 +438,7 @@ class PersistenceFlowMixin:
                             exit_meta = json.loads(exit_saved.get("signal_metadata") or "{}")
                         except (TypeError, ValueError):
                             exit_meta = {}
+                        exit_meta = restored_trigger_metadata(exit_meta, active=True)
                         exit_side = str(exit_saved.get("side") or "").upper()
                         exit_signal = Signal(
                             signal_type=SignalType(exit_side), instrument=str(exit_saved.get("instrument") or strategy.instrument),

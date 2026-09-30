@@ -658,6 +658,26 @@ class SLFlowMixin:
             self._mark_sl_unavailable(env, pos, entry.get("reason")
                                       or SLReject.STOP_MISSING)
 
+        # Complete crash/restart recovery for positions whose first entry fill
+        # arrived before its order chain settled. An active LIMIT remains
+        # unprotected until full fill or a confirmed fallback; a fallback fill
+        # arms only the broker-confirmed position quantity.
+        protect_entry = getattr(self, "_protect_entry_fill_if_ready", None)
+        execution_orders = (getattr(execution, "_orders", {}) or {}) if execution else {}
+        for entry in summary.get("awaiting_entry_completion", []):
+            pos = by_pid.get(str(entry.get("position_id")))
+            if pos is None or not callable(protect_entry):
+                continue
+            entry_order = execution_orders.get(getattr(pos, "entry_order_id", None))
+            if entry_order is None:
+                continue
+            try:
+                protect_entry(env, pos, entry_order,
+                              source="entry_completion_reconciliation")
+            except Exception as e:
+                log.error("[SL] deferred entry protection failed for %s: %s",
+                          getattr(pos, "position_id", None), e)
+
         # A local row the broker does not confirm cannot exist: close it.
         for entry in summary.get("dropped_local", []):
             pid = entry.get("position_id")
@@ -668,25 +688,44 @@ class SLFlowMixin:
             except Exception as e2:
                 log.error("[SL] could not close stale position %s: %s", pid, e2)
                 stale_position = None
-            # A broker/manual close removes the position owner without routing
-            # an exit fill through fill_flow. Release the strategy's position
-            # state at the same time, preserving an opposite reversal trigger
-            # so it can resume as a normal pending entry once the broker is
-            # confirmed flat. Otherwise position_side remains set forever and
-            # the reversal stays waiting_for_flat (and cannot expire or fire).
+            # A broker/manual close ends the pending reversal lifecycle too;
+            # a later fresh strategy signal may create a new entry.
             stale_sid = (entry.get("strategy_id")
                          or getattr(stale_position, "strategy_id", None))
             strategy = (getattr(env, "strategies", {}) or {}).get(stale_sid)
             if strategy is not None:
+                pending = getattr(strategy, "pending_entry", None)
+                pending_signal = getattr(pending, "signal", None)
+                pending_signal_id = getattr(pending_signal, "signal_id", None)
                 reset_strategy = getattr(self, "_reset_strategy_state", None)
                 if callable(reset_strategy):
-                    keep_pending = getattr(strategy, "pending_entry", None) is not None
                     try:
-                        reset_strategy(stale_sid, keep_pending=keep_pending,
+                        reset_strategy(stale_sid, keep_pending=False,
                                        env_name=getattr(env, "name", None))
                     except Exception as e2:
                         log.error("[SL] strategy reset after broker-flat position %s "
                                   "failed: %s", pid, e2)
+                if pending_signal_id:
+                    persistence = getattr(env, "persistence", None)
+                    if persistence is not None:
+                        try:
+                            persistence.terminalize_pending_order(
+                                str(pending_signal_id), status="resolved",
+                                reason="position_closed_manually_before_reversal_entry",
+                            )
+                        except Exception as e2:
+                            log.error("[SL] manual-close reversal cleanup failed "
+                                      "for %s: %s", pending_signal_id, e2)
+                    registry = getattr(env, "pending_triggers", None)
+                    if registry is not None:
+                        registry.remove_signal(str(pending_signal_id))
+                    self.publish_event("pending_reversal_cancelled_after_manual_close", {
+                        "signal_id": str(pending_signal_id),
+                        "strategy_id": stale_sid,
+                        "position_id": pid,
+                        "reason": "position_closed_manually_before_reversal_entry",
+                        "execution_mode": getattr(env, "mode", None),
+                    }, env_name=getattr(env, "name", None))
             self.publish_event("sl_stale_local_position_closed", dict(
                 entry, execution_mode=getattr(env, "mode", None)),
                 env_name=getattr(env, "name", None))

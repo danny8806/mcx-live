@@ -284,8 +284,9 @@ def test_exit_fallback_keeps_the_exit_side_and_never_crosses_the_position():
 
 def test_entry_fallback_is_not_dressed_up_as_an_exit():
     w = _watcher()
-    signal = w._fresh_market_entry(
-        _watcher_record(order_role="ENTRY", side="BUY"), quantity=10)
+    rec = _watcher_record(order_role="ENTRY", side="BUY")
+    rec.current_market_price = 101.0
+    signal = w._fresh_market_entry(rec, quantity=10)
     assert signal.signal_type == SignalType.LONG
     assert "exit" not in signal.metadata
     assert signal.metadata["market_fallback"] is True
@@ -331,19 +332,37 @@ def test_engine_admits_a_market_exit_but_still_bans_a_market_entry():
     exit_order = engine.create_order(_signal(True), trade_id="T1", side="SELL")
     exit_order.order_type = "MARKET"
     exit_order.order_role = "EXIT"
+    exit_order.original_order_id = "old-limit-exit"
+    engine.submit_order(exit_order)
+    assert exit_order.state == OrderState.REJECTED
+    assert exit_order.reason == "FALLBACK_LIMIT_CANCEL_NOT_CONFIRMED"
+    assert broker.placed == []
+
+    # A watcher-owned exit MARKET is admitted only after the original LIMIT
+    # cancellation has been confirmed by the broker.
+    exit_order.state = OrderState.CREATED
+    exit_order.fallback_cancel_confirmed = True
     engine.submit_order(exit_order)
     assert exit_order.state == OrderState.SUBMITTED
-    assert exit_order.reason is None
     assert [o["order_type"] for o in broker.placed] == ["MARKET"]
 
-    # The entry-side fallback is still refused, so a MARKET can never open.
+    # An unverified entry fallback is refused at the gateway.
     entry_order = engine.create_order(_signal(False, False), trade_id="T2")
     entry_order.order_type = "MARKET"
     entry_order.order_role = "FALLBACK_MARKET"
     engine.submit_order(entry_order)
     assert entry_order.state == OrderState.REJECTED
-    assert entry_order.reason == "LIVE_MARKET_ENTRY_DISABLED"
+    assert entry_order.reason == "FALLBACK_LIMIT_CANCEL_NOT_CONFIRMED"
     assert len(broker.placed) == 1
+
+    # The watcher may submit it only after a confirmed cancel and with parent
+    # order lineage; the execution gateway admits that authorized fallback.
+    entry_order.state = OrderState.CREATED
+    entry_order.original_order_id = "limit-order-1"
+    entry_order.fallback_cancel_confirmed = True
+    engine.submit_order(entry_order)
+    assert entry_order.state == OrderState.SUBMITTED
+    assert [o["order_type"] for o in broker.placed] == ["MARKET", "MARKET"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

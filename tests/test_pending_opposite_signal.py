@@ -16,18 +16,18 @@ from core.candle_fetcher import CandleFetcher, IST
 from datetime import datetime
 
 
-@pytest.mark.parametrize("timeout_bars", [0, 50])
-def test_opposite_signal_replaces_untriggered_entry(timeout_bars):
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+def test_new_valid_signal_replaces_untriggered_entry_with_its_candle_values(side):
     strategy = StrategyInstance("s1", "GOLDM", "123", "5m",
-                                pending_timeout_bars=timeout_bars)
+                                pending_timeout_bars=50)
     old = strategy._create_triggered_entry_signal(
         "LONG", 100.0, 101.0, 99.0, 1.0, 100.0, 98.0)
     strategy._prev_fast_close = 101.0
     strategy._prev_htf_value = 100.0
     strategy._prev_fast_high = 101.0
     strategy._prev_fast_low = 99.0
-    strategy._check_long_cross = lambda *args: False
-    strategy._check_short_cross = lambda *args: True
+    strategy._check_long_cross = lambda *args: side == "LONG"
+    strategy._check_short_cross = lambda *args: side == "SHORT"
     bar = Bar("GOLDM", "5m", 2.0, 3.0, 100.0, 101.0, 97.0,
               99.0, 1.0)
 
@@ -39,11 +39,14 @@ def test_opposite_signal_replaces_untriggered_entry(timeout_bars):
     assert new.metadata["trigger_state"] == "ARMED"
     assert new.metadata["cancel_inflight"] is True
     assert new.metadata["old_pending_id"] == old.signal_id
-    if timeout_bars == 0:
-        assert new.metadata["pending_termination"] == "expired"
+    assert new.metadata["signal_candle_high"] == bar.high
+    assert new.metadata["signal_candle_low"] == bar.low
+    assert new.metadata["signal_htf_dema_atr"] == 100.0
     assert strategy.pending_entry.signal is new
-    assert strategy.state == StrategyState.PENDING_SHORT
-    assert strategy.on_tick(old.trigger_price, 4.0) is None
+    assert strategy.state == (StrategyState.PENDING_LONG if side == "LONG"
+                              else StrategyState.PENDING_SHORT)
+    if side != "LONG":
+        assert strategy.on_tick(old.trigger_price, 4.0) is None
     assert strategy.on_tick(new.trigger_price, 5.0) is new
     assert new.metadata["trigger_state"] == "FIRED"
     assert strategy.on_tick(new.trigger_price, 5.0) is None
@@ -51,7 +54,7 @@ def test_opposite_signal_replaces_untriggered_entry(timeout_bars):
 
 def test_expired_trigger_without_replacement_emits_cancel_only_event():
     strategy = StrategyInstance("s1", "GOLDM", "123", "5m",
-                                pending_timeout_bars=0)
+                                pending_timeout_bars=1)
     old = strategy._create_triggered_entry_signal(
         "LONG", 100.0, 101.0, 99.0, 1.0, 100.0, 98.0)
     strategy._prev_fast_close = 101.0
@@ -61,6 +64,7 @@ def test_expired_trigger_without_replacement_emits_cancel_only_event():
     bar = Bar("GOLDM", "5m", 2.0, 3.0, 100.0, 101.0, 97.0,
               99.0, 1.0)
 
+    strategy.pending_entry.bars_pending = 1
     control = strategy.on_bar(bar, SimpleNamespace(htf_value=100.0), 100.0)
 
     assert control.metadata["cancel_only"] is True
@@ -104,9 +108,9 @@ def test_fired_entry_limit_uses_current_tick_not_old_trigger(side, ltp, expected
 
 
 @pytest.mark.parametrize("side,ltp,expected", [
-    ("SELL", 94.2, 94.0), ("BUY", 105.2, 106.0),
+    ("SELL", 94.2, 95.0), ("BUY", 105.2, 105.0),
 ])
-def test_stop_exit_limit_is_marketable_after_gap(side, ltp, expected):
+def test_stop_exit_limit_uses_the_signal_stop_price(side, ltp, expected):
     signal = Signal(
         signal_type=SignalType.SHORT if side == "SELL" else SignalType.LONG,
         instrument="GOLDM", strategy_id="s1", timestamp=1.0,
@@ -171,6 +175,44 @@ def test_live_opposite_pending_signal_terminalizes_old_without_broker_order():
     assert new.metadata["old_pending_id"] == old.signal_id
     assert strategy.on_tick(new.trigger_price, 5.0) is new
     assert strategy.is_fired_trigger_signal(new.signal_id)
+
+
+def test_restart_cannot_replay_pending_candle_cancel_and_reject_its_trigger():
+    """Exercise snapshot restore -> WebSocket fire -> actual live ownership gate."""
+    strategy = StrategyInstance("s1", "GOLDM", "123", "15m")
+    pending = strategy._create_triggered_entry_signal(
+        "SHORT", 100.0, 103.0, 98.0, 10.0, 104.0, 99.0)
+    pending.metadata.update(
+        cancel_inflight=True, cancel_inflight_consumed=True,
+        old_pending_id="superseded-signal", pending_termination="expired",
+        signal_candle_start=1700000000.0)
+    pending.timestamp = 0.0
+    snapshot = strategy.snapshot()
+
+    restored = StrategyInstance("s1", "GOLDM", "123", "15m")
+    restored.restore(snapshot)
+    restored_pending = restored.pending_entry.signal
+    assert restored_pending.timestamp == 1700000000.0
+    for transient in ("cancel_inflight", "cancel_inflight_consumed",
+                      "old_pending_id", "pending_termination", "cancel_only"):
+        assert transient not in restored_pending.metadata
+
+    fired = restored.on_tick(restored_pending.trigger_price, timestamp=11.0)
+    assert fired is restored_pending
+    assert fired.metadata["trigger_state"] == "FIRED"
+
+    validator = object.__new__(TradingEngine)
+    validator._gate_for = lambda _sid: SimpleNamespace(
+        entries_allowed=True, reversal_enabled=True, exit_enabled=True,
+        sl_enabled=True)
+    env = SimpleNamespace(
+        safe_mode=None, gate_enabled=True, strategies={"s1": restored},
+        position_manager=SimpleNamespace(get_positions_by_strategy=lambda _sid: []),
+    )
+    execution = LiveExecutionEngine(SimpleNamespace())
+    order = execution.create_order(fired, trade_id="restored-trade")
+
+    assert validator._validate_live_order_ownership(env, order) is None
 
 
 @pytest.mark.parametrize("status,should_cancel", [

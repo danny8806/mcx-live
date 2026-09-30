@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from config import as_dict
+from strategies.types import StrategyState
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +62,19 @@ def _terminal_entry_matches_pending(strategy, order) -> bool:
                        or getattr(order, "parent_signal_id", None))
     return bool(pending_signal_id and order_signal_id
                 and str(pending_signal_id) == str(order_signal_id))
+
+
+def _has_market_fallback_child(engine_orders: dict, order) -> bool:
+    """A canceled parent LIMIT is not a failed exit if its fallback exists."""
+    parent_id = getattr(order, "order_id", None)
+    if not parent_id:
+        return False
+    return any(
+        getattr(candidate, "original_order_id", None) == parent_id
+        and str(getattr(candidate, "order_type", "") or "").upper() == "MARKET"
+        and str(getattr(candidate, "order_role", "") or "").upper()
+            in {"EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT", "FALLBACK_MARKET"}
+        for candidate in (engine_orders or {}).values())
 
 
 def _is_live(env) -> bool:
@@ -287,6 +301,11 @@ class LiveBrokerPoller:
                 self._persist_order_state(order)
                 role = (getattr(order, "order_role", "") or "").upper()
                 if role in ("EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"):
+                    if _has_market_fallback_child(engine_orders, order):
+                        # The watcher canceled this LIMIT as the first half of
+                        # cancel-confirm-MARKET. Do not release the SL or cancel
+                        # the reversal entry while its child MARKET owns exit.
+                        continue
                     position_id = getattr(order, "parent_position_id", None)
                     position = next((p for p in getattr(
                         self.env.position_manager, "open_positions", [])
@@ -309,7 +328,35 @@ class LiveBrokerPoller:
                     if role == "REVERSAL_EXIT":
                         strat = strategies.get(order.strategy_id)
                         if strat is not None:
+                            pending = getattr(strat, "pending_entry", None)
+                            pending_signal = getattr(pending, "signal", None)
+                            pending_signal_id = getattr(pending_signal, "signal_id", None)
+                            if pending_signal_id:
+                                persistence = getattr(self.env, "persistence", None)
+                                if persistence is not None:
+                                    try:
+                                        persistence.terminalize_pending_order(
+                                            str(pending_signal_id), status="resolved",
+                                            reason="reversal_exit_ended_without_close")
+                                    except Exception as exc:
+                                        log.error("[LivePoller:%s] failed to retire reversal "
+                                                  "entry %s: %s", self.env.name,
+                                                  pending_signal_id, exc)
+                                registry = getattr(self.env, "pending_triggers", None)
+                                if registry is not None:
+                                    registry.remove_signal(str(pending_signal_id))
                             strat.pending_entry = None
+                            strat.pending_exit_trigger = None
+                            if position is not None:
+                                strat.position_side = (
+                                    "LONG" if getattr(position, "is_long", False)
+                                    else "SHORT")
+                                strat.state = (StrategyState.LONG_POSITION
+                                               if position.is_long
+                                               else StrategyState.SHORT_POSITION)
+                            strat._last_fired_trigger_signal_id = None
+                            if hasattr(strat, "_fired_trigger_signal_ids"):
+                                strat._fired_trigger_signal_ids.clear()
                             strat.stop_exit_submitted = False
                 if role.startswith("ENTRY") or role == "REVERSAL_ENTRY":
                     # The POST may have been accepted as PENDING and rejected
@@ -553,6 +600,9 @@ class LiveBrokerPoller:
                 continue
             role = str(getattr(order, "order_role", "") or "").upper()
             if role not in _EXIT_ROLES:
+                continue
+            if _has_market_fallback_child(
+                    getattr(engine, "_orders", {}) or {}, order):
                 continue
             position_id = getattr(order, "parent_position_id", None)
             if not position_id:

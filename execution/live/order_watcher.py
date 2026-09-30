@@ -30,6 +30,7 @@ reconciliation; it never creates a high-frequency poll loop.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 import uuid
@@ -154,6 +155,7 @@ class OrderWatcher:
         position_lookup: Optional[Callable[[str, str], Any]] = None,
         preflight_fn: Optional[Callable[[str, "OrderWatchRecord"], Optional[str]]] = None,
         on_fills: Optional[Callable[[list], None]] = None,
+        on_order: Optional[Callable[[object, object], None]] = None,
     ):
         self._engine = engine
         self._broker = broker
@@ -171,6 +173,10 @@ class OrderWatcher:
         self._strategy_lookup = strategy_lookup
         self._position_lookup = position_lookup
         self._on_fills = on_fills or (lambda _fills: None)
+        # Fallback orders are created outside SignalFlow, so the watcher must
+        # persist their order row before the broker can return a fill. A fill
+        # without that row is rejected by the LIVE fill-integrity checks.
+        self._on_order = on_order or (lambda _order, _signal: None)
         self._rate_bucket_ts = 0.0
         self._rate_bucket_used = 0
         self._stats = {
@@ -476,6 +482,17 @@ class OrderWatcher:
                     self._on_fills(new_fills)
                 except Exception as e:
                     log.error("OrderWatcher on_fills route failed: %s", e)
+            # Keep the durable order projection aligned with the status that
+            # was just read from broker truth (including FILLED/CANCELED).
+            # Fallback orders are persisted when created, but have no later
+            # SignalFlow pass to persist their final state.
+            if engine is not None and callable(getattr(engine, "get_order", None)):
+                verified_order = engine.get_order(order_id)
+                if verified_order is not None:
+                    try:
+                        self._on_order(verified_order, None)
+                    except Exception as e:
+                        log.error("OrderWatcher on_order persistence failed: %s", e)
             # A successful status read is authoritative evidence we queried the
             # broker (the §13 race gate: "send nothing until REST checked").
             rec.rest_verified = True
@@ -587,12 +604,70 @@ class OrderWatcher:
             # (they are trigger orders, never to be re-driven here).
             if rec.order_role in ("EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"):
                 is_exit = True
-            elif rec.order_role in ("ENTRY", "REVERSAL_ENTRY"):
+            elif rec.order_role in ("ENTRY", "REVERSAL_ENTRY", "FALLBACK_MARKET"):
                 is_exit = False
             else:
                 continue
+            # A MARKET fallback is a one-shot completion attempt. Never run it
+            # through the LIMIT recovery tree (which could create another
+            # MARKET order). A partial fill is protected at actual quantity by
+            # fill_flow and surfaced for operator attention.
+            order_is_market_fallback = bool(
+                rec.order_role == "FALLBACK_MARKET"
+                or (getattr(order_obj, "original_order_id", None)
+                    and str(getattr(order_obj, "order_type", "")).upper() == "MARKET")
+                or (rec.original_order_id and rec.order_type == "MARKET"))
+            if order_is_market_fallback:
+                if (rec.status == "PARTIALLY_FILLED"
+                        and not rec.extra.get("market_partial_alerted")):
+                    rec.extra["market_partial_alerted"] = True
+                    self._fail_event("MARKET_FALLBACK_PARTIAL_FILL", rec, {
+                        "filled_quantity": int(rec.filled_quantity or 0),
+                        "remaining_quantity": int(rec.remaining_quantity or 0),
+                        "action": "no_retry; protect actual position quantity",
+                    })
+                if (rec.status == "PARTIALLY_FILLED" and is_exit
+                        and not rec.extra.get("market_exit_remainder_cancel_requested")):
+                    # A partial exit MARKET has no retry leg by contract.
+                    # Cancel its unfilled remainder once; broker confirmation
+                    # lets the poller re-arm SL for the residual position.
+                    rec.extra["market_exit_remainder_cancel_requested"] = True
+                    try:
+                        cancelled = bool(self._engine.cancel_order(order_id))
+                    except Exception as exc:
+                        cancelled = False
+                        rec.last_error = str(exc)
+                    if not cancelled:
+                        self._fallback_wait_alert(
+                            rec, "partial_exit_market_cancel_unconfirmed",
+                            error=rec.last_error)
+                    else:
+                        self._publish("market_fallback_partial_exit_cancelled", rec, {
+                            "filled_quantity": int(rec.filled_quantity or 0),
+                            "remaining_quantity": int(rec.remaining_quantity or 0),
+                            "action": "no_retry; reconcile and re-arm residual SL",
+                        })
+                elif (rec.status in ("REJECTED", "CANCELLED", "CANCELED", "EXPIRED")
+                      and not rec.extra.get("market_terminal_alerted")):
+                    rec.extra["market_terminal_alerted"] = True
+                    self._fail_event("MARKET_FALLBACK_TERMINAL_WITHOUT_FULL_FILL", rec, {
+                        "status": rec.status,
+                        "filled_quantity": int(rec.filled_quantity or 0),
+                        "remaining_quantity": int(rec.remaining_quantity or 0),
+                        "action": "no_retry; reconcile broker position",
+                    })
+                continue
             # Final orders are watched, not re-driven (no blind re-entry).
             if rec.status in ("REJECTED", "CANCELLED", "CANCELED", "EXPIRED"):
+                if (rec.status in ("REJECTED", "CANCELLED", "CANCELED")
+                        and rec.order_role in ("ENTRY", "REVERSAL_ENTRY")
+                        and not rec.extra.get("fallback_cancel_requested")
+                        and not rec.extra.get("terminal_failure_alerted")):
+                    rec.extra["terminal_failure_alerted"] = True
+                    self._fail_event("ENTRY_ORDER_CANCELLED_OR_REJECTED", rec, {
+                        "error": "broker ended entry without fallback authorization",
+                        "status": rec.status,
+                    })
                 continue
             # A fully-filled order is done: it was REST-verified once (WS/
             # engine-fill discovery + the first scan force-verify) and must
@@ -617,6 +692,8 @@ class OrderWatcher:
     def _decide(self, rec: OrderWatchRecord, classification: str, now: float) -> str:
         """§14 decision tree.  Returns WAIT / VERIFY / REPRICE / CANCEL / LOCK /
         MARKET_FALLBACK."""
+        if rec.extra.get("remainder_abandoned"):
+            return "WAIT"
         # P0..P4 gate: exits, SL and reversal leg must outrank an entry.
         blocker = self._highest_priority_blocker(rec)
         if blocker is not None:
@@ -643,7 +720,10 @@ class OrderWatcher:
         if classification == "A_FILLED":
             return "WAIT"  # fills flow through engine; nothing to do here
         if classification == PENDING_BUT_VALID:
-            return "WAIT"
+            if not rec.rest_verified:
+                return "VERIFY"
+            return ("MARKET_FALLBACK"
+                    if self._market_fallback_eligible(rec, now) else "WAIT")
         # Broker-side trigger entries (STOP_LOSS stop-limits) REST at the broker
         # waiting for their breakout trigger.  Aging / deviation must NEVER
         # cancel them or escalate to MARKET — that would enter a position
@@ -720,6 +800,8 @@ class OrderWatcher:
         * Terminal states (REJECTED/EXPIRED/CANCELLED) are never re-driven.
         * Protective STOP_LOSS trigger rests are never touched here.
         """
+        if rec.extra.get("remainder_abandoned"):
+            return "WAIT"
         if rec.order_type == "STOP_LOSS":
             return "WAIT"
         if classification in (ORDER_REJECTED, ORDER_CANCELLED, ORDER_EXPIRED,
@@ -736,7 +818,10 @@ class OrderWatcher:
                 return "MARKET_FALLBACK"
             return "WAIT"
         if classification == PENDING_BUT_VALID:
-            return "VERIFY" if not rec.rest_verified else "WAIT"
+            if not rec.rest_verified:
+                return "VERIFY"
+            return ("MARKET_FALLBACK"
+                    if self._market_fallback_eligible(rec, now) else "WAIT")
         if classification in (PENDING_AND_AGING, PENDING_MARKET_MOVED_AWAY,
                               TRIGGER_CROSSED_NOT_FILLED):
             # A resting exit that aged past policy must complete the close:
@@ -970,17 +1055,43 @@ class OrderWatcher:
         # duplicate a broker-side fill.  Force VERIFY instead — no blind
         # LIMIT->MARKET even through the fallback path.
         if not rec.broker_order_id:
+            self._fallback_wait_alert(rec, "missing_broker_order_id_blocks_market",
+                                      status=str(rec.status))
             return {"order_id": rec.internal_order_id,
                     "decision": "MARKET_FALLBACK", "ok": False,
                     "error": "missing_broker_order_id_blocks_market",
                     "status": str(rec.status)}
+        is_exit_rec = str(rec.order_role or "").upper() in (
+            "EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT")
+        if not is_exit_rec:
+            latest_ltp = rec.current_market_price or self._quote_fn(rec.instrument)
+            try:
+                latest_ltp = float(latest_ltp)
+            except (TypeError, ValueError):
+                latest_ltp = 0.0
+            if not (latest_ltp > 0 and math.isfinite(latest_ltp)):
+                self._fallback_wait_alert(
+                    rec, "latest_market_price_unavailable_blocks_fallback")
+                return {"order_id": rec.internal_order_id,
+                        "decision": "MARKET_FALLBACK", "ok": False,
+                        "error": "latest_market_price_unavailable_blocks_fallback"}
+            rec.current_market_price = latest_ltp
         # 1) cancel the resting LIMIT (must be confirmed before placing).
         try:
+            rec.extra["fallback_cancel_requested"] = True
             cancelled = bool(engine.cancel_order(rec.internal_order_id))
         except Exception as e:
+            rec.extra["fallback_cancel_requested"] = False
+            self._fallback_wait_alert(rec, "cancel_request_failed", error=str(e))
             return {"order_id": rec.internal_order_id,
                     "decision": "MARKET_FALLBACK", "ok": False, "error": str(e)}
         if not cancelled:
+            rec.extra["fallback_cancel_requested"] = False
+            self._fallback_wait_alert(
+                rec, "resting_limit_cancel_not_confirmed",
+                status=str(rec.status), error=(
+                    getattr(engine.get_order(rec.internal_order_id), "reason", None)
+                    if hasattr(engine, "get_order") else None))
             return {"order_id": rec.internal_order_id,
                     "decision": "MARKET_FALLBACK", "ok": False,
                     "error": "resting_limit_cancel_failed"}
@@ -1024,6 +1135,10 @@ class OrderWatcher:
                 self._fail_event("PARTIAL_REMAINDER_ABANDONED", rec, {
                     "error": "cancel_never_landed", "attempts": attempts,
                     "filled": filled_now, "requested": requested})
+            else:
+                self._fallback_wait_alert(
+                    rec, "partial_limit_remainder_still_working",
+                    attempts=attempts, filled=filled_now, requested=requested)
             return {"order_id": rec.internal_order_id,
                     "decision": "MARKET_FALLBACK", "ok": False,
                     "error": "partial_remainder_still_working",
@@ -1036,6 +1151,9 @@ class OrderWatcher:
         # I9 — UNKNOWN blocks MARKET: the broker truth is unresolved, a
         # MARKET could duplicate a broker-side fill.
         if status in ("UNKNOWN", "CREATED", "SUBMITTED"):
+            self._fallback_wait_alert(rec, "cancel_unverified_blocks_market",
+                                      status=status,
+                                      order_status_error=summary.get("order_status_error"))
             return {"order_id": rec.internal_order_id,
                     "decision": "MARKET_FALLBACK", "ok": False,
                     "error": "cancel_unverified_blocks_market",
@@ -1096,9 +1214,8 @@ class OrderWatcher:
             # FALLBACK_MARKET is still rejected there.  Using the entry role for
             # an exit would (a) be rejected and (b) route the completion through
             # the entry gate, which an emergency close must never depend on.
-            is_exit_rec = str(rec.order_role or "").upper() in (
-                "EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT")
-            new_order.order_role = ("EXIT" if is_exit_rec else "FALLBACK_MARKET")
+            new_order.order_role = (str(rec.order_role or "EXIT").upper()
+                                    if is_exit_rec else "FALLBACK_MARKET")
             if is_exit_rec:
                 # The plan built by create_order priced a protective LIMIT at
                 # the stop; a MARKET carries no price, so clear it rather than
@@ -1111,7 +1228,13 @@ class OrderWatcher:
             new_order.position_id = rec.position_id
             new_order.position_generation = rec.position_generation
             new_order.original_order_id = rec.internal_order_id
+            new_order.fallback_cancel_confirmed = True
+            # Persist the CREATED fallback before any broker side effect. This
+            # preserves the orders -> fills foreign-key/data-flow invariant.
+            self._on_order(new_order, order)
             engine.submit_order(new_order)
+            # Save the authoritative response state and broker id as well.
+            self._on_order(new_order, order)
             if str(getattr(getattr(new_order, "state", None), "value",
                            getattr(new_order, "state", ""))).lower() == "rejected":
                 reason = getattr(new_order, "reason", None) or "market_fallback_rejected"
@@ -1137,6 +1260,16 @@ class OrderWatcher:
                 "decision": "MARKET_FALLBACK", "ok": True,
                 "market_order_id": new_order.order_id, "quantity": remaining}
 
+    def _fallback_wait_alert(self, rec: OrderWatchRecord, reason: str, **details) -> None:
+        """Report an unresolved fallback gate once while never bypassing it."""
+        alerted = rec.extra.setdefault("fallback_wait_alerted", [])
+        if reason in alerted:
+            return
+        alerted.append(reason)
+        self._fail_event("MARKET_FALLBACK_WAITING_FOR_BROKER_CONFIRMATION", rec, {
+            "reason": reason, "status": str(rec.status), **details,
+        })
+
     def _fresh_market_entry(self, rec: OrderWatchRecord, quantity: Optional[int] = None):
         """Signal clone carrying the exact strategy intent for a fresh order.
         I11 — the fallback always uses the REMAINING quantity
@@ -1160,6 +1293,7 @@ class OrderWatcher:
             "prev_order_id": rec.internal_order_id,
             "prev_correlation_id": rec.correlation_id,
             "original_order_id": rec.internal_order_id,
+            "triggered": True,
             "trigger_state": rec.extra.get("trigger_state"),
             "trigger_generation": rec.extra.get("trigger_generation"),
             "trigger_source": rec.extra.get("trigger_source"),
@@ -1175,6 +1309,11 @@ class OrderWatcher:
                                    or "local_sl_exit_market_fallback"),
                 "trigger_state": "FIRED",
             })
+        else:
+            latest_ltp = rec.current_market_price or self._quote_fn(rec.instrument)
+            if latest_ltp is not None:
+                metadata["trigger_ltp"] = float(latest_ltp)
+            metadata["trigger_state"] = "FIRED"
         signal = Signal(
             signal_type=s_type,
             instrument=rec.instrument,

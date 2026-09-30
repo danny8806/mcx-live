@@ -72,7 +72,7 @@ class LiveExecutionEngine:
         self._plans: dict[str, ExecutionPricePlan] = {}
         # §9.5 — price plans are IMMUTABLE PER SIGNAL: the plan computed for a
         # signal_id is stored once and every recompute must equal it exactly.
-        self._plan_by_signal: dict[str, ExecutionPricePlan] = {}
+        self._plan_by_signal: dict[tuple[str, str, str], ExecutionPricePlan] = {}
         # Tick grid used to round planned LIMIT prices; defaults to 1.0 and is
         # refined by the PricePreset when one is configured.
         self._tick_size = float(self._price_preset.tick_size)
@@ -147,7 +147,13 @@ class LiveExecutionEngine:
             # exit leg and the new opposite-side entry leg, and those two legs
             # legitimately carry different plans (system exit vs.
             # local-triggered entry). Immutability is preserved per-leg.
-            plan_key = (signal.signal_id, order.order_role)
+            # A watcher fallback is a distinct execution leg even when an
+            # EXIT-family fallback intentionally keeps the EXIT role for
+            # priority/risk routing. Its MARKET plan must not collide with
+            # the original signal's canonical LIMIT exit plan.
+            execution_leg = ("fallback" if (signal.metadata or {}).get(
+                "market_fallback") else "primary")
+            plan_key = (signal.signal_id, order.order_role, execution_leg)
             prior = self._plan_by_signal.get(plan_key)
             if prior is not None and prior != plan:
                 raise RuntimeError(
@@ -205,19 +211,35 @@ class LiveExecutionEngine:
             order.reason = "ORDER_ROLE_INVALID"
             order.updated_at = self._now()
             return order
-        # LIVE entry execution has one permitted route: a locally fired
-        # trigger followed by the configured LIMIT order.  Do not allow a
-        # timeout/recovery path (or a direct caller) to turn an entry into a
-        # MARKET order, even if market-fallback config is accidentally enabled.
-        if role == "FALLBACK_MARKET":
-            order.state = OrderState.REJECTED
-            order.reason = "LIVE_MARKET_ENTRY_DISABLED"
-            order.updated_at = self._now()
-            return order
+        # A market entry is allowed only for a watcher-created fallback after
+        # the originating fired LIMIT has been broker-confirmed cancelled.
+        # The watcher preserves the original trigger and order lineage; this
+        # gateway still rejects direct/unowned market entry attempts below.
         if role in {"ENTRY", "REVERSAL_ENTRY"} and str(
                 getattr(order, "order_type", "") or "").upper() != "LIMIT":
             order.state = OrderState.REJECTED
             order.reason = "LIVE_ENTRY_MUST_BE_LIMIT"
+            order.updated_at = self._now()
+            return order
+        if role == "FALLBACK_MARKET" and str(
+                getattr(order, "order_type", "") or "").upper() != "MARKET":
+            order.state = OrderState.REJECTED
+            order.reason = "FALLBACK_MARKET_MUST_BE_MARKET"
+            order.updated_at = self._now()
+            return order
+        if role == "FALLBACK_MARKET" and not (
+                getattr(order, "original_order_id", None)
+                and getattr(order, "fallback_cancel_confirmed", False)):
+            order.state = OrderState.REJECTED
+            order.reason = "FALLBACK_LIMIT_CANCEL_NOT_CONFIRMED"
+            order.updated_at = self._now()
+            return order
+        if (role in {"EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"}
+                and str(getattr(order, "order_type", "") or "").upper() == "MARKET"
+                and getattr(order, "original_order_id", None)
+                and not getattr(order, "fallback_cancel_confirmed", False)):
+            order.state = OrderState.REJECTED
+            order.reason = "FALLBACK_LIMIT_CANCEL_NOT_CONFIRMED"
             order.updated_at = self._now()
             return order
         if (role in {"ENTRY", "REVERSAL_ENTRY", "EXIT",
@@ -610,6 +632,17 @@ class LiveExecutionEngine:
                     "planned_sl": o.planned_sl,
                     "planned_order_type": o.planned_order_type,
                     "order_role": o.order_role,
+                    "original_order_id": o.original_order_id,
+                    "fallback_cancel_confirmed": o.fallback_cancel_confirmed,
+                    "lifecycle_id": o.lifecycle_id,
+                    "parent_signal_id": o.parent_signal_id,
+                    "parent_position_id": o.parent_position_id,
+                    "position_id": o.position_id,
+                    "position_generation": o.position_generation,
+                    "reversal_parent_signal_id": o.reversal_parent_signal_id,
+                    "trigger_state": o.trigger_state,
+                    "trigger_generation": o.trigger_generation,
+                    "trigger_source": o.trigger_source,
                     "_broker_order_id": getattr(o, "_broker_order_id", None),
                 }
                 for o in self._orders.values()
@@ -692,6 +725,18 @@ class LiveExecutionEngine:
             order.planned_sl = o_data.get("planned_sl")
             order.planned_order_type = o_data.get("planned_order_type")
             order.order_role = o_data.get("order_role")
+            order.original_order_id = o_data.get("original_order_id")
+            order.fallback_cancel_confirmed = bool(
+                o_data.get("fallback_cancel_confirmed", False))
+            order.lifecycle_id = o_data.get("lifecycle_id") or order.trade_id
+            order.parent_signal_id = o_data.get("parent_signal_id") or order.entry_signal_id
+            order.parent_position_id = o_data.get("parent_position_id")
+            order.position_id = o_data.get("position_id") or order.parent_position_id
+            order.position_generation = o_data.get("position_generation")
+            order.reversal_parent_signal_id = o_data.get("reversal_parent_signal_id")
+            order.trigger_state = o_data.get("trigger_state")
+            order.trigger_generation = o_data.get("trigger_generation")
+            order.trigger_source = o_data.get("trigger_source")
             if o_data.get("_broker_order_id"):
                 order._broker_order_id = o_data["_broker_order_id"]
             self._orders[order.order_id] = order

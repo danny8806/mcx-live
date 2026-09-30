@@ -414,7 +414,7 @@ class PositionOwnedSLMonitor:
         Returns a summary dict.
         """
         summary = {"armed": [], "unavailable": [], "dropped_local": [],
-                   "broker_only": []}
+                   "broker_only": [], "awaiting_entry_completion": []}
         rows = list(broker_positions or [])
         consumed: set[int] = set()
 
@@ -447,6 +447,19 @@ class PositionOwnedSLMonitor:
 
             consumed.add(match_idx)
             p = rows[match_idx]
+            if str(getattr(lp, "sl_state", "") or "").upper() == \
+                    "ENTRY_FILL_INCOMPLETE":
+                # A broker-confirmed partial LIMIT fill is real exposure, but
+                # the configured lifecycle explicitly waits for full entry
+                # confirmation (or the one-shot MARKET fallback) before
+                # arming the position SL. Keep the broker row consumed and
+                # preserve the marker for lifecycle reconciliation.
+                summary["awaiting_entry_completion"].append({
+                    "position_id": getattr(lp, "position_id", None),
+                    "strategy_id": sid, "instrument": instrument,
+                    "quantity": int(p.get("quantity") or getattr(lp, "quantity", 0)),
+                })
+                continue
             qty = int(p.get("quantity") or 0)
             stop = getattr(lp, "stop_price", None)
             if not _valid_price(stop) and stop_resolver is not None:

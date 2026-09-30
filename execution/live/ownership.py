@@ -69,7 +69,38 @@ def validate_live_order_ownership(env, order) -> Optional[str]:
             or current.quantity <= 0):
         return "STALE_LIFECYCLE_TRIGGER_REJECTED:position_invalid"
     if current.exit_started:
-        return "POSITION_EXIT_ALREADY_STARTED"
+        # A fallback MARKET is completing the exact EXIT order whose LIMIT
+        # has already been broker-confirmed cancelled. The position's exit
+        # latch must stay set throughout that handoff, so permit only this
+        # explicitly linked recovery leg; an unrelated second exit remains
+        # blocked by the latch.
+        fallback_root_id = getattr(order, "original_order_id", None)
+        fallback_ok = bool(
+            str(getattr(order, "order_type", "") or "").upper() == "MARKET"
+            and fallback_root_id
+            and getattr(order, "fallback_cancel_confirmed", False)
+        )
+        if fallback_ok:
+            execution = getattr(env, "execution_engine", None)
+            root = (execution.get_order(fallback_root_id)
+                    if execution is not None else None)
+            root_state = str(getattr(getattr(root, "state", None), "value",
+                                     getattr(root, "state", ""))).lower()
+            root_role = str(getattr(root, "order_role", "") or "").upper()
+            fallback_ok = bool(
+                root is not None
+                and root_state in {"canceled", "cancelled"}
+                and root_role == role
+                and getattr(root, "parent_position_id", None) == current.position_id
+                and (getattr(root, "lifecycle_id", None) or root.trade_id)
+                    == current.trade_id
+                and str(getattr(root, "side", "")).upper()
+                    == str(getattr(order, "side", "")).upper()
+                and int(getattr(order, "quantity", 0) or 0)
+                    <= int(getattr(current, "quantity", 0) or 0)
+            )
+        if not fallback_ok:
+            return "POSITION_EXIT_ALREADY_STARTED"
     if str(order.side).upper() != ("SELL" if current.is_long else "BUY"):
         return "STALE_LIFECYCLE_TRIGGER_REJECTED:side_mismatch"
     if int(order.quantity or 0) <= 0 or int(order.quantity) > int(current.quantity):

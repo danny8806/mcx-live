@@ -18,6 +18,7 @@ from indicators.dema_atr import DEMAATR
 from strategies.htf_state import HTFState
 from strategies.types import (
     SignalType, StrategyState, Signal, PendingEntry, freeze_signal_context,
+    restored_trigger_metadata,
 )
 from strategies.intent import long_crossover, short_crossover, entry_levels, reversal_levels
 from indicators.shared import (
@@ -62,7 +63,7 @@ class StrategyInstance:
         mid_timeframe: str = "15m",
         htf_timeframe: str = "1h",
         quantity: int = 1,
-        pending_timeout_bars: int = 50,
+        pending_timeout_bars: int = 0,
         capital: float = 300_000.0,
         multiplier: float = 10.0,
     ):
@@ -322,7 +323,8 @@ class StrategyInstance:
         # OHLC values are never used to fire an order.
         expired_pending = None
         if self.pending_entry is not None and self.pending_entry.status == "pending":
-            if self.pending_entry.bars_pending >= self.pending_timeout_bars:
+            if (self.pending_timeout_bars > 0
+                    and self.pending_entry.bars_pending >= self.pending_timeout_bars):
                 expired_pending = self.pending_entry.signal
                 self._cancel_trigger(self.pending_entry)
                 self.pending_entry = None
@@ -331,17 +333,12 @@ class StrategyInstance:
             else:
                 self.pending_entry.bars_pending += 1
 
-        # 2. OPPOSITE CROSSOVER OVERRIDE: cancel old pending/in-flight and
-        # take the new signal on the same bar.  Applies when:
-        #   a) ENTRY_TRIGGERED + no position → a LIMIT rests at the broker
-        #   b) PENDING_LONG / PENDING_SHORT → a trigger is waiting to cross
-        # In both cases the old signal is superseded by the new opposite
-        # crossover.  Strategy state resets to FLAT, then _detect_signal arms
-        # the new pending/limit.  The signal carries cancel_inflight=True so
-        # the engine can terminalize the old durable pending row (if LIVE).
+        # 2. A fresh crossover replaces an ARMED local entry, including a
+        # same-direction crossover with newer candle/DEMA values. Once its
+        # trigger has fired and an order is at Dhan, however, that original
+        # signal owns the limit->market fallback; later signals are ignored.
         if (self.position_side is None
-                and self.state in (StrategyState.ENTRY_TRIGGERED,
-                                   StrategyState.PENDING_LONG,
+                and self.state in (StrategyState.PENDING_LONG,
                                    StrategyState.PENDING_SHORT)):
             cancel_and_reenter = None
             if self._check_long_cross(close, prev_close, htf_val, prev_htf_val,
@@ -643,6 +640,13 @@ class StrategyInstance:
             stop_price=self.stop_price,
             quantity=self.quantity,
         )
+        # LIVE exit admission requires explicit ownership of the currently
+        # open position. Unlike a candle-level entry, a reversal exit must not
+        # reach SignalFlow without the exact lifecycle, position and generation
+        # that its trigger is intended to close.
+        exit_signal.lifecycle_id = self.current_trade_id
+        exit_signal.parent_position_id = self.current_position_id
+        exit_signal.position_generation = self.position_generation
         exit_signal.metadata = {
             "exit": True,
             "pending": True,
@@ -1099,18 +1103,26 @@ class StrategyInstance:
             signal_type = (SignalType(signal_type_value)
                            if signal_type_value in {item.value for item in SignalType}
                            else SignalType.LONG if side == "LONG" else SignalType.SHORT)
+            active = pending_status in ("pending", "waiting_for_flat")
+            restored_metadata = restored_trigger_metadata(
+                pending_entry.get("metadata") or {}
+                if isinstance(pending_entry, dict) else {"pending": True},
+                active=active)
+            restored_timestamp = (
+                (pending_entry.get("timestamp") or
+                 pending_entry.get("signal_candle_start") or
+                 restored_metadata.get("signal_candle_start") or 0.0)
+                if isinstance(pending_entry, dict) else 0.0)
             restored_signal = Signal(
                     signal_type=signal_type,
                     instrument=self.instrument, strategy_id=self.strategy_id,
-                    timestamp=float(pending_entry.get("timestamp", 0.0) or 0.0)
-                    if isinstance(pending_entry, dict) else 0.0,
+                    timestamp=float(restored_timestamp),
                     trigger_price=trigger,
                     stop_price=(pending_entry.get("stop_price") if isinstance(
                         pending_entry, dict) else None) or self.stop_price or 0.0,
                     quantity=int(pending_entry.get("quantity", self.quantity) or self.quantity)
                     if isinstance(pending_entry, dict) else self.quantity,
-                    metadata=dict(pending_entry.get("metadata") or {})
-                    if isinstance(pending_entry, dict) else {"pending": True},
+                    metadata=restored_metadata,
                 )
             if signal_id:
                 restored_signal.signal_id = signal_id

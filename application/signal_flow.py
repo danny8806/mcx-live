@@ -29,6 +29,32 @@ def _strategy_positions_for_risk(signal_type, open_positions) -> int:
 
 
 class SignalFlowMixin:
+    def _retire_fired_live_pending(self, signal, env, reason: str) -> None:
+        """Do not restore an already-fired trigger after a local gate rejects it."""
+        metadata = getattr(signal, "metadata", None) or {}
+        if (not env.is_live or bool(metadata.get("exit"))
+                or str(metadata.get("trigger_state", "")).upper() != "FIRED"):
+            return
+        signal_id = str(getattr(signal, "signal_id", "") or "")
+        if not signal_id:
+            return
+        persistence = getattr(env, "persistence", None)
+        if persistence is not None:
+            try:
+                persistence.terminalize_pending_order(
+                    signal_id, status="resolved", reason=reason)
+            except Exception as exc:
+                log.error("[Engine] fired pending trigger cleanup failed for %s: %s",
+                          signal_id, exc)
+                self.publish_event("pending_trigger_cleanup_failed", {
+                    "signal_id": signal_id, "strategy_id": signal.strategy_id,
+                    "reason": reason, "error": str(exc),
+                    "execution_mode": env.mode,
+                }, env_name=env.name)
+        registry = getattr(env, "pending_triggers", None)
+        if registry is not None:
+            registry.remove_signal(signal_id)
+
     def _preserve_position_after_exit_block(self, signal, env, *, cancel_reversal=False,
                                             stop_exit_blocked=False) -> None:
         """Keep exposure and its local SL state when an exit is gated off."""
@@ -363,6 +389,8 @@ class SignalFlowMixin:
                     })
                 except Exception as e:
                     log.warning("[Engine] rollover telegraph failed: %s", e)
+                self._retire_fired_live_pending(
+                    signal, env, "entry_blocked_contract_rollover")
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
             # Entries must pass the strategy's own gate AND the legacy enabled
@@ -375,6 +403,7 @@ class SignalFlowMixin:
                           else "close_only")
                 self._publish_gate_block(signal, reason,
                                          {"gate": gates.to_dict()}, env)
+                self._retire_fired_live_pending(signal, env, reason)
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
             # §38 — never open exposure on a feed we already know is dead.
@@ -394,6 +423,8 @@ class SignalFlowMixin:
                     {"env": env.name}, env)
                 log.error("[Engine] entry BLOCKED: env %s has no confirmed "
                           "broker position state", env.name)
+                self._retire_fired_live_pending(
+                    signal, env, "startup_reconciliation_failed")
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
             health = getattr(self, "market_data_health", None)
@@ -406,6 +437,7 @@ class SignalFlowMixin:
                      "stale_after_seconds": health.stale_after}, env)
                 log.error("[Engine] entry BLOCKED: market data unhealthy for %s "
                           "(age=%s)", signal.instrument, age)
+                self._retire_fired_live_pending(signal, env, "market_data_unhealthy")
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
             ok, reject_reason = self._validate_strategy_risk_gate(signal, env, gates)
@@ -424,6 +456,7 @@ class SignalFlowMixin:
                     })
                 except Exception as e:
                     log.warning("[Engine] telegram risk alert failed: %s", e)
+                self._retire_fired_live_pending(signal, env, reject_reason)
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
 
@@ -458,6 +491,8 @@ class SignalFlowMixin:
             safe_mode = env.safe_mode if env.safe_mode is not None else self.safe_mode
             market_status = env.market_status if env.market_status is not None else self.market_status
             if safe_mode.is_active or not market_status.is_trading_allowed:
+                self._retire_fired_live_pending(
+                    signal, env, "safe_mode_or_market_closed")
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
             account = env.account_engines.get(signal.strategy_id)
@@ -486,6 +521,7 @@ class SignalFlowMixin:
                 else:
                     log.warning("Order rejected for %s (%s): %s",
                                 signal.strategy_id, env.name, reason)
+                    self._retire_fired_live_pending(signal, env, reason)
                     self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                     self.publish_event("order_rejected", {"signal_id": signal.signal_id,
                         "strategy_id": signal.strategy_id, "instrument": signal.instrument,
@@ -499,19 +535,27 @@ class SignalFlowMixin:
         # restart, or already EXPIRED/CANCELLED_BY_REVERSAL) blocks placement
         # BEFORE any trade is born, so no orphan trade is created.
         live_pending = None
-        if env.mode == "LIVE" and not is_exit:
+        if env.mode == "LIVE" and not is_exit and not is_pending:
             live_pending = self._live_pending_row(env, signal)
-            if live_pending is not None:
-                pend_status = (live_pending.get("status") or "").lower()
-                if pend_status != PendingOrderState.ARMED.value:
-                    self.publish_event("pending_order_blocked", {
-                        "signal_id": signal.signal_id,
-                        "pending_order_id": live_pending.get("pending_order_id"),
-                        "state": pend_status,
-                        "reason": "durable_pending_not_armed"
-                                    if pend_status else "durable_pending_missing",
-                        "execution_mode": env.mode}, env_name=env.name)
-                    return
+            pend_status = (live_pending.get("status") or "").lower() \
+                if live_pending is not None else ""
+            if live_pending is None or pend_status != PendingOrderState.ARMED.value:
+                self.publish_event("pending_order_blocked", {
+                    "signal_id": signal.signal_id,
+                    "pending_order_id": (live_pending or {}).get("pending_order_id"),
+                    "state": pend_status,
+                    "reason": "durable_pending_not_armed"
+                                if pend_status else "durable_pending_missing",
+                    "execution_mode": env.mode}, env_name=env.name)
+                # ENTRY_SENT is a duplicate/replay while its original Dhan
+                # order owns the signal. Preserve that lifecycle; a missing
+                # or terminal row cannot safely create a fresh broker order.
+                if pend_status != PendingOrderState.ENTRY_SENT.value:
+                    self._retire_fired_live_pending(
+                        signal, env, "durable_pending_not_armed")
+                    self._reset_strategy_state(
+                        signal.strategy_id, env_name=env.name)
+                return
 
         if is_exit:
             position = next((p for p in position_manager.get_positions_by_strategy(signal.strategy_id)
@@ -558,9 +602,17 @@ class SignalFlowMixin:
                             side = str(signal.side or signal.signal_type.value).upper()
                             strategy.pending_entry = PendingEntry(
                                 signal=signal, trigger_price=signal.trigger_price,
-                                side=side, status="pending", created_at=time.time())
-                            strategy.state = (StrategyState.PENDING_LONG if side == "LONG"
-                                              else StrategyState.PENDING_SHORT)
+                                side=side, status="waiting_for_flat",
+                                created_at=time.time())
+                            md = signal.metadata or {}
+                            md.update(pending=True, triggered=False,
+                                      trigger_state="ARMED")
+                            signal.metadata = md
+                            strategy.state = StrategyState.EXIT_ORDER_SUBMITTED
+                            strategy._fired_trigger_signal_ids.pop(
+                                signal.signal_id, None)
+                            if strategy._last_fired_trigger_signal_id == signal.signal_id:
+                                strategy._last_fired_trigger_signal_id = None
                             registry = getattr(env, "pending_triggers", None)
                             if registry is not None:
                                 registry.sync_strategy(strategy)
@@ -637,6 +689,8 @@ class SignalFlowMixin:
                     if registry is not None:
                         registry.sync_strategy(strategy)
             else:
+                self._retire_fired_live_pending(
+                    signal, env, "entry_order_not_created")
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
             return
         if is_exit and position is not None and order.state.value in (

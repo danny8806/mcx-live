@@ -116,7 +116,7 @@ def test_startup_restore_rebuilds_armed_trigger_from_database():
         "strategy_id": "gold_02", "instrument": "GOLDM", "direction": "LONG",
         "trigger_price": 147100.0, "quantity": 100, "status": "armed",
         "trigger_state": "ARMED", "trigger_generation": 3,
-        "trigger_source": "market_websocket_ltp", "signal_timestamp": 10.0,
+        "trigger_source": "market_websocket_ltp", "signal_timestamp": 0.0,
     }
 
     class _Persistence:
@@ -129,11 +129,17 @@ def test_startup_restore_rebuilds_armed_trigger_from_database():
             return {
                 "signal_id": signal_id, "strategy_id": "gold_02",
                 "instrument": "GOLDM", "side": "LONG", "trigger_price": 147100.0,
-                "stop_price": 146719.0, "quantity": 100, "signal_timestamp": 10.0,
-                "candle_timestamp": 10.0, "open": 146800.0, "high": 147100.0,
+                "stop_price": 146719.0, "quantity": 100, "signal_timestamp": 0.0,
+                "candle_timestamp": 1700000000.0, "open": 146800.0, "high": 147100.0,
                 "low": 146721.0, "close": 146950.0, "htf_value": 146915.5,
                 "mid_value": 146873.6, "fast_dema": 146873.6, "fast_atr": 268.2,
-                "signal_metadata": None,
+                # Forensic signal metadata can retain one-shot candle actions.
+                # They must not be replayed on the restored tick-trigger path.
+                "signal_metadata": ('{"cancel_inflight": true, '
+                                     '"cancel_inflight_consumed": true, '
+                                     '"old_pending_id": "prior", '
+                                     '"pending_termination": "expired", '
+                                     '"trigger_state": "FIRED", "triggered": true}'),
             }
 
     strategy = create_gold_15m(strategy_id="gold_02", instrument="GOLDM", quantity=1)
@@ -148,9 +154,18 @@ def test_startup_restore_rebuilds_armed_trigger_from_database():
     assert pending.trigger_price == 147100.0
     assert pending.signal.stop_price == 146719.0
     assert pending.signal.quantity == 100
+    assert pending.signal.timestamp == 1700000000.0
+    assert pending.signal.metadata["trigger_state"] == "ARMED"
+    assert pending.signal.metadata["pending"] is True
+    assert pending.signal.metadata["triggered"] is False
+    for transient in ("cancel_inflight", "cancel_inflight_consumed",
+                      "old_pending_id", "pending_termination", "cancel_only"):
+        assert transient not in pending.signal.metadata
     assert strategy._trigger_generation == 3
     assert env.pending_triggers.entry_for("gold_02") is pending
     assert env.pending_triggers.live_row(signal_id)["status"] == "armed"
+    assert strategy.on_tick(147100.0, 11.0) is pending.signal
+    assert strategy.is_fired_trigger_signal(signal_id)
 
 
 def test_startup_restore_does_not_resurrect_terminal_snapshot_trigger():
@@ -277,6 +292,63 @@ def test_live_pending_order_lookup_is_memory_only_after_restore():
     row = PersistenceFlowMixin()._live_pending_row(env, signal)
 
     assert row["status"] == "armed"
+
+
+def test_live_row_cache_drops_entry_sent_and_terminal_history():
+    registry = PendingTriggerRegistry()
+    registry.cache_live_row({"signal_id": "armed", "status": "armed"})
+    assert registry.live_row("armed") is not None
+    registry.update_live_row("armed", {"status": "entry_sent"})
+    assert registry.live_row("armed") is None
+
+    registry.cache_live_row({"signal_id": "old", "status": "resolved"})
+    registry.cache_live_row({"signal_id": "cancelled", "status": "cancelled_by_reversal"})
+    assert registry.live_row("old") is None
+    assert registry.live_row("cancelled") is None
+
+
+def test_restore_queries_only_armed_rows_and_checks_snapshot_by_id(tmp_path):
+    persistence = PersistenceManager(
+        state_path=str(tmp_path / "state.json"),
+        db_path=str(tmp_path / "pending.db"), execution_mode="LIVE")
+    common = {
+        "strategy_id": "gold_02", "instrument": "GOLDM", "direction": "LONG",
+        "side": "LONG", "order_type": "LIMIT", "trigger_price": 101.0,
+        "quantity": 1, "trigger_state": "ARMED", "signal_timestamp": 1.0,
+    }
+    for index in range(25):
+        sid = f"old-{index}"
+        persistence.save_pending_order({
+            **common, "signal_id": sid, "pending_order_id": sid,
+            "status": "resolved",
+        })
+    strategy = create_gold_15m(strategy_id="gold_02", instrument="GOLDM", quantity=1)
+    stale = Signal(signal_type=SignalType.LONG, instrument="GOLDM",
+                   strategy_id="gold_02", timestamp=1, trigger_price=101.0,
+                   stop_price=95.0, quantity=1)
+    stale.signal_id = "old-0"
+    strategy.pending_entry = PendingEntry(
+        signal=stale, trigger_price=101.0, side="LONG", status="pending")
+    persistence.save_pending_order({
+        **common, "signal_id": "active", "pending_order_id": "active",
+        "status": "armed",
+    })
+    persistence.save_signal({
+        "signal_id": "active", "strategy_id": "gold_02", "instrument": "GOLDM",
+        "side": "LONG", "signal_type": "entry", "timestamp": 1.0,
+        "trigger_price": 101.0, "stop_price": 95.0, "quantity": 1,
+        "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5,
+        "signal_metadata": {},
+    })
+    env = Environment(name="live", mode="LIVE", is_live=True,
+                      strategies={"gold_02": strategy}, persistence=persistence)
+
+    assert PersistenceFlowMixin()._restore_live_pending_triggers(env) == 1
+    assert strategy.pending_entry is not None
+    assert strategy.pending_entry.signal.signal_id == "active"
+    assert env.pending_triggers.live_row("active")["status"] == "armed"
+    assert env.pending_triggers.live_row("old-0") is None
+    persistence.close()
 
 
 def test_signal_metadata_schema_roundtrips_reversal_links(tmp_path):

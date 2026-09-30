@@ -152,22 +152,11 @@ class PricePreset:
         if is_exit:
             if str(metadata.get("trigger_state", "")).upper() != "FIRED":
                 raise ValueError("exit must be triggered before limit planning")
-            # A gap can cross a stop before the order is built. A SELL limit
-            # above the observed price (or BUY limit below it) would rest
-            # unfilled, so use the worse of the stop and observed price.
             reason = str(metadata.get("exit_reason") or "").lower()
             is_sl = reason in ("stop_loss_hit", "stop_loss")
             level = None
             if is_sl and signal.stop_price:
-                observed = metadata.get("trigger_ltp", signal.trigger_price)
-                if observed is None:
-                    observed = signal.trigger_price
-                observed = float(observed)
-                if not math.isfinite(observed) or observed <= 0:
-                    raise ValueError("stop exit observed price is invalid")
-                level = (min(float(signal.stop_price), observed)
-                         if side_u == "SELL" else
-                         max(float(signal.stop_price), observed))
+                level = float(signal.stop_price)
             if not level:
                 # Never improvise a protective price: without a stop there is
                 # nothing to protect against, so fall back to the detected
@@ -205,13 +194,18 @@ class PricePreset:
         tick = float(self.tick_size)
         if tick <= 0:
             raise ValueError("entry tick size must be positive")
+        reversal_after_exit = bool(
+            metadata.get("entry_after_confirmed_reversal_exit"))
+        market_fallback = bool(metadata.get("market_fallback"))
         if side_u == "BUY":
-            if observed < float(signal.trigger_price):
+            if (not reversal_after_exit and not market_fallback
+                    and observed < float(signal.trigger_price)):
                 raise ValueError("long entry price has not crossed the trigger")
             price = math.ceil((observed + self.entry_offset) / tick) * tick
             kind = "long_entry"
         else:
-            if observed > float(signal.trigger_price):
+            if (not reversal_after_exit and not market_fallback
+                    and observed > float(signal.trigger_price)):
                 raise ValueError("short entry price has not crossed the trigger")
             price = math.floor((observed - self.entry_offset) / tick) * tick
             kind = "short_entry"

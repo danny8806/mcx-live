@@ -592,19 +592,28 @@ class DhanRESTClient:
 
         for attempt in range(self.max_retries):
             try:
-                r = resp(
-                    f"{self.base_url}{path}",
-                    json=payload if payload is not None else {},
-                    headers=self._headers(),
-                    timeout=30,
-                )
+                request_kwargs = {"headers": self._headers(), "timeout": 30}
+                # The Dhan v2 DELETE /orders/{id} contract has no request
+                # body. Avoid sending an artificial `{}` JSON body on cancel.
+                if payload is not None:
+                    request_kwargs["json"] = payload
+                r = resp(f"{self.base_url}{path}", **request_kwargs)
             except requests.RequestException as e:
                 last = e
                 time.sleep(1.0)
                 continue
 
-            if r.status_code == 200:
-                j = r.json()
+            # Dhan documents DELETE order cancellation as HTTP 202 Accepted;
+            # it may return an empty body. Treating 202 as an error causes
+            # needless retries and prevents the caller from doing its required
+            # GET /orders/{id} confirmation before a fallback order.
+            if r.status_code in (200, 202):
+                try:
+                    j = r.json() if getattr(r, "text", "") else {}
+                except (ValueError, json.JSONDecodeError):
+                    j = {}
+                if not isinstance(j, dict):
+                    j = {}
                 if j.get("errorType") == "Authentication_Failed":
                     if not auth_retried:
                         auth_retried = True

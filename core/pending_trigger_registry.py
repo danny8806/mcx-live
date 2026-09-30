@@ -10,6 +10,12 @@ from typing import Any
 
 
 class PendingTriggerRegistry:
+    _ACTIVE_LIVE_STATES = {"pending", "armed"}
+    _TERMINAL_LIVE_STATES = {
+        "entry_sent", "expired", "cancelled_by_reversal", "resolved",
+        "filled", "rejected", "cancelled", "canceled",
+    }
+
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._entry: dict[str, Any] = {}
@@ -56,7 +62,11 @@ class PendingTriggerRegistry:
         signal_id = row.get("signal_id") or row.get("pending_order_id")
         if signal_id:
             with self._lock:
-                self._live_rows[str(signal_id)] = dict(row)
+                status = str(row.get("status") or "").lower()
+                if status in self._ACTIVE_LIVE_STATES or not status:
+                    self._live_rows[str(signal_id)] = dict(row)
+                else:
+                    self._live_rows.pop(str(signal_id), None)
 
     def live_row(self, signal_id: str) -> dict | None:
         with self._lock:
@@ -68,10 +78,15 @@ class PendingTriggerRegistry:
             row = self._live_rows.get(str(signal_id))
             if row is not None:
                 row.update(updates)
+                status = str(row.get("status") or "").lower()
+                if status in self._TERMINAL_LIVE_STATES:
+                    self._live_rows.pop(str(signal_id), None)
 
     def expire_live_row(self, signal_id: str, status: str, reason: str) -> None:
         with self._lock:
             row = self._live_rows.get(str(signal_id))
             if row is not None:
                 row.update(status=status, expired_reason=reason)
+                if str(status).lower() in self._TERMINAL_LIVE_STATES:
+                    self._live_rows.pop(str(signal_id), None)
 

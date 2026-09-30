@@ -34,6 +34,21 @@ class StrategyState(Enum):
     EXIT_ORDER_SUBMITTED = "exit_order_submitted"
 
 
+def restored_trigger_metadata(metadata: Optional[dict], *, active: bool) -> dict:
+    """Normalize persisted trigger metadata before resuming after restart.
+
+    Candle-time cancellation markers are one-shot control messages. They may
+    remain in forensic signal metadata, but must not replay on a later tick.
+    """
+    restored = dict(metadata or {})
+    for key in ("cancel_inflight", "cancel_inflight_consumed", "old_pending_id",
+                "pending_termination", "cancel_only"):
+        restored.pop(key, None)
+    if active:
+        restored.update(pending=True, triggered=False, trigger_state="ARMED")
+    return restored
+
+
 class OrderState(Enum):
     """Order lifecycle states."""
     CREATED = "created"
@@ -173,7 +188,10 @@ def resolve_order_role(signal: Optional['Signal'], *, exit_reason: Optional[str]
     reason = exit_reason
     if signal is not None:
         md = signal.metadata or {}
-        if md.get("market_fallback"):
+        # A watcher-created fallback keeps the original signal id but
+        # represents a distinct order leg and price plan. Resolve its role
+        # before engine plan immutability is checked.
+        if md.get("market_fallback") and not md.get("exit") and not md.get("is_exit"):
             return "FALLBACK_MARKET"
         # The local position-owned SL exit is an ORDINARY exit order: the stop
         # is monitored in-process and the exit is submitted directly to the

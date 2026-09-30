@@ -1450,6 +1450,11 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                     # once (kill the ≤2 s poll lag), round-tripping through
                     # the same router the poller uses.
                     on_fills=env.sync_service.route_fills,
+                    # Watcher-created fallback orders do not pass through
+                    # SignalFlow; persist their order row before submission so
+                    # broker fills satisfy the same DB lineage constraints.
+                    on_order=lambda order, signal, _env=env: self._persist_order(
+                        order, signal, env_name=_env.name),
                 )
             except Exception as e:
                 log.error("[Engine] order watcher init failed for %s: %s", name, e)
@@ -2040,6 +2045,21 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 else:
                     # An unattributable broker position keeps the gate shut too.
                     self._reconciled_envs.discard(env.name)
+                if sl_summary.get("status") == "reconciled" and not \
+                        sl_summary.get("orphan_exposure"):
+                    # The old reversal exit may be filled before Dhan's
+                    # position endpoint reports flat. Keep its opposite entry
+                    # parked until this broker-authoritative reconciliation,
+                    # then submit it immediately (there is no second trigger).
+                    for sid, strategy in list(env.strategies.items()):
+                        pending = getattr(strategy, "pending_entry", None)
+                        signal = getattr(pending, "signal", None)
+                        if (pending is not None
+                                and getattr(pending, "status", None)
+                                    == "waiting_for_flat"
+                                and bool((getattr(signal, "metadata", None) or {})
+                                         .get("is_reversal_entry"))):
+                            self._activate_reversal_entry_after_flat(env, sid)
             with self._lock:
                 for sid, strategy in list(env.strategies.items()):
                     open_pos = next((

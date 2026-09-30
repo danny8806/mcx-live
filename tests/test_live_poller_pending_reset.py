@@ -2,7 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from execution.live.poller import LiveBrokerPoller, _terminal_entry_matches_pending
+from execution.live.poller import (
+    LiveBrokerPoller, _has_market_fallback_child,
+    _terminal_entry_matches_pending,
+)
 
 
 def test_default_reconciliation_interval_is_fast_for_broker_flat_release():
@@ -70,3 +73,16 @@ def test_missing_order_lineage_cannot_reset_a_pending_trigger():
     order = SimpleNamespace(entry_signal_id=None, parent_signal_id=None)
 
     assert not _terminal_entry_matches_pending(strategy, order)
+
+
+@pytest.mark.parametrize("child_state", ["submitted", "partially_filled", "rejected"])
+def test_canceled_reversal_limit_is_not_terminal_while_fallback_child_exists(child_state):
+    parent = SimpleNamespace(order_id="reversal-limit", order_type="LIMIT",
+                             order_role="REVERSAL_EXIT", state="canceled")
+    child = SimpleNamespace(order_id="reversal-market",
+                            original_order_id="reversal-limit",
+                            order_type="MARKET", order_role="REVERSAL_EXIT",
+                            state=child_state)
+
+    assert _has_market_fallback_child(
+        {parent.order_id: parent, child.order_id: child}, parent)

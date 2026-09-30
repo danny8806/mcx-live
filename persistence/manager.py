@@ -687,6 +687,26 @@ class PersistenceManager:
             rows = conn.execute(sql + " ORDER BY created_at", params).fetchall()
             return [dict(r) for r in rows]
 
+    def get_pending_order(self, signal_id: str,
+                          execution_mode: Optional[str] = None) -> Optional[dict]:
+        """Fetch only the newest pending row for one signal.
+
+        Startup uses this to reject a stale in-memory trigger without loading
+        the entire historical pending_orders table into RAM.
+        """
+        sql = ("SELECT * FROM pending_orders WHERE "
+               "(signal_id = ? OR pending_order_id = ?)")
+        params: list[Any] = [str(signal_id), str(signal_id)]
+        if execution_mode is not None:
+            sql += " AND execution_mode = ?"
+            params.append(str(execution_mode).upper())
+        sql += " ORDER BY created_at DESC LIMIT 1"
+        with self._lock:
+            conn = self._get_conn()
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(sql, params).fetchone()
+            return dict(row) if row else None
+
     def get_order_by_broker_order_id(self, broker_order_id: str) -> Optional[dict]:
         """Resolve the newest local order row by broker_order_id (F2 tier-3)."""
         with self._lock:

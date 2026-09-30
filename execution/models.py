@@ -63,6 +63,7 @@ class Order:
     position_id: Optional[str] = None
     position_generation: Optional[int] = None
     original_order_id: Optional[str] = None
+    fallback_cancel_confirmed: bool = False
     reversal_parent_signal_id: Optional[str] = None
     trigger_state: Optional[str] = None
     trigger_generation: Optional[int] = None

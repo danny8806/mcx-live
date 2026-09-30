@@ -94,7 +94,7 @@ def test_order_watcher_takes_its_budget_from_the_live_section():
         "live": {
             "order_watcher": {
                 "max_reprices": 2,
-                "market_fallback_enabled": False,
+                "market_fallback_enabled": True,
                 "limit_skip_policy": {"enabled": True},
             }
         }
@@ -102,7 +102,7 @@ def test_order_watcher_takes_its_budget_from_the_live_section():
     watcher = OrderWatcher(config=Config())
 
     assert watcher._tick_cfg["max_reprices"] == 2          # default is 3
-    assert watcher._tick_cfg["market_fallback_enabled"] is False
+    assert watcher._tick_cfg["market_fallback_enabled"] is True
     assert watcher._tick_cfg["limit_skip_enabled"] is True
 
 

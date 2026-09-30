@@ -405,7 +405,7 @@ def test_limit_fallback_uses_only_remaining_quantity_and_unknown_blocks_market()
         strategy_id="s1", trade_id="trade-1", lifecycle_id="trade-1",
         signal_id="signal-1", instrument="GOLDM", side="BUY",
         order_role="ENTRY", requested_quantity=10, filled_quantity=3,
-        remaining_quantity=7,
+            remaining_quantity=7, current_market_price=100.0,
         status="PARTIALLY_FILLED", extra={
             "trigger_state": "FIRED", "trigger_generation": 1,
             "trigger_source": "market_websocket_ltp",
@@ -428,6 +428,159 @@ def test_limit_fallback_uses_only_remaining_quantity_and_unknown_blocks_market()
     assert result["ok"] is False
     assert result["error"] == "missing_broker_order_id_blocks_market"
     assert engine.submitted == []
+
+
+def test_first_dhan_pending_confirmation_immediately_selects_market_fallback():
+    watcher = OrderWatcher(engine=SimpleNamespace(_orders={}), config={
+        "live": {"order_watcher": {
+            "market_fallback_enabled": True,
+            "market_fallback_timeout_ms": 0,
+        }}
+    })
+    rec = OrderWatchRecord(
+        internal_order_id="limit-2", broker_order_id="broker-2",
+        order_role="ENTRY", status="SUBMITTED", submitted_at=10.0,
+        requested_quantity=1, remaining_quantity=1, rest_verified=True,
+    )
+
+    assert watcher._decide(rec, "A_PENDING_BUT_VALID", now=10.0) == \
+        "MARKET_FALLBACK"
+
+
+def test_partial_limit_fill_waits_for_market_fallback_then_protects_actual_qty():
+    engine = object.__new__(TradingEngine)
+    events = []
+    armed = []
+    engine.publish_event = lambda event, payload, **kw: events.append((event, payload))
+    engine._persist_position = lambda *_a, **_k: None
+    engine._arm_position_sl = lambda _env, position, source="": (
+        armed.append((position.quantity, source)) or "ARMED")
+
+    limit = SimpleNamespace(order_id="limit-1", original_order_id=None,
+                            order_role="ENTRY", quantity=10,
+                            state=OrderState.PARTIALLY_FILLED)
+    broker = SimpleNamespace(_orders={"limit-1": limit},
+                             get_order=lambda order_id: broker._orders.get(order_id))
+    env = SimpleNamespace(execution_engine=broker, mode="LIVE", name="live")
+    position = SimpleNamespace(position_id="P1", entry_order_id="limit-1",
+                               quantity=3, sl_state=None, sl_protected_at=None)
+
+    assert engine._protect_entry_fill_if_ready(
+        env, position, limit, source="test") is False
+    assert position.sl_state == "ENTRY_FILL_INCOMPLETE"
+    assert armed == []
+
+    # The broker-confirmed fallback owns only the remainder. Its first partial
+    # fill arms the actual position quantity and alerts that the target is not
+    # fully filled; the watcher must not create another fallback.
+    fallback = SimpleNamespace(order_id="market-1", original_order_id="limit-1",
+                               order_role="FALLBACK_MARKET", quantity=7,
+                               state=OrderState.PARTIALLY_FILLED)
+    broker._orders[fallback.order_id] = fallback
+    position.quantity = 5
+    assert engine._protect_entry_fill_if_ready(
+        env, position, fallback, source="test") == "ARMED"
+    assert armed == [(5, "market_fallback_fill")]
+    assert any(event == "entry_quantity_underfilled" for event, _ in events)
+
+
+def test_real_price_planner_accepts_fired_market_fallback_at_latest_ltp():
+    watcher = OrderWatcher(quote_fn=lambda _instrument: 104.2)
+    rec = OrderWatchRecord(
+        internal_order_id="limit-1", strategy_id="s1", trade_id="t1",
+        lifecycle_id="t1", signal_id="s1-signal", instrument="GOLDM",
+        side="BUY", order_role="ENTRY", order_type="LIMIT",
+        trigger_price=101.0, requested_quantity=1, remaining_quantity=1,
+        current_market_price=104.2,
+        extra={"trigger_state": "FIRED", "trigger_generation": 4,
+               "trigger_source": "market_websocket_ltp"},
+    )
+    signal = watcher._fresh_market_entry(rec, quantity=1)
+    plan = PricePreset(entry_offset=2.0, tick_size=1.0).plan_for(signal, "BUY")
+
+    assert signal.metadata["triggered"] is True
+    assert signal.metadata["trigger_state"] == "FIRED"
+    assert signal.metadata["trigger_ltp"] == 104.2
+    assert plan.price == 107.0  # ceil(latest LTP + configured offset)
+
+    # The original LIMIT and fallback share the signal id but have separate
+    # role-scoped immutable price plans in the actual execution engine.
+    engine = LiveExecutionEngine(
+        CountingBroker(), price_preset=PricePreset(entry_offset=2.0, tick_size=1.0))
+    original_signal = _signal("LONG", strategy="s1", signal_id="s1-signal")
+    original_signal.metadata.update(
+        triggered=True, trigger_state="FIRED", trigger_ltp=101.0)
+    original = engine.create_order(original_signal, trade_id="t1")
+    fallback = engine.create_order(signal, trade_id="t1")
+    assert original.order_role == "ENTRY"
+    assert fallback.order_role == "FALLBACK_MARKET"
+    assert fallback.price == 107.0
+
+
+def test_market_fallback_parent_confirmation_survives_engine_snapshot_restore():
+    broker = CountingBroker()
+    engine = LiveExecutionEngine(broker)
+    signal = _signal("LONG", strategy="s1", lifecycle="t1",
+                     signal_id="fallback-signal")
+    signal.metadata.update(market_fallback=True, triggered=True,
+                           trigger_state="FIRED", trigger_ltp=101.0)
+    order = engine.create_order(signal, trade_id="t1")
+    order.order_type = "MARKET"
+    order.order_role = "FALLBACK_MARKET"
+    order.original_order_id = "limit-1"
+    order.fallback_cancel_confirmed = True
+    order.lifecycle_id = "t1"
+    order.parent_signal_id = signal.signal_id
+    snapshot = engine.snapshot()
+
+    restored = LiveExecutionEngine(CountingBroker())
+    restored.restore(snapshot)
+    copy = restored.get_order(order.order_id)
+    assert copy.order_role == "FALLBACK_MARKET"
+    assert copy.order_type == "MARKET"
+    assert copy.original_order_id == "limit-1"
+    assert copy.fallback_cancel_confirmed is True
+    assert copy.trigger_state == "FIRED"
+
+
+def test_partial_market_exit_is_cancelled_once_and_never_retried():
+    order = SimpleNamespace(
+        order_id="market-exit", strategy_id="s1", trade_id="t1",
+        lifecycle_id="t1", entry_signal_id="exit-signal",
+        instrument="GOLDM", side="SELL", quantity=10, filled_quantity=4,
+        average_fill_price=100.0, order_type="MARKET", order_role="EXIT",
+        original_order_id="limit-exit", state=OrderState.PARTIALLY_FILLED,
+        _broker_order_id="B-market-exit", parent_position_id="P1",
+        position_generation=1,
+    )
+
+    class _Engine:
+        def __init__(self):
+            self._orders = {"market-exit": order}
+            self.cancels = 0
+
+        def get_fills(self):
+            return []
+
+        def cancel_order(self, order_id):
+            assert order_id == "market-exit"
+            self.cancels += 1
+            order.state = OrderState.CANCELED
+            return True
+
+    failures = []
+    engine = _Engine()
+    watcher = OrderWatcher(
+        engine=engine,
+        config={"live": {"order_watcher": {"market_fallback_enabled": True}}},
+        on_failure_event=failures.append,
+    )
+
+    watcher.scan(now=100.0)
+    watcher.scan(now=101.0)
+
+    assert engine.cancels == 1
+    assert any(e["event_type"] == "MARKET_FALLBACK_PARTIAL_FILL" for e in failures)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

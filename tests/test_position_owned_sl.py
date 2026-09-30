@@ -474,8 +474,8 @@ def test_startup_arms_only_broker_confirmed_positions():
     assert h.processed == []
 
 
-def test_broker_flat_external_close_releases_strategy_and_preserves_reversal():
-    """A manual/Dhan close must release the old position and unblock reversal."""
+def test_broker_flat_external_close_releases_strategy_and_cancels_reversal():
+    """A manual/Dhan close retires the parked reversal with the old position."""
     h = Harness()
     position = make_position(pid="P-EXTERNAL", stop=90.0)
     strategy = FakeStrategy("S1", "NIFTY")
@@ -491,10 +491,7 @@ def test_broker_flat_external_close_releases_strategy_and_preserves_reversal():
         reset_calls.append((strategy_id, keep_pending, env_name))
         strategy.position_side = None
         strategy.stop_price = None
-        if keep_pending:
-            pending.status = "pending"
-        else:
-            strategy.pending_entry = None
+        strategy.pending_entry = None
         h._sl_monitor(env).close(position.position_id)
 
     h._reset_strategy_state = reset_strategy
@@ -503,10 +500,9 @@ def test_broker_flat_external_close_releases_strategy_and_preserves_reversal():
     assert [row["position_id"] for row in summary["dropped_local"]] == ["P-EXTERNAL"]
     assert env.position_manager.get_position("P-EXTERNAL").is_open is False
     assert env.sl_monitor.armed_ids() == []
-    assert reset_calls == [("S1", True, "LIVE")]
+    assert reset_calls == [("S1", False, "LIVE")]
     assert strategy.position_side is None
-    assert strategy.pending_entry is pending
-    assert pending.status == "pending"
+    assert strategy.pending_entry is None
 
 
 def test_startup_treats_the_transports_dhan_fan_out_as_one_net():
