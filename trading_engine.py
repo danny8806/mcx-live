@@ -650,6 +650,12 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         return gate.to_dict()
 
     def control_strategy(self, strategy_id: str, action: str) -> dict:
+        # A tick, broker fill, or order-book update can otherwise replace a
+        # pending trigger between its durable retirement and memory cleanup.
+        with getattr(self, "_lock", threading.RLock()):
+            return self._control_strategy_locked(strategy_id, action)
+
+    def _control_strategy_locked(self, strategy_id: str, action: str) -> dict:
         """High-level operator control for ONE strategy (spec §5).
 
         start          -> fully open (entries + all exit classes).
@@ -710,8 +716,32 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 if any(pos.is_open for pos in open_positions):
                     return {"success": False, "strategy_id": strategy_id, "action": action,
                             "error": "Cannot pause a strategy with an open position; close it first."}
+                env = next((candidate for candidate in getattr(self, "_envs", {}).values()
+                            if candidate.strategies.get(strategy_id) is strat), None)
+                pending = getattr(strat, "pending_entry", None)
+                pending_id = getattr(getattr(pending, "signal", None), "signal_id", None)
+                if pending_id and env is not None and getattr(env, "is_live", False):
+                    persistence = getattr(env, "persistence", None)
+                    if persistence is None:
+                        return {"success": False, "strategy_id": strategy_id, "action": action,
+                                "error": "Cannot pause: LIVE pending trigger store unavailable."}
+                    try:
+                        retired = persistence.terminalize_pending_order(
+                            str(pending_id), status="resolved", reason="operator_paused")
+                        if not retired:
+                            row = persistence.get_pending_order(
+                                str(pending_id), execution_mode="LIVE")
+                            if row is None or str(row.get("status", "")).lower() not in (
+                                    "resolved", "expired", "cancelled_by_reversal",
+                                    "cancelled_by_indicator_change"):
+                                raise RuntimeError("durable trigger remained active")
+                    except Exception as exc:
+                        return {"success": False, "strategy_id": strategy_id, "action": action,
+                                "error": f"Cannot pause pending trigger: {exc}"}
+                if pending is not None:
+                    strat._cancel_trigger(pending)
                 strat.pending_entry = None
-                registry = getattr(env, "pending_triggers", None)
+                registry = getattr(env, "pending_triggers", None) if env is not None else None
                 if registry is not None:
                     registry.sync_strategy(strat)
                 strat.enabled = False

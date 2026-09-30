@@ -28,6 +28,7 @@ interface DataContextType {
   healthComponents: any[];
   overallHealth: string;
   reconciliation: any;
+  brokerPnl: any;
   settings: any;
   audit: any[];
   alerts: any[];
@@ -59,7 +60,7 @@ const DEFAULT_STATE: DataContextType = {
   pnl: null, pnlByInstrument: {},
   risk: null, indicators: {}, htf: {},
   healthComponents: [], overallHealth: "unknown",
-  reconciliation: null, settings: null, audit: [], alerts: [],
+  reconciliation: null, brokerPnl: null, settings: null, audit: [], alerts: [],
   equityCurve: [], marketData: null, wsEvents: [], wsState: null,
   refresh: () => {}, lastError: null,
 };
@@ -117,6 +118,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [healthComponents, setHealthComponents] = useState<any[]>([]);
   const [overallHealth, setOverallHealth] = useState("unknown");
   const [reconciliation, setReconciliation] = useState<any>(null);
+  const [brokerPnl, setBrokerPnl] = useState<any>(null);
   const [settings, setSettings] = useState<any>(null);
   const [audit, setAudit] = useState<any[]>([]);
   const [alerts, setAlerts] = useState<any[]>([]);
@@ -129,6 +131,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const timersRef = useRef<Record<string, number>>({});
   const mountedRef = useRef(true);
   const wsActiveRef = useRef(false);
+  const wsEngineAtRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -181,9 +184,13 @@ export function DataProvider({ children }: { children: ReactNode }) {
       const d = await api.strategies() as any;
       if (!Array.isArray(d?.strategies)) throw new Error(d?.error || "Invalid strategy payload");
       setSnapshotStatus((previous) => ({ ...previous, strategies: "live" }));
-      if (wsActiveRef.current) return;
+      if (wsActiveRef.current && Date.now() - wsEngineAtRef.current < 10_000) return;
       safe(setStrategies)(d.strategies);
-    } catch (e: any) { setSnapshotStatus((previous) => ({ ...previous, strategies: "error" })); setLastError(`strategies: ${e?.message || e}`); }
+    } catch (e: any) {
+      if (!(wsActiveRef.current && Date.now() - wsEngineAtRef.current < 10_000))
+        setSnapshotStatus((previous) => ({ ...previous, strategies: "error" }));
+      setLastError(`strategies: ${e?.message || e}`);
+    }
   }, [safe]);
 
   const fetchPositions = useCallback(async () => {
@@ -191,9 +198,13 @@ export function DataProvider({ children }: { children: ReactNode }) {
       const d = await api.positions() as any;
       if (!Array.isArray(d?.positions)) throw new Error(d?.error || "Invalid position payload");
       setSnapshotStatus((previous) => ({ ...previous, positions: "live" }));
-      if (wsActiveRef.current) return;
+      if (wsActiveRef.current && Date.now() - wsEngineAtRef.current < 10_000) return;
       safe(setPositions)(d.positions);
-    } catch (e: any) { setSnapshotStatus((previous) => ({ ...previous, positions: "error" })); setLastError(`positions: ${e?.message || e}`); }
+    } catch (e: any) {
+      if (!(wsActiveRef.current && Date.now() - wsEngineAtRef.current < 10_000))
+        setSnapshotStatus((previous) => ({ ...previous, positions: "error" }));
+      setLastError(`positions: ${e?.message || e}`);
+    }
   }, [safe]);
 
   const fetchOrders = useCallback(async () => {
@@ -261,7 +272,27 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, [safe]);
 
   const fetchReconciliation = useCallback(async () => {
-    try { safe(setReconciliation)(await api.reconciliation()); } catch (e: any) { setLastError(`reconciliation: ${e?.message || e}`); }
+    try {
+      const result = await api.reconciliation() as any;
+      if (!result || result.error) throw new Error(result?.error || "Invalid reconciliation payload");
+      safe(setReconciliation)({ ...result, _fetched_at: Date.now() / 1000, _fetch_error: null });
+    } catch (e: any) {
+      const message = e?.message || String(e);
+      if (mountedRef.current) setReconciliation((previous: any) => ({ ...previous, _fetch_error: message }));
+      setLastError(`reconciliation: ${message}`);
+    }
+  }, [safe]);
+
+  const fetchBrokerPnl = useCallback(async () => {
+    try {
+      const result = await api.livePnl() as any;
+      if (!result || result.error) throw new Error(result?.error || "Invalid broker P&L payload");
+      safe(setBrokerPnl)({ ...result, _fetched_at: Date.now() / 1000, _fetch_error: null });
+    } catch (e: any) {
+      const message = e?.message || String(e);
+      if (mountedRef.current) setBrokerPnl((previous: any) => ({ ...previous, _fetch_error: message }));
+      setLastError(`broker P&L: ${message}`);
+    }
   }, [safe]);
 
   const fetchSettings = useCallback(async () => {
@@ -308,19 +339,20 @@ export function DataProvider({ children }: { children: ReactNode }) {
       strategies: fetchStrategies, positions: fetchPositions, orders: fetchOrders,
       fills: fetchFills, trades: fetchTrades, pnl: fetchPnl, risk: fetchRisk, indicators: fetchIndicators,
       htf: fetchHtf, health: fetchHealth, reconciliation: fetchReconciliation,
+      brokerPnl: fetchBrokerPnl,
       settings: fetchSettings, audit: fetchAudit, alerts: fetchAlerts,
       equityCurve: fetchEquityCurve, marketData: fetchMarketData,
     };
     if (key && map[key]) map[key]();
     else Object.values(map).forEach(fn => fn());
-  }, [fetchOverview, fetchGoldOverview, fetchSilverOverview, fetchStrategies, fetchPositions, fetchOrders, fetchFills, fetchTrades, fetchPnl, fetchRisk, fetchIndicators, fetchHtf, fetchHealth, fetchReconciliation, fetchSettings, fetchAudit, fetchAlerts, fetchEquityCurve, fetchMarketData]);
+  }, [fetchOverview, fetchGoldOverview, fetchSilverOverview, fetchStrategies, fetchPositions, fetchOrders, fetchFills, fetchTrades, fetchPnl, fetchRisk, fetchIndicators, fetchHtf, fetchHealth, fetchReconciliation, fetchBrokerPnl, fetchSettings, fetchAudit, fetchAlerts, fetchEquityCurve, fetchMarketData]);
 
   useEffect(() => {
     fetchOverview(); fetchGoldOverview(); fetchSilverOverview();
     fetchStrategies(); fetchPositions(); fetchOrders(); fetchFills();
     fetchTrades();
     fetchPnl(); fetchRisk(); fetchIndicators(); fetchHtf();
-    fetchHealth(); fetchReconciliation(); fetchSettings();
+    fetchHealth(); fetchReconciliation(); fetchBrokerPnl(); fetchSettings();
     fetchAudit(); fetchAlerts(); fetchEquityCurve(); fetchMarketData();
   }, []);
 
@@ -339,13 +371,15 @@ export function DataProvider({ children }: { children: ReactNode }) {
       indicators: window.setInterval(fetchIndicators, 5000),
       htf: window.setInterval(fetchHtf, 5000),
       health: window.setInterval(fetchHealth, 10000),
+      reconciliation: window.setInterval(fetchReconciliation, 15000),
+      brokerPnl: window.setInterval(fetchBrokerPnl, 15000),
       audit: window.setInterval(fetchAudit, 10000),
       alerts: window.setInterval(fetchAlerts, 5000),
       equityCurve: window.setInterval(fetchEquityCurve, 10000),
       marketData: window.setInterval(fetchMarketData, 2000),
     };
     return () => { Object.values(timersRef.current).forEach(clearInterval); timersRef.current = {}; };
-  }, [fetchOverview, fetchGoldOverview, fetchSilverOverview, fetchStrategies, fetchPositions, fetchOrders, fetchFills, fetchTrades, fetchPnl, fetchRisk, fetchIndicators, fetchHtf, fetchHealth, fetchAudit, fetchAlerts, fetchEquityCurve, fetchMarketData]);
+  }, [fetchOverview, fetchGoldOverview, fetchSilverOverview, fetchStrategies, fetchPositions, fetchOrders, fetchFills, fetchTrades, fetchPnl, fetchRisk, fetchIndicators, fetchHtf, fetchHealth, fetchReconciliation, fetchBrokerPnl, fetchAudit, fetchAlerts, fetchEquityCurve, fetchMarketData]);
 
   useEffect(() => {
     return connectDashboardSocket((msg) => {
@@ -359,6 +393,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
             safe(setWsState)(s);
             if (s?.account) {
               wsActiveRef.current = true;
+              wsEngineAtRef.current = Date.now();
             }
             if (s?.risk && (s.risk.daily_pnl !== undefined || s.risk.kill_switch_active !== undefined)) {
             }
@@ -403,7 +438,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
           }
         } catch (e: any) { setLastError(`ws: ${e?.message || e}`); }
       }, (isConnected) => {
-        if (!isConnected) wsActiveRef.current = false;
+        if (!isConnected) { wsActiveRef.current = false; wsEngineAtRef.current = 0; }
         if (mountedRef.current) setConnected(isConnected);
       });
   }, [safe]);
@@ -411,12 +446,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const contextValue = useMemo<DataContextType>(() => ({
     connected, snapshotStatus, overview, goldOverview, silverOverview, strategies, positions,
     orders, fills, trades, pnl, pnlByInstrument, risk, indicators, htf,
-    healthComponents, overallHealth, reconciliation, settings, audit,
+    healthComponents, overallHealth, reconciliation, brokerPnl, settings, audit,
     alerts, equityCurve, marketData, wsEvents, wsState, refresh, lastError,
   }), [
     connected, snapshotStatus, overview, goldOverview, silverOverview, strategies, positions,
     orders, fills, trades, pnl, pnlByInstrument, risk, indicators, htf,
-    healthComponents, overallHealth, reconciliation, settings, audit,
+    healthComponents, overallHealth, reconciliation, brokerPnl, settings, audit,
     alerts, equityCurve, marketData, wsEvents, wsState, refresh, lastError,
   ]);
 

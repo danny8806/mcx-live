@@ -1,49 +1,86 @@
+import { useEffect, useState } from "react";
 import { useDataSelector } from "../store/DataProvider";
+import { api } from "../lib/api";
 import { formatTimestamp } from "../lib/utils";
 
-export default function Alerts() {
-  const alerts = useDataSelector<any[]>((s) => s.alerts);
-  if (!alerts) return (
-    <div style={{ padding: "20px", color: "var(--text-muted)" }}>
-      <div className="skeleton" style={{ width: "160px", height: "14px", marginBottom: "12px" }} />
-      <div className="skeleton" style={{ width: "100%", height: "200px" }} />
-      <div style={{ fontSize: "11px", marginTop: "8px" }}>Loading alerts...</div>
-    </div>
-  );
+const categories = ["ALL", "SIGNAL", "ORDER", "FILL", "POSITION", "SL", "EXIT", "REVERSAL", "RECONCILIATION", "WEBSOCKET", "LTP", "RISK", "SYSTEM", "TELEGRAM", "ERROR", "CRITICAL"];
+const deliveries = ["ALL", "SENT", "FAILED", "QUEUED"];
 
-  return (
-    <div className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", overflow: "hidden" }}>
-      <div style={{ padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", fontSize: "10px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>
-        ALERTS ({alerts.length})
+function detailText(row: any): string {
+  if (row.error) return String(row.error);
+  if (row.payload_sanitized) {
+    try {
+      const payload = typeof row.payload_sanitized === "string" ? JSON.parse(row.payload_sanitized) : row.payload_sanitized;
+      const message = typeof payload?.message === "string" ? payload.message : null;
+      if (message) {
+        const lines = message.replace(/<[^>]*>/g, "").split(/\r?\n/).map((line: string) => line.trim()).filter(Boolean);
+        const subject = lines.find((line: string) => /^(Message|Reason):/i.test(line));
+        return subject ? subject.replace(/^(Message|Reason):\s*/i, "") : lines.slice(0, 2).join(" · ");
+      }
+    } catch { /* Older ledger rows may contain plain text. */ }
+    if (typeof row.payload_sanitized === "string") return row.payload_sanitized.slice(0, 220);
+  }
+  const transition = [row.status_before, row.status_after].filter(Boolean).join(" → ");
+  if (transition) return transition;
+  if (row.trigger_price != null) return `Trigger ${row.trigger_price}`;
+  if (row.price != null) return `Price ${row.price}`;
+  return "Event recorded";
+}
+
+export default function Alerts() {
+  const runtimeEvents = useDataSelector<any[]>((s) => s.alerts);
+  const [category, setCategory] = useState("ALL");
+  const [delivery, setDelivery] = useState("ALL");
+  const [rows, setRows] = useState<any[]>([]);
+  const [stats, setStats] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const [ledger, counts] = await Promise.all([
+          api.alertLedger({ limit: 100, event_type: category === "ALL" ? undefined : category, telegram_status: delivery === "ALL" ? undefined : delivery }),
+          api.alertLedgerStats(),
+        ]);
+        if (!alive) return;
+        if (ledger?.error || !Array.isArray(ledger?.items)) throw new Error(ledger?.error || "Invalid alert ledger response");
+        setRows(ledger.items);
+        setStats(counts?.stats ?? counts);
+        setUpdatedAt(Date.now());
+        setError(null);
+        setLoaded(true);
+      } catch (e: any) {
+        if (alive) { setError(e?.message || String(e)); setLoaded(true); }
+      }
+    };
+    load();
+    const timer = window.setInterval(load, 10_000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [category, delivery]);
+
+  return <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+    <section className="desk-section">
+      <div className="desk-section-heading"><div><div className="eyebrow">DURABLE ALERT LEDGER</div><h3>Lifecycle and Telegram delivery</h3></div><span className="source-note">{updatedAt ? `Updated ${formatTimestamp(updatedAt / 1000)} · ` : ""}Last 100 matching events</span></div>
+      {stats && <div className="alert-stats"><span>Total <b>{stats.total ?? "—"}</b></span><span>Sent <b>{stats.sent ?? "—"}</b></span><span>Failed <b>{stats.failed ?? "—"}</b></span><span>Queued <b>{stats.queued ?? "—"}</b></span></div>}
+      <div className="alert-filters">
+        <label>Category <select value={category} onChange={(e) => setCategory(e.target.value)}>{categories.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+        <label>Telegram <select value={delivery} onChange={(e) => setDelivery(e.target.value)}>{deliveries.map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
       </div>
-      {alerts.length === 0 ? (
-        <div className="animate-fade-in-up" style={{ padding: "40px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>No alerts — system operating normally</div>
-      ) : (
-        <div style={{ maxHeight: "500px", overflow: "auto" }}>
-          {alerts.map((a: any, i: number) => (
-            <div key={a.id ?? i} className="hover-row" style={{ display: "flex", alignItems: "flex-start", gap: "10px", padding: "8px 12px", fontSize: "10px", borderBottom: "1px solid var(--border-subtle)" }}>
-              <span style={{
-                width: "5px", height: "5px", borderRadius: "50%", marginTop: "4px", flexShrink: 0,
-                background: a.severity === "critical" ? "var(--red)" : a.severity === "warning" ? "var(--amber)" : "var(--text-muted)",
-              }} />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "2px" }}>
-                  <span style={{ fontWeight: 500, color: "var(--text-primary)" }}>{a.type}</span>
-                  {a.severity && (
-                    <span style={{
-                      fontSize: "8px", padding: "1px 4px", borderRadius: "2px", fontWeight: 600,
-                      background: a.severity === "critical" ? "var(--red-muted)" : a.severity === "warning" ? "var(--amber-muted)" : "var(--bg-table-header)",
-                      color: a.severity === "critical" ? "var(--red)" : a.severity === "warning" ? "var(--amber)" : "var(--text-muted)",
-                    }}>{a.severity}</span>
-                  )}
-                </div>
-                {a.data && <p style={{ color: "var(--text-secondary)", fontSize: "9px" }}>{typeof a.data === "string" ? a.data : JSON.stringify(a.data)}</p>}
-              </div>
-              <span className="tabular-nums" style={{ color: "var(--text-muted)", fontSize: "9px", flexShrink: 0 }}>{formatTimestamp(a.timestamp)}</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
+      {error && <div role="alert" className="desk-warning">Alert ledger unavailable: {error}. Runtime events are listed below.</div>}
+      {!loaded && <div className="empty-state">Loading durable alerts…</div>}
+      {loaded && !error && rows.length === 0 && <div className="empty-state">No matching durable alerts.</div>}
+      {rows.map((row) => <article className="alert-event" key={row.event_id}>
+        <div className="alert-event-head"><strong>{row.event_type || "EVENT"}</strong><span>{row.telegram_status || "NOT SENT"}</span><time>{formatTimestamp(row.event_timestamp)}</time></div>
+        <div className="alert-event-main">{detailText(row)}</div>
+        <div className="alert-event-meta">{[row.strategy_id, row.side, row.quantity != null ? `qty ${row.quantity}` : null, row.broker_order_id ? `Dhan ${row.broker_order_id}` : null, row.local_order_id ? `Local ${row.local_order_id}` : null].filter(Boolean).join(" · ") || row.event_source || "LOCAL"}</div>
+        {row.payload_sanitized && <details><summary>Recorded detail</summary><pre>{String(row.payload_sanitized)}</pre></details>}
+      </article>)}
+    </section>
+    <section className="desk-section"><div className="desk-section-heading"><div><div className="eyebrow">CURRENT RUNTIME</div><h3>Recent engine events</h3></div><span className="source-note">In-memory event bus; resets on restart</span></div>
+      {runtimeEvents?.length ? runtimeEvents.map((event: any, index: number) => <div className="alert-event" key={event.id ?? index}><div className="alert-event-head"><strong>{event.type || "EVENT"}</strong><span>{event.severity || "info"}</span><time>{formatTimestamp(event.timestamp)}</time></div><details><summary>Event detail</summary><pre>{typeof event.data === "string" ? event.data : JSON.stringify(event.data, null, 2)}</pre></details></div>) : <div className="empty-state">No recent runtime events. Check the durable ledger above for history.</div>}
+    </section>
+  </div>;
 }

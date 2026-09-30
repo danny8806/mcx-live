@@ -2,6 +2,7 @@ import { useState, useCallback } from "react";
 import { useDataSelector } from "../store/DataProvider";
 import { safeINR } from "../lib/utils";
 import { api } from "../lib/api";
+import { quoteIsFresh, quoteStatus, tickAge } from "../lib/market";
 
 export default function MarketData() {
   const marketData = useDataSelector<any>((s) => s.marketData);
@@ -46,7 +47,7 @@ export default function MarketData() {
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
         {Object.entries(instruments).map(([name, data]: [string, any]) => {
-          const isLive = data.ltp > 0;
+          const isLive = quoteIsFresh(data, Boolean(marketData.ws_connected));
           const isExpanded = expanded === name;
           return (
             <div key={name} className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", padding: "12px", cursor: "pointer" }} onClick={() => toggleDetail(name)}>
@@ -57,14 +58,14 @@ export default function MarketData() {
                     className={isLive ? "animate-pulse-dot" : ""}
                     style={{ width: "5px", height: "5px", borderRadius: "50%", background: isLive ? "var(--green)" : "var(--red)", ["--dot" as any]: isLive ? "var(--green)" : "var(--red)" }}
                   />
-                  <span style={{ fontSize: "9px", color: isLive ? "var(--green)" : "var(--red)" }}>{isLive ? "LIVE" : "NO DATA"}</span>
+                  <span style={{ fontSize: "9px", color: isLive ? "var(--green)" : "var(--amber)" }}>{quoteStatus(data, Boolean(marketData.ws_connected))}</span>
                 </div>
               </div>
               <div className="tabular-nums" style={{ fontSize: "28px", fontWeight: 700, color: "var(--text-primary)", marginBottom: "12px" }}>
-                {isLive ? safeINR(data.ltp) : "—"}
+                {data.ltp > 0 ? safeINR(data.ltp) : "—"}
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px", fontSize: "10px" }}>
-                {[["Spread", data.spread > 0 ? `₹${data.spread}` : "—"], ["Ticks", String(data.tick_count ?? 0)], ["Last Update", data.timestamp > 0 ? new Date(data.timestamp * 1000).toLocaleTimeString("en-IN", { hour12: false }) : "—"]].map(([k, v]) => (
+                {[["Spread", data.spread > 0 ? `₹${data.spread}` : "—"], ["Ticks", String(data.tick_count ?? 0)], ["Last tick", data.receive_timestamp ? new Date(data.receive_timestamp * 1000).toLocaleTimeString("en-IN", { hour12: false, timeZone: "Asia/Kolkata" }) : "—"], ["Tick age", tickAge(data)]].map(([k, v]) => (
                   <div key={String(k)} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", borderBottom: "1px solid var(--border-subtle)" }}>
                     <span style={{ color: "var(--text-muted)" }}>{String(k)}</span>
                     <span className="tabular-nums" style={{ color: "var(--text-primary)" }}>{String(v)}</span>

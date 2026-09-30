@@ -1,6 +1,7 @@
 import { Activity, ArrowDownRight, ArrowUpRight, CircleCheck, Clock3, ShieldAlert, Waypoints } from "lucide-react";
 import { formatINR, formatTimestamp, pnlColor, safeINR, safeNum } from "../lib/utils";
 import { useDataSelector } from "../store/DataProvider";
+import { quoteIsFresh, quoteStatus, tickAge } from "../lib/market";
 
 const activeOrderStates = new Set(["submitted", "acknowledged", "partially_filled", "partial", "partially filled", "pending", "open", "transit", "part_traded"]);
 
@@ -29,6 +30,8 @@ export default function LiveTrading() {
   const connected = useDataSelector<boolean>((s) => s.connected);
   const snapshotStatus = useDataSelector<any>((s) => s.snapshotStatus);
   const lastError = useDataSelector<string | null>((s) => s.lastError);
+  const reconciliation = useDataSelector<any>((s) => s.reconciliation);
+  const brokerPnl = useDataSelector<any>((s) => s.brokerPnl);
   if (!overview || snapshotStatus.overview !== "live") return <div className="desk-unavailable"><ShieldAlert size={21}/><div><strong>Current account snapshot unavailable</strong><p>The dashboard has not received a successful account snapshot, so positions, triggers, and P&amp;L cannot be confirmed.</p>{lastError && <small>{lastError}</small>}</div></div>;
 
   const open = positions.filter((position: any) => position.is_open);
@@ -49,10 +52,12 @@ export default function LiveTrading() {
   return <div className="live-floor">
     <section className="desk-hero">
       <div><div className="eyebrow">REAL-TIME EXECUTION</div><h2>Live execution desk</h2><p>Runtime state, armed triggers, broker orders, open positions, and local stop monitoring.</p></div>
-      <div className="desk-hero-status"><StateTag kind={connected ? "good" : "bad"}>{connected ? "Dashboard socket connected" : "Dashboard socket disconnected"}</StateTag><StateTag kind={marketData?.ws_connected ? "good" : "warn"}>{marketData?.ws_connected ? "Market feed live" : "Market feed unknown"}</StateTag><StateTag kind={overview.execution_mode === "LIVE" ? "bad" : "neutral"}>{overview.execution_mode || "MODE UNKNOWN"}</StateTag></div>
+      <div className="desk-hero-status"><StateTag kind={connected ? "good" : "bad"}>{connected ? "Dashboard socket connected" : "Dashboard socket disconnected"}</StateTag><StateTag kind={marketData?.ws_connected ? "good" : "warn"}>{marketData?.ws_connected ? "Market feed connected" : "Market feed disconnected"}</StateTag><StateTag kind={overview.execution_mode === "LIVE" ? "bad" : "neutral"}>{overview.execution_mode || "MODE UNKNOWN"}</StateTag></div>
     </section>
 
     {overview.kill_switch && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Kill switch is active</b><small>Trading is halted according to the current runtime state.</small></div></div>}
+    {reconciliation?.is_consistent === false && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Broker and local ledgers differ</b><small>{reconciliation.summary?.total_errors ?? reconciliation.errors?.length ?? "?"} reconciliation error(s). Check Reconciliation before relying on local fills or P&amp;L.</small></div></div>}
+    {reconciliation?._fetch_error && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Reconciliation refresh failed</b><small>Last confirmed snapshot: {reconciliation._fetched_at ? formatTimestamp(reconciliation._fetched_at) : "unknown"}. Check Reconciliation.</small></div></div>}
 
     <section className="desk-metrics">
       <Value label="Open positions" value={positionsKnown ? open.length : "—"}/>
@@ -64,12 +69,24 @@ export default function LiveTrading() {
     </section>
 
     <section className="desk-section">
+      <div className="desk-section-heading"><div><div className="eyebrow">P&amp;L SOURCES</div><h3>Dhan and local book</h3></div><span className="source-note">{brokerPnl?._fetched_at ? `Fetched ${formatTimestamp(brokerPnl._fetched_at)}` : "Awaiting broker data"}</span></div>
+      {brokerPnl?._fetch_error && <div role="alert" className="desk-warning">Broker P&amp;L refresh failed. Values below are from the last successful fetch: {brokerPnl._fetch_error}</div>}
+      {brokerPnl?.dhan && brokerPnl?.local ? <div className="account-grid">
+        <Value label="Dhan reported net" value={formatINR(brokerPnl.dhan.net_pnl)} emphasis={pnlColor(brokerPnl.dhan.net_pnl)}/>
+        <Value label="Local net after charges" value={formatINR(brokerPnl.local.net_pnl)} emphasis={pnlColor(brokerPnl.local.net_pnl)}/>
+        <Value label="Dhan minus local" value={formatINR(brokerPnl.difference?.net_pnl)} emphasis={pnlColor(brokerPnl.difference?.net_pnl)}/>
+        <Value label="Dhan data age" value={brokerPnl.dhan.age_seconds == null ? "Unknown" : `${Math.floor(brokerPnl.dhan.age_seconds)}s`}/>
+      </div> : <div className="empty-state">Broker P&amp;L comparison has not been confirmed.</div>}
+    </section>
+
+    <section className="desk-section">
       <div className="desk-section-heading"><div><div className="eyebrow">MARKET WATCH</div><h3>Instruments</h3></div><StateTag kind={marketData?.ws_connected ? "good" : "warn"}>{marketData?.ws_connected ? "Feed connected" : "Feed status unknown"}</StateTag></div>
       <div className="instrument-grid">{instruments.length ? instruments.map((instrument) => {
         const quote = marketData?.instruments?.[instrument];
         const ltp = getLtp(instrument);
         const linked = strategies.filter((strategy: any) => strategy.instrument === instrument);
-        return <article className="instrument-card" key={instrument}><div className="instrument-card-head"><div><span className="instrument-symbol">{instrument}</span><small>{linked.length ? linked.map((strategy: any) => strategy.strategy_id).join(" · ") : "No strategy assigned"}</small></div><StateTag kind={ltp > 0 ? "good" : "warn"}>{ltp > 0 ? "Live price" : "No quote"}</StateTag></div><strong className="instrument-price tabular-nums">{ltp > 0 ? safeINR(ltp) : "—"}</strong><div className="instrument-foot"><span>Last update <b>{quote?.updated_at ? formatTimestamp(quote.updated_at) : quote?.timestamp ? formatTimestamp(quote.timestamp) : "—"}</b></span><span>{linked.length} strategy{linked.length === 1 ? "" : "ies"}</span></div></article>;
+        const fresh = quoteIsFresh(quote, Boolean(marketData?.ws_connected));
+        return <article className="instrument-card" key={instrument}><div className="instrument-card-head"><div><span className="instrument-symbol">{instrument}</span><small>{linked.length ? linked.map((strategy: any) => strategy.strategy_id).join(" · ") : "No strategy assigned"}</small></div><StateTag kind={fresh ? "good" : "warn"}>{quoteStatus(quote, Boolean(marketData?.ws_connected))}</StateTag></div><strong className="instrument-price tabular-nums">{ltp > 0 ? safeINR(ltp) : "—"}</strong><div className="instrument-foot"><span>Last tick <b>{quote?.receive_timestamp ? formatTimestamp(quote.receive_timestamp) : "—"}</b> · {tickAge(quote)}</span><span>{linked.length} strategy{linked.length === 1 ? "" : "ies"}</span></div></article>;
       }) : <div className="empty-state"><div><b>Instrument state is not confirmed.</b><small>No feed or strategy snapshot has arrived.</small></div></div>}</div>
     </section>
 
@@ -113,7 +130,7 @@ export default function LiveTrading() {
 
     <div className="desk-bottom-grid">
       <section className="desk-section"><div className="desk-section-heading"><div><div className="eyebrow">LATEST EXECUTIONS</div><h3>Recent fills</h3></div><Waypoints size={17}/></div>{!fillsKnown ? <div className="empty-state">Fill state is not confirmed.</div> : fills.slice(0,8).length ? <div className="order-list">{fills.slice(0,8).map((fill: any)=><div className="order-row fill-row" key={fill.fill_id}><span><b>{fill.instrument}</b><small>{fill.strategy_id} · {formatTimestamp(fill.timestamp)}</small></span><b className={fill.side === "BUY" ? "positive" : "negative"}>{fill.side}</b><span>{fill.quantity} filled</span><strong className="tabular-nums">{safeINR(fill.price)}</strong></div>)}</div> : <div className="empty-state">No fills in the current snapshot.</div>}</section>
-      <section className="desk-section"><div className="desk-section-heading"><div><div className="eyebrow">ACCOUNT SNAPSHOT</div><h3>Broker and runtime</h3></div><Activity size={17}/></div><div className="account-grid"><Value label="Execution mode" value={overview.execution_mode || "—"}/><Value label="Margin used" value={overviewKnown ? safeINR(overview.margin_used) : "—"}/><Value label="Available margin" value={overviewKnown ? safeINR(overview.available_margin) : "—"}/><Value label="Orders reported" value={ordersKnown ? orders.length : "—"}/><Value label="Updated feed" value={marketData?.updated_at ? formatTimestamp(marketData.updated_at) : "Shown per instrument"}/><Value label="Position source" value={positionsKnown ? "Runtime local state" : "Not confirmed"}/></div><div className="desk-disclaimer"><Clock3 size={14}/>This page labels local engine values explicitly. Broker account P&amp;L and broker positions are available in Operations when returned by Dhan.</div></section>
+      <section className="desk-section"><div className="desk-section-heading"><div><div className="eyebrow">ACCOUNT SNAPSHOT</div><h3>Broker and runtime</h3></div><Activity size={17}/></div><div className="account-grid"><Value label="Execution mode" value={overview.execution_mode || "—"}/><Value label="Margin used" value={overviewKnown ? safeINR(overview.margin_used) : "—"}/><Value label="Available margin" value={overviewKnown ? safeINR(overview.available_margin) : "—"}/><Value label="Orders reported" value={ordersKnown ? orders.length : "—"}/><Value label="Updated feed" value={marketData?.updated_at ? formatTimestamp(marketData.updated_at) : "Shown per instrument"}/><Value label="Position source" value={positionsKnown ? "Runtime local state" : "Not confirmed"}/></div><div className="desk-disclaimer"><Clock3 size={14}/>Local engine values are labeled separately from Dhan account P&amp;L. Broker positions and feed diagnostics are available in Operations.</div></section>
     </div>
   </div>;
 }

@@ -154,7 +154,7 @@ export default function Reversals() {
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
               <span style={{ fontSize: "9px", fontWeight: 600, color: rev.complete ? "var(--green)" : "var(--amber)", border: `1px solid ${rev.complete ? "var(--green)" : "var(--amber)"}`, borderRadius: "4px", padding: "2px 6px" }}>
-                {rev.complete ? "COMPLETE" : (rev.status || "PENDING_EXIT")}
+                {rev.complete ? (rev.new_entry_order_id?.startsWith("IMPORT-") ? "COMPLETE · MANUAL ENTRY" : "COMPLETE") : (rev.status || "PENDING_EXIT")}
               </span>
               {rev.fallback_used && (
                 <span style={{ fontSize: "9px", fontWeight: 600, color: "var(--amber)", border: "1px solid var(--amber)", borderRadius: "4px", padding: "2px 6px" }}>
@@ -167,6 +167,8 @@ export default function Reversals() {
           <div style={{ fontSize: "9px", color: "var(--text-muted)", marginTop: "4px" }}>
             SOURCE: DATABASE (reversals) · broker IDs: DHAN
           </div>
+          {rev.new_entry_order_id?.startsWith("IMPORT-") && <div style={{ marginTop: 6, color: "var(--amber)", fontSize: 11 }}>The opposite entry was placed manually and later imported. This record does not prove automatic reversal entry succeeded.</div>}
+          <div style={{ marginTop: 4, color: "var(--text-muted)", fontSize: 10 }}>Stops are monitored locally; an empty SL order ID means no resting Dhan stop order.</div>
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: "8px", marginTop: "10px" }}>
             <div>

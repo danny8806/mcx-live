@@ -27,20 +27,40 @@ def _get_market_data_sync():
                 inst_ticks = stats_obj.get("instrument_ticks", {}) or {}
         except Exception:
             inst_ticks = {}
+        ws_connected = False
+        try:
+            ws_connected = bool(_engine.data_adapter.connected)
+        except Exception:
+            pass
+        adapter = getattr(_engine, "data_adapter", None)
+        health = getattr(_engine, "market_data_health", None)
         data = {}
         for name, cfg in instruments.items():
             ltp = prices.get(name, 0.0)
+            quote = {}
+            if adapter is not None:
+                lock = getattr(adapter, "_ltp_lock", None)
+                cache = getattr(adapter, "_live_ltp", None)
+                if lock is not None and isinstance(cache, dict):
+                    with lock:
+                        quote = dict(cache.get(name) or {})
+            received_at = quote.get("receive_timestamp")
+            tick_age = max(0.0, time.time() - float(received_at)) if received_at else None
+            try:
+                feed_healthy = bool(health.is_healthy(name)) if health is not None else (
+                    bool(ws_connected) and tick_age is not None and tick_age <= 60)
+            except Exception:
+                feed_healthy = False
             data[name] = {
                 "ltp": ltp,
-                "spread": 0.0,
+                "spread": None,
                 "tick_count": inst_ticks.get(name, 0),
-                "timestamp": time.time(),
+                "timestamp": received_at,
+                "receive_timestamp": received_at,
+                "event_timestamp": quote.get("timestamp"),
+                "tick_age_seconds": tick_age,
+                "feed_healthy": feed_healthy,
             }
-        ws_connected = False
-        try:
-            ws_connected = _engine.data_adapter.connected
-        except Exception:
-            pass
         return {
             "instruments": data,
             "ws_connected": ws_connected,

@@ -84,7 +84,8 @@ function Age({ ts }: { ts: number | null | undefined }) {
   }, []);
   if (ts == null) return <Badge warn label="AGE UNKNOWN" />;
   const age = (now / 1000) - Number(ts);
-  if (age < 0) return <Badge ok label="fresh" />;
+  if (age < -5) return <Badge warn label={`CLOCK SKEW ${Math.round(-age)}s`} />;
+  if (age < 0) return <Badge ok label="Updated now" />;
   const stale = age > 90;
   return <Badge warn={stale} ok={!stale} label={stale ? `STALE ${Math.round(age)}s` : `Updated ${Math.round(age)}s ago`} />;
 }
@@ -131,6 +132,7 @@ function StateColor(state?: string) {
 
 export default function LiveOps() {
   const { data, error, loading, refresh } = useLiveDashboard(5000);
+  const [showRoutine, setShowRoutine] = useState(false);
   if (loading && !data) return (
     <div style={{ padding: "20px", color: "var(--text-muted)" }}>
       <div className="skeleton" style={{ width: "200px", height: "14px", marginBottom: "12px" }} />
@@ -139,6 +141,9 @@ export default function LiveOps() {
   );
   const err = error || data?.error;
   const p = data?.profile;
+  const timeline = (data?.timeline ?? []).filter((ev: any) => showRoutine || !(
+    ev.source === "BROKER" && /HTTP 200/.test(String(ev.detail || "")) &&
+    ["POSITIONS", "FUNDLIMIT", "ORDERLIST", "TRADEBOOK"].includes(String(ev.kind || "").toUpperCase())));
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
@@ -388,10 +393,10 @@ export default function LiveOps() {
       </div>
 
       {/* ── Row 6: Timeline ── */}
-      <Panel title="TIMELINE — recent engine/broker events (latest 50)">
-        {data?.timeline && data.timeline.length > 0 ? (
+      <Panel title="TIMELINE — recent engine/broker events" right={<label style={{ fontSize: 10, textTransform: "none" }}><input type="checkbox" checked={showRoutine} onChange={(e) => setShowRoutine(e.target.checked)} /> Show routine REST polls</label>}>
+        {timeline.length > 0 ? (
           <div style={{ maxHeight: 160, overflowY: "auto", fontSize: "10px" }}>
-            {data.timeline.map((ev: any, i: number) => (
+            {timeline.map((ev: any, i: number) => (
               <div key={i} style={{ display: "grid", gridTemplateColumns: "70px 50px 80px 80px 1fr", gap: "6px", padding: "3px 8px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center" }}>
                 <span style={{ color: "var(--text-muted)", fontFamily: "monospace" }}>{formatTimestamp(secs(ev.at) as number)}</span>
                 <span style={{ color: ev.source === "ALERT" ? "var(--red)" : ev.source === "BROKER" ? "var(--amber)" : "var(--text-secondary)", fontWeight: 600 }}>{ev.source}</span>
@@ -401,7 +406,7 @@ export default function LiveOps() {
               </div>
             ))}
           </div>
-        ) : <div style={{ padding: "14px", color: "var(--text-muted)", fontSize: "10px" }}>no timeline events yet</div>}
+        ) : <div style={{ padding: "14px", color: "var(--text-muted)", fontSize: "10px" }}>No actionable events in the latest window. Enable routine REST polls to see all events.</div>}
       </Panel>
 
       {/* ── Row 7: Telegram ── */}

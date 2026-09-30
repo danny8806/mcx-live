@@ -11,6 +11,8 @@ export default function Positions() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<any>(null);
   const [detailBusy, setDetailBusy] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [lastSuccessAt, setLastSuccessAt] = useState<number | null>(null);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -19,31 +21,21 @@ export default function Positions() {
   }, []);
 
   useEffect(() => {
-    (async () => {
-      try {
-        const [o, c, a] = await Promise.all([
-          api.positions({ status: "open" }),
-          api.positions({ status: "closed" }),
-          api.positions({ status: "all" }),
-        ]);
-        if (mounted.current) {
-          setCounts({
-            open: o?.count ?? 0,
-            closed: c?.count ?? 0,
-            all: a?.count ?? 0,
-          });
-        }
-      } catch { /* ignore */ }
-    })();
-  }, []);
-
-  useEffect(() => {
     let timer: number;
     const load = async () => {
       try {
-        const d = await api.positions({ status: view }) as any;
-        if (mounted.current) setList(Array.isArray(d?.positions) ? d.positions : []);
-      } catch { /* ignore */ }
+        const d = await api.positions({ status: "all" }) as any;
+        if (!Array.isArray(d?.positions)) throw new Error(d?.error || "Invalid positions response");
+        if (mounted.current) {
+          const all = d.positions;
+          const open = all.filter((position: any) => position.is_open);
+          const closed = all.filter((position: any) => !position.is_open);
+          setCounts({ open: open.length, closed: closed.length, all: all.length });
+          setList(view === "open" ? open : view === "closed" ? closed : all);
+          setLoadError(null);
+          setLastSuccessAt(Date.now());
+        }
+      } catch (error: any) { if (mounted.current) setLoadError(error?.message || String(error)); }
     };
     load();
     timer = window.setInterval(load, 5000);
@@ -70,6 +62,7 @@ export default function Positions() {
     }
   }, [expandedId]);
 
+  if (!list && loadError) return <div role="alert" className="desk-warning">Positions unavailable: {loadError}</div>;
   if (!list) return (
     <div style={{ padding: "20px", color: "var(--text-muted)" }}>
       <div className="skeleton" style={{ width: "220px", height: "36px", marginBottom: "12px" }} />
@@ -86,6 +79,7 @@ export default function Positions() {
 
   return (
     <div className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", overflow: "hidden" }}>
+      {loadError && <div role="alert" className="desk-warning">Position refresh failed. Showing the last successful snapshot from {lastSuccessAt ? new Date(lastSuccessAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) : "unknown time"}: {loadError}</div>}
       <div style={{ padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <span style={{ fontSize: "10px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>
           POSITIONS ({list.length})
