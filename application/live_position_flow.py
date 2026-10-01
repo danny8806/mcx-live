@@ -481,8 +481,16 @@ class LivePositionFlowMixin:
                 if rec_oid is not None and getattr(o, "order_id", None) == rec_oid:
                     continue
                 role = str(getattr(o, "order_role", "") or "").upper()
-                state_s = str(getattr(o, "state", "")).lower()
-                if state_s in ("filled", "canceled", "cancelled", "rejected"):
+                raw_state = getattr(o, "state", "") or ""
+                # OrderState is an Enum in the engine.  str(enum) renders as
+                # e.g. "OrderState.FILLED", which used to leave completed
+                # exit/reversal legs looking active here and LOCK the entry
+                # watcher (including its safe cancel-confirm-MARKET fallback).
+                # Match OrderWatcher._highest_priority_blocker by comparing
+                # the normalized value instead.
+                state_s = str(getattr(raw_state, "value", raw_state)).lower()
+                if state_s in ("filled", "canceled", "cancelled", "rejected",
+                               "expired"):
                     continue
                 if role in ("REVERSAL_EXIT", "REVERSAL_ENTRY"):
                     return 4
