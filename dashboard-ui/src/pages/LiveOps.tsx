@@ -350,13 +350,13 @@ export default function LiveOps() {
             <Stat label="DHAN realized (reported)" value={`₹${fmt(data?.pnl?.dhan?.realized_pnl)}`} sub="positions realizedProfit" />
             <Stat label="DHAN unrealized" value={`₹${fmt(data?.pnl?.dhan?.unrealized_pnl)}`} />
             <Stat label="DHAN total (reported)" value={`₹${fmt(data?.pnl?.dhan?.net_pnl)}`} />
-            <Stat label="LOCAL realized net" value={`₹${fmt(data?.pnl?.local?.realized_pnl)}`} sub="after recorded local charges" />
+            <Stat label="LOCAL realized net" value={`₹${fmt(data?.pnl?.local?.realized_pnl)}`} sub={data?.pnl?.local?.realized_pnl_basis || "local trade ledger"} />
             <Stat label="LOCAL unrealized" value={`₹${fmt(data?.pnl?.local?.unrealized_pnl)}`} sub="local position book" />
             <Stat label="LOCAL net" value={`₹${fmt(data?.pnl?.local?.net_pnl)}`} />
           </div>
           {data?.pnl?.difference && (
             <div style={{ padding: "8px 12px", borderTop: "1px solid var(--border-subtle)" }}>
-              <span style={{ fontSize: "9px", color: "var(--text-muted)", textTransform: "uppercase" }}>Difference (Dhan − Local): </span>
+              <span style={{ fontSize: "9px", color: "var(--text-muted)", textTransform: "uppercase" }}>Broker snapshot − local ledger (scope may differ): </span>
               <span className="tabular-nums" style={{ fontSize: "11px", fontWeight: 600, color: "var(--amber)" }}>
                 ₹{fmt(data.pnl.difference.net_pnl)}
               </span>

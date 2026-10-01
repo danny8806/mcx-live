@@ -1051,11 +1051,21 @@ def _get_pnl_sync():
     d_unr = _num(acct.get("unrealized_pnl"))
     l_real = 0.0
     l_unr = 0.0
-    for pnl in (env.pnl_engines or {}).values():
+    pnl_history = None
+    if getattr(env, "persistence", None) is not None:
         try:
-            l_real += _num(pnl.snapshot().get("realized_net"))
+            from dashboard.history_pnl import trade_history_pnl
+            pnl_history = trade_history_pnl(env)
         except Exception:
-            pass
+            pnl_history = None
+    if pnl_history is not None and pnl_history.get("history_source"):
+        l_real = _num(pnl_history["total"].get("realized_net"))
+    else:
+        for pnl in (env.pnl_engines or {}).values():
+            try:
+                l_real += _num(pnl.snapshot().get("realized_net"))
+            except Exception:
+                pass
     pm = getattr(env, "position_manager", None)
     if pm is not None:
         try:
@@ -1080,8 +1090,21 @@ def _get_pnl_sync():
             "realized_pnl": round(l_real, 2),
             "unrealized_pnl": round(l_unr, 2),
             "net_pnl": round(l_real + l_unr, 2),
-            "source": "engine pnl engines + local position book",
-            "realized_pnl_basis": "local realized_net after recorded charges",
+            "source": (pnl_history.get("source")
+                       if pnl_history is not None and pnl_history.get("history_source")
+                       else "engine pnl engines + local position book"),
+            "realized_pnl_basis": (
+                "fill-reconciled trade history; charges use system fee-model estimate"
+                if pnl_history is not None and pnl_history.get("history_source")
+                else "local realized_net after recorded charges"),
+            "reconciled_trade_count": (
+                pnl_history["total"]["reconciled_trade_count"]
+                if pnl_history is not None and pnl_history.get("history_source")
+                else None),
+            "unreconciled_trade_count": (
+                pnl_history["total"]["unreconciled_trade_count"]
+                if pnl_history is not None and pnl_history.get("history_source")
+                else None),
             "generated_at": _ts(),
         },
         "difference": {

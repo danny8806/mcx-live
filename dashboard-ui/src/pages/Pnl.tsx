@@ -64,18 +64,23 @@ export default function Pnl() {
 
   const instruments = Object.entries(pnlByInstrument);
   const mode = String(pnl.execution_mode ?? "").toUpperCase();
-  const portfolioSource = mode === "LIVE" ? "Account snapshot · live mode" : "Engine account snapshot · paper mode";
+  const portfolioSource = pnl.pnl_source === "fill_reconciled_trade_history"
+    ? "Fill-reconciled closed-trade history"
+    : mode === "LIVE" ? "Live P&L engine" : "Paper P&L engine";
+  const netBasis = pnl.pnl_source === "fill_reconciled_trade_history"
+    ? "Net = verified closed-trade history plus local open-position P&L; charges use the configured fee model."
+    : "P&L values come from the active account and strategy engines.";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-      <div className="pnl-source-banner"><div><strong>{mode || "ENGINE"} P&amp;L SOURCE BREAKDOWN</strong><span>Realized totals come from strategy P&amp;L engines. Unrealized P&amp;L, net P&amp;L, charges, and equity come from the {portfolioSource.toLowerCase()}. These sources can differ while broker and local ledgers reconcile.</span></div><span className="pnl-source-chip">{portfolioSource}</span></div>
+      <div className="pnl-source-banner"><div><strong>{mode || "ENGINE"} P&amp;L SOURCE BREAKDOWN</strong><span>{netBasis} {pnl.unreconciled_trade_count ? `${pnl.unreconciled_trade_count} closed trade(s) are excluded until their fills reconcile.` : ""}</span></div><span className="pnl-source-chip">{portfolioSource}</span></div>
       <div className="metric-grid">
         {[
-          ["NET P&L · ACCOUNT SNAPSHOT", pnl.net_pnl],
-          ["REALIZED · STRATEGY LEDGER", pnl.realized_pnl],
-          ["UNREALIZED · ACCOUNT SNAPSHOT", pnl.unrealized_pnl],
-          ["CHARGES · ACCOUNT SNAPSHOT", pnl.charges],
-          ["EQUITY · ACCOUNT SNAPSHOT", pnl.equity],
+          ["NET P&L · LOCAL BOOK", pnl.net_pnl],
+          ["REALIZED · CLOSED TRADES", pnl.realized_pnl],
+          ["UNREALIZED · OPEN POSITIONS", pnl.unrealized_pnl],
+          ["CHARGES · FEE MODEL", pnl.charges],
+          ["EQUITY · ACCOUNT", pnl.equity],
         ].map(([label, val]) => (
           <div key={String(label)} className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", padding: "10px 12px" }}>
             <div style={{ fontSize: "9px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "4px" }}>{String(label)}</div>

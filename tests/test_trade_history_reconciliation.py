@@ -171,3 +171,82 @@ def test_fill_history_sorts_mixed_epoch_and_iso_timestamps(monkeypatch):
     assert [fill["fill_id"] for fill in result["fills"]] == [
         "runtime-fill", "persisted-fill"]
     assert all(isinstance(fill["timestamp"], float) for fill in result["fills"])
+
+
+def test_live_portfolio_pnl_uses_same_fill_reconciled_rows_as_trade_history(monkeypatch):
+    from dashboard.routes import pnl
+
+    trade = _closed_trade(trade_id="closed-1")
+    persisted = SimpleNamespace(
+        get_trades=lambda **_: [trade],
+        get_fills=lambda: _fills(trade_id="closed-1"),
+    )
+    stale_engine = SimpleNamespace(
+        fee_model=MCXFeeModel(stamp_duty_pct=0.0),
+        snapshot=lambda: {"realized_gross": -1, "realized_charges": 1,
+                          "realized_net": -2, "trade_count": 99,
+                          "wins": 90, "losses": 9},
+    )
+    pm = SimpleNamespace(
+        get_positions_by_instrument=lambda _: [SimpleNamespace(
+            is_open=True, unrealized_pnl=-50.0)],
+    )
+    env = SimpleNamespace(
+        mode="LIVE", persistence=persisted,
+        runtimes=None, pnl_engines={"silver_01": stale_engine},
+        account_engine=SimpleNamespace(snapshot=lambda: {
+            "realized_pnl": -2, "unrealized_pnl": -999,
+            "net_pnl": -1001, "charges": 1, "equity": 500000,
+            "starting_capital": 1200000,
+        }),
+        position_manager=pm,
+    )
+    engine = SimpleNamespace(
+        config={"strategies": {"silver_01": {"instrument": "SILVERM"}}},
+        live=env,
+    )
+    monkeypatch.setattr(trades, "_engine", engine)
+    monkeypatch.setattr(trades, "_env_for", lambda _env=None: env)
+    monkeypatch.setattr(pnl, "_engine", engine)
+    monkeypatch.setattr(pnl, "_env_for", lambda _env=None: env)
+
+    result = pnl._get_portfolio_pnl_sync()
+
+    row = trades._reconcile_history_from_fills(
+        trade, _fills(trade_id="closed-1"), stale_engine.fee_model)
+    assert result["portfolio"]["realized_pnl"] == row["net_pnl"]
+    assert result["portfolio"]["unrealized_pnl"] == -50.0
+    assert result["portfolio"]["net_pnl"] == pytest.approx(
+        row["net_pnl"] - 50.0)
+    assert result["portfolio"]["realized_pnl"] != -2
+    assert result["portfolio"]["pnl_source"] == "fill_reconciled_trade_history"
+    assert result["portfolio"]["reconciled_trade_count"] == 1
+    assert result["by_instrument"]["SILVERM"]["trade_count"] == 1
+
+
+def test_history_aggregate_excludes_closed_rows_without_fill_reconciliation(monkeypatch):
+    from dashboard import history_pnl
+
+    rows = [
+        {"trade_id": "verified", "instrument": "SILVERM",
+         "strategy_id": "silver_01", "status": "CLOSED",
+         "pnl_reconciled_from_fills": True, "gross_pnl": -50,
+         "charges": 5, "net_pnl": -55},
+        {"trade_id": "legacy-unknown", "instrument": "SILVERM",
+         "strategy_id": "silver_01", "status": "CLOSED",
+         "gross_pnl": -900, "charges": 20, "net_pnl": -920},
+    ]
+    monkeypatch.setattr(
+        trades, "_list_trades_sync",
+        lambda **_: {"trades": rows, "source": "merged"},
+    )
+
+    result = history_pnl.trade_history_pnl(SimpleNamespace())
+
+    assert result["total"]["realized_gross"] == -50
+    assert result["total"]["realized_charges"] == 5
+    assert result["total"]["realized_net"] == -55
+    assert result["total"]["trade_count"] == 2
+    assert result["total"]["pnl_trade_count"] == 1
+    assert result["total"]["reconciled_trade_count"] == 1
+    assert result["total"]["unreconciled_trade_count"] == 1

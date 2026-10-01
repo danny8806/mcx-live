@@ -189,8 +189,15 @@ def _get_overview_sync(env=None):
 
         used_margin = _safe(account.get("used_margin", 0))
         available_margin = equity - used_margin
-        realized = sum(
-            pnl.snapshot().get("realized_net", 0) for pnl in env.pnl_engines.values()
+        pnl_history = None
+        if getattr(env, "persistence", None) is not None:
+            from dashboard.history_pnl import trade_history_pnl
+            pnl_history = trade_history_pnl(env)
+        realized = (
+            pnl_history["total"]["realized_net"]
+            if pnl_history is not None and pnl_history.get("history_source")
+            else sum(pnl.snapshot().get("realized_net", 0)
+                     for pnl in env.pnl_engines.values())
         )
         unrealized = sum(
             pos.get("unrealized_pnl", 0) for pos in open_pos.values()
@@ -225,6 +232,17 @@ def _get_overview_sync(env=None):
             "total_net_pnl": {"value": net_pnl, "timestamp": _ts()},
             "realized_pnl": {"value": realized, "timestamp": _ts()},
             "unrealized_pnl": {"value": unrealized, "timestamp": _ts()},
+            "pnl_source": (pnl_history.get("source")
+                           if pnl_history is not None and pnl_history.get("history_source")
+                           else "pnl_engine"),
+            "pnl_reconciled_trade_count": (
+                pnl_history["total"]["reconciled_trade_count"]
+                if pnl_history is not None and pnl_history.get("history_source")
+                else None),
+            "pnl_unreconciled_trade_count": (
+                pnl_history["total"]["unreconciled_trade_count"]
+                if pnl_history is not None and pnl_history.get("history_source")
+                else None),
             "broker_pnl": broker_pnl,
             "margin_used": {"value": used_margin, "timestamp": _ts()},
             "available_margin": {"value": available_margin, "timestamp": _ts()},
@@ -262,6 +280,11 @@ def _get_instrument_overview_sync(instrument: str):
     try:
         e = _engine
         instrument_upper = instrument.upper()
+        env = _env_for()
+        pnl_history = None
+        if env is not None and getattr(env, "persistence", None) is not None:
+            from dashboard.history_pnl import trade_history_pnl
+            pnl_history = trade_history_pnl(env, instrument=instrument_upper)
 
         prices = e.execution_engine._current_prices
         ltp = prices.get(instrument_upper, 0.0)
@@ -273,6 +296,13 @@ def _get_instrument_overview_sync(instrument: str):
             snap = strat.snapshot()
             pnl_eng = e.pnl_engines.get(name)
             pnl_snap = pnl_eng.snapshot() if pnl_eng else {}
+            history_available = bool(
+                pnl_history is not None and pnl_history.get("history_source"))
+            history_row = (pnl_history or {}).get("by_strategy", {}).get(name)
+            if history_available and history_row is None:
+                history_row = {
+                    "trade_count": 0, "win_rate": 0.0, "realized_net": 0.0,
+                }
             strat_summaries.append({
                 "strategy_id": name,
                 "status": snap.get("state", "unknown"),
@@ -282,9 +312,15 @@ def _get_instrument_overview_sync(instrument: str):
                 "stop_price": snap.get("stop_price"),
                 "bars_processed": snap.get("bars_processed", 0),
                 "pending_entry": snap.get("pending_entry"),
-                "trades": pnl_snap.get("trade_count", 0),
-                "win_rate": pnl_snap.get("win_rate", 0),
-                "net_pnl": pnl_snap.get("realized_net", 0),
+                "trades": (history_row.get("trade_count", 0)
+                           if history_available else pnl_snap.get("trade_count", 0)),
+                "win_rate": (history_row.get("win_rate", 0)
+                             if history_available else pnl_snap.get("win_rate", 0)),
+                "net_pnl": (history_row.get("realized_net", 0)
+                            if history_available else pnl_snap.get("realized_net", 0)),
+                "pnl_source": (pnl_history.get("source")
+                               if pnl_history is not None and pnl_history.get("history_source")
+                               else "pnl_engine"),
             })
 
         return {
