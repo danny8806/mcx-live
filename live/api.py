@@ -429,6 +429,7 @@ def _adopt_broker_position(body: dict) -> dict:
         operator_candle = body.get("operator_signal_candle")
         operator_attribution = bool(body.get("operator_confirmed_manual_fill"))
         operator_source_signal_id = ""
+        operator_reversal_parent_signal_id = None
         if len(closed) < 2 and not operator_attribution:
             raise HTTPException(status_code=409,
                                 detail="two completed 15m candles are required for the structural stop")
@@ -485,6 +486,16 @@ def _adopt_broker_position(body: dict) -> dict:
                                 or source_metadata.get("external_position_stop_reference"))):
                     raise HTTPException(status_code=409,
                                         detail="operator stop reference does not match an exact persisted SILVERM LONG signal")
+                parent_signal_id = source_metadata.get("reversal_parent_signal_id")
+                if source_metadata.get("is_reversal_entry") and parent_signal_id:
+                    reversal = _persistence.get_reversal_by_signal_id(
+                        str(parent_signal_id))
+                    if (reversal
+                            and reversal.get("strategy_id") == strategy_id
+                            and reversal.get("instrument") == "SILVERM"
+                            and str(reversal.get("status") or "").upper()
+                                in ("EXIT_FILLED", "ENTRY_SUBMITTED")):
+                        operator_reversal_parent_signal_id = str(parent_signal_id)
             elif operator_trigger != h0 or operator_stop != low0:
                 raise HTTPException(status_code=409,
                                     detail="operator candle trigger/stop must match its high/low unless tied to an exact persisted signal")
@@ -582,6 +593,9 @@ def _adopt_broker_position(body: dict) -> dict:
                 "external_position_source": "dhan_tradebook_operator_reconcile",
                 "operator_confirmed_manual_fill": operator_attribution,
                 "operator_stop_source_signal_id": operator_source_signal_id or None,
+                "is_reversal": bool(operator_reversal_parent_signal_id),
+                "is_reversal_entry": bool(operator_reversal_parent_signal_id),
+                "reversal_parent_signal_id": operator_reversal_parent_signal_id,
                 "broker_order_id": broker_order_id,
                 "broker_fill_id": broker_fill_id,
                 "signal_reason": "operator_attributed_to_latest_closed_15m_candle",
@@ -600,7 +614,9 @@ def _adopt_broker_position(body: dict) -> dict:
             instrument="SILVERM", side="BUY", quantity=1,
             order_type=str(broker_order.get("order_type") or "LIMIT").upper(),
             price=fill_price, planned_entry_price=trigger, planned_sl=stop,
-            planned_order_type="EXTERNAL_DHAN_FILL", order_role="ENTRY",
+            planned_order_type="EXTERNAL_DHAN_FILL",
+            order_role=("REVERSAL_ENTRY" if operator_reversal_parent_signal_id
+                        else "ENTRY"),
             state=OrderState.FILLED, filled_quantity=1,
             average_fill_price=fill_price, created_at=fill_time,
             updated_at=fill_time, reason="operator_imported_existing_dhan_position",
@@ -610,6 +626,8 @@ def _adopt_broker_position(body: dict) -> dict:
         order._broker_order_id = broker_order_id
         order.parent_signal_id = signal.signal_id
         order.correlation_id = None  # Dhan's manual-order correlation is NA.
+        if operator_reversal_parent_signal_id:
+            order.reversal_parent_signal_id = operator_reversal_parent_signal_id
 
         _engine._persist_signal(signal, "EXTERNAL_POSITION_IMPORT", env_name="live")
         lifecycle = runtime.lifecycle
@@ -636,6 +654,9 @@ def _adopt_broker_position(body: dict) -> dict:
                                     detail="imported local order id already exists")
             execution._orders[local_order_id] = order
         _engine._persist_order(order, signal, env_name="live")
+        if operator_reversal_parent_signal_id:
+            _engine._update_reversal_entry_created(
+                env, operator_reversal_parent_signal_id, trade, order)
 
         fill = Fill(
             fill_id=f"DHAN-{broker_fill_id}", order_id=local_order_id,
@@ -677,6 +698,7 @@ def _adopt_broker_position(body: dict) -> dict:
             "source": "Dhan tradebook and current broker net",
             "broker_order_id": broker_order_id,
             "broker_fill_id": broker_fill_id,
+            "reversal_parent_signal_id": operator_reversal_parent_signal_id,
             "position": position.snapshot(),
             "signal_candle": {"timestamp": candle_timestamp,
                               "open": o, "high": h, "low": low,

@@ -264,6 +264,67 @@ def test_operator_manual_import_uses_stop_from_exact_persisted_reversal_signal(
         persistence.close()
 
 
+def test_operator_manual_reversal_import_completes_the_existing_reversal_chain(
+        tmp_path, monkeypatch):
+    engine, env, broker, persistence = _adoption_runtime(
+        tmp_path, monkeypatch, omit_prior_from_recent_window=True)
+    parent_id = "REV-EXIT-MANUAL-IMPORT"
+    source_signal_id = "REVERSAL-LONG-PAIRED-ENTRY"
+    source_trigger = 228902.0
+    source_stop = 228050.0
+    persistence.save_signal({
+        "signal_id": source_signal_id, "strategy_id": "silver_01",
+        "instrument": "SILVERM", "side": "LONG", "signal_type": "entry",
+        "timestamp": CANDLE_TS, "candle_timestamp": CANDLE_TS,
+        "open": 228374.0, "high": 228900.0, "low": 228100.0,
+        "close": 228895.0, "trigger_price": source_trigger,
+        "stop_price": source_stop, "quantity": 1,
+        "signal_metadata": {"is_reversal_entry": True,
+                             "reversal_parent_signal_id": parent_id},
+    })
+    persistence.save_reversal({
+        "reversal_id": "RV-MANUAL-IMPORT-1", "signal_id": parent_id,
+        "strategy_id": "silver_01", "instrument": "SILVERM",
+        "old_exit_order_id": "OLD-EXIT", "old_exit_broker_status": "FILLED",
+        "old_exit_fill_price": 228700.0, "old_exit_filled_quantity": 1,
+        "exit_verified_at": "2026-09-30T10:00:00+00:00",
+        "status": "EXIT_FILLED",
+    })
+    env.data_adapter = SimpleNamespace(
+        fetch_candle_state=lambda *_args: {"closed": [[
+            1790746200.0, 228895.0, 229140.0, 228700.0, 228871.0, 300.0]],
+            "forming": None},
+        get_live_ltp=lambda _symbol: 229107.0,
+    )
+    body = {
+        "strategy_id": "silver_01", "broker_order_id": BROKER_ORDER,
+        "signal_candle_timestamp": CANDLE_TS,
+        "operator_confirmed_manual_fill": True,
+        "operator_signal_candle": {
+            "timestamp": CANDLE_TS, "open": 228374.0, "high": 228900.0,
+            "low": 228100.0, "close": 228895.0,
+            "trigger_price": source_trigger, "stop_price": source_stop,
+            "source_signal_id": source_signal_id,
+        },
+    }
+    try:
+        result = live_api._adopt_broker_position(body)
+        reversal = persistence.get_reversal("RV-MANUAL-IMPORT-1")
+        imported = next(iter(env.execution_engine._orders.values()))
+        assert result["reversal_parent_signal_id"] == parent_id
+        assert imported.order_role == "REVERSAL_ENTRY"
+        assert imported.reversal_parent_signal_id == parent_id
+        assert reversal["status"] == "COMPLETE"
+        assert reversal["new_entry_order_id"] == f"IMPORT-{BROKER_ORDER}"
+        assert reversal["new_broker_order_id"] == BROKER_ORDER
+        assert reversal["new_entry_broker_status"] == "FILLED"
+        assert reversal["new_sl_state"] == "ARMED"
+        assert not broker._orders
+    finally:
+        engine.stop()
+        persistence.close()
+
+
 def test_correct_imported_stop_from_exact_historical_signal_candle(
         tmp_path, monkeypatch):
     engine, env, broker, persistence = _adoption_runtime(tmp_path, monkeypatch)
