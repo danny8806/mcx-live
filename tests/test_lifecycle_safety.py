@@ -231,6 +231,19 @@ def test_short_trigger_cross_and_snapshot_restore_fire_once():
     assert restored.on_tick(94, timestamp=13) is None
 
 
+def test_restore_clears_pending_state_when_trigger_was_cancelled():
+    strategy = create_gold_5m()
+    snapshot = strategy.snapshot()
+    snapshot.update(state="pending_long", position_side=None, pending_entry=None)
+
+    restored = create_gold_5m()
+    restored.restore(snapshot)
+
+    assert restored.state.value == "flat"
+    assert restored.pending_entry is None
+    assert restored.snapshot()["has_pending"] is False
+
+
 def test_strategy_never_mints_a_stop_and_the_local_sl_owns_it():
     """The strategy no longer decides the stop: it is position-owned.
 

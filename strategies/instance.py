@@ -1265,3 +1265,17 @@ class StrategyInstance:
             )
         self.pending_entry = restore_trigger(snapshot.get("pending_entry"))
         self.pending_exit_trigger = restore_trigger(snapshot.get("pending_exit_trigger"))
+        if self.position_side is None:
+            active_entry = (self.pending_entry is not None
+                            and self.pending_entry.status in ("pending", "waiting_for_flat"))
+            if active_entry:
+                self.state = (StrategyState.PENDING_LONG
+                              if self.pending_entry.side == "LONG"
+                              else StrategyState.PENDING_SHORT)
+            elif self.state in (StrategyState.PENDING_LONG,
+                                StrategyState.PENDING_SHORT):
+                # A terminal or missing trigger cannot own a pending strategy
+                # state after restart. In particular, an operator-cancelled
+                # trigger must not reappear as an armed state in the dashboard.
+                self.pending_entry = None
+                self.state = StrategyState.FLAT
