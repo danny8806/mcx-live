@@ -16,11 +16,14 @@ If step 4-8 fails: state is recoverable from database on restart.
 from __future__ import annotations
 
 import math
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from execution.models import Fill
+
+log = logging.getLogger(__name__)
 
 
 class TradeCloseManager:
@@ -78,6 +81,29 @@ class TradeCloseManager:
             )
             return False
 
+        # The open position owns the contract multiplier. Exit fills may be
+        # created by fallback/reconciliation paths that lack instrument
+        # metadata (and therefore carry Fill's default multiplier=1). Prefer
+        # the position value, while allowing a configured non-unit multiplier
+        # to repair legacy positions restored with the dataclass default.
+        position_multiplier = self._positive_multiplier(
+            getattr(position, "multiplier", None))
+        supplied_multiplier = self._positive_multiplier(
+            multiplier or getattr(fill, "multiplier", None))
+        if position_multiplier is None:
+            effective_multiplier = supplied_multiplier or 1.0
+        elif position_multiplier == 1.0 and supplied_multiplier not in (None, 1.0):
+            effective_multiplier = supplied_multiplier
+        else:
+            effective_multiplier = position_multiplier
+        if (supplied_multiplier is not None
+                and not math.isclose(supplied_multiplier, effective_multiplier)):
+            log.warning(
+                "[TradeClose] multiplier mismatch for %s (%s): position=%s supplied=%s; using %s",
+                getattr(position, "trade_id", "?"), fill.instrument,
+                position_multiplier, supplied_multiplier, effective_multiplier)
+        position.multiplier = effective_multiplier
+
         # ── Step 1: Calculate P&L (pure calculation, no side effects) ──
         pnl_engine = self._pnl_engines.get(strategy_id)
         if pnl_engine:
@@ -90,12 +116,12 @@ class TradeCloseManager:
                 price=position.average_entry,
                 timestamp=position.entry_timestamp,
                 strategy_id=position.strategy_id,
-                multiplier=multiplier,
+                multiplier=effective_multiplier,
             )
             gross_pnl, charges, net_pnl = pnl_engine.calculate_realized_pnl(
                 entry_fill=entry_fill,
                 exit_fill=fill,
-                multiplier=multiplier,
+                multiplier=effective_multiplier,
             )
         else:
             gross_pnl, charges, net_pnl = 0.0, 0.0, 0.0
@@ -135,7 +161,7 @@ class TradeCloseManager:
                     "exit_timestamp": exit_ts,
                     "exit_price": fill.price,
                     "quantity": position.quantity,
-                    "multiplier": multiplier,
+                    "multiplier": effective_multiplier,
                     "gross_pnl": gross_pnl,
                     "charges": charges,
                     "net_pnl": net_pnl,
@@ -263,7 +289,7 @@ class TradeCloseManager:
                         signal_time=position.entry_timestamp,
                         trigger_price=position.average_entry,
                         stop_price=getattr(position, "stop_price", None) or 0.0,
-                        multiplier=multiplier,
+                        multiplier=effective_multiplier,
                         entry_reason=exit_reason_final,  # projection bookkeeping only
                         trade_id=trade_id,
                         position_id=position.position_id,
@@ -377,3 +403,11 @@ class TradeCloseManager:
 
         print(f"[TradeClose] Closed: strategy={strategy_id} P&L={net_pnl:.2f}", flush=True)
         return {"gross_pnl": gross_pnl, "charges": charges, "net_pnl": net_pnl}
+
+    @staticmethod
+    def _positive_multiplier(value) -> Optional[float]:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) and result > 0 else None

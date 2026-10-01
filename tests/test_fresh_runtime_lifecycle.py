@@ -863,6 +863,7 @@ def test_fresh_runtime_limit_to_market_fallback_requires_cancel_confirmation(tmp
         fallback = env.execution_engine.get_order(result["market_order_id"])
         assert fallback.order_type == "MARKET"
         assert fallback.order_role == "FALLBACK_MARKET"
+        assert fallback.multiplier == 1.0  # broker order metadata remains unchanged
         assert fallback.fallback_cancel_confirmed is True
         assert fallback.original_order_id == limit.order_id
         assert fallback.quantity == limit.quantity == 1
@@ -969,6 +970,7 @@ def test_fresh_runtime_sl_exit_limit_fallback_closes_only_after_broker_fill(tmp_
         market_exit = env.execution_engine.get_order(result["market_order_id"])
         assert market_exit.order_role == "EXIT"
         assert market_exit.order_type == "MARKET"
+        assert market_exit.multiplier == 1.0  # close P&L resolves from the position
         assert market_exit.fallback_cancel_confirmed is True
         assert market_exit.original_order_id == exit_limit.order_id
         # Local exposure and its stop stay present until Dhan confirms the
@@ -991,6 +993,10 @@ def test_fresh_runtime_sl_exit_limit_fallback_closes_only_after_broker_fill(tmp_
         assert market_exit.state == OrderState.FILLED
         assert not env.position_manager.open_positions
         assert old_sl_id not in env.sl_monitor.armed_ids()
+        closed_trade = next(t for t in persistence.get_trades("gold_02")
+                            if t.get("trade_id") == position.trade_id)
+        assert closed_trade["multiplier"] == position.multiplier
+        assert closed_trade["gross_pnl"] == (97.0 - 103.0) * position.quantity * position.multiplier
         trade = env.runtimes.require("gold_02").lifecycle.get_trade(
             position.trade_id)
         assert str(trade.status).upper() in ("CLOSED", "COMPLETED")

@@ -2415,6 +2415,14 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             return
         try:
             multiplier = getattr(position, "multiplier", 1.0) or 1.0
+            if float(multiplier) == 1.0:
+                configured = self.config.instrument(position.instrument) or {}
+                configured_multiplier = float(configured.get("multiplier", 1.0) or 1.0)
+                if configured_multiplier != 1.0:
+                    # Repair only P&L metadata on the position being closed;
+                    # this does not alter or resubmit any broker order.
+                    multiplier = configured_multiplier
+                    position.multiplier = multiplier
             fill = Fill(
                 fill_id=f"LIVE-{uuid.uuid4().hex}",
                 order_id=f"RECON-CLOSE-{uuid.uuid4().hex}",

@@ -13,6 +13,36 @@ log = logging.getLogger("trading_engine")
 
 
 class FillFlowMixin:
+    def _position_pnl_multiplier(self, position, fill) -> float:
+        """Resolve contract multiplier for closing math without changing orders.
+
+        A fallback fill can carry the Fill default (1.0), and older fallback
+        entries can therefore leave 1.0 on the local position. Preserve a
+        non-default multiplier already owned by the position; if it is only
+        the default, use the configured instrument multiplier before falling
+        back to fill metadata.
+        """
+        def positive(value):
+            try:
+                result = float(value)
+            except (TypeError, ValueError):
+                return None
+            return result if math.isfinite(result) and result > 0 else None
+
+        stored = positive(getattr(position, "multiplier", None))
+        supplied = positive(getattr(fill, "multiplier", None))
+        configured = None
+        try:
+            instrument_config = self.config.instrument(position.instrument) or {}
+            configured = positive(instrument_config.get("multiplier"))
+        except Exception:
+            pass
+        if stored is not None and stored != 1.0:
+            return stored
+        if configured is not None and configured != 1.0:
+            return configured
+        return stored or supplied or configured or 1.0
+
     def _handle_fill(self, fill, signal_id: str | None, is_exit: bool | None = None,
                      env_name: Optional[str] = None) -> None:
         """Apply a fill exactly once, using explicit IDs throughout.
@@ -411,8 +441,19 @@ class FillFlowMixin:
                 env.fill_dedup.mark_processed(fill.fill_id)
                 return
             self._release_live_sl(env, current, fill.order_id, sl_role)
+            close_multiplier = self._position_pnl_multiplier(current, fill)
+            if not math.isclose(float(getattr(current, "multiplier", 1.0) or 1.0),
+                                close_multiplier):
+                log.warning(
+                    "[Engine] close multiplier mismatch for %s (%s): position=%s fill=%s config=%s; using %s",
+                    current.trade_id, fill.instrument,
+                    getattr(current, "multiplier", None),
+                    getattr(fill, "multiplier", None),
+                    (self.config.instrument(fill.instrument) or {}).get("multiplier"),
+                    close_multiplier)
+            current.multiplier = close_multiplier
             result = close_manager.close_position(
-                fill, current, fill.strategy_id, fill.multiplier,
+                fill, current, fill.strategy_id, close_multiplier,
                 exit_reason=exit_reason,
                 exit_signal_id=exit_signal_id or None,
             )
@@ -710,6 +751,17 @@ class FillFlowMixin:
             return
         # P&L on the exiting quantity only (entry side == position side).
         pnl_engine = env.pnl_engines.get(fill.strategy_id)
+        # Exit fill metadata can default to 1 on fallback/recovery orders.
+        # The already-open position is the authority for contract economics.
+        position_multiplier = self._position_pnl_multiplier(position, fill)
+        fill_multiplier = float(getattr(fill, "multiplier", 1.0) or 1.0)
+        effective_multiplier = position_multiplier
+        position.multiplier = effective_multiplier
+        if not math.isclose(fill_multiplier, effective_multiplier):
+            log.warning(
+                "[Engine] partial-exit multiplier mismatch for %s (%s): position=%s fill=%s; using %s",
+                trade.trade_id, fill.instrument, position_multiplier,
+                fill_multiplier, effective_multiplier)
         if pnl_engine is not None:
             entry_fill = Fill(
                 fill_id=(position.entry_fill_ids[0]
@@ -721,10 +773,11 @@ class FillFlowMixin:
                 price=float(position.average_entry or 0.0),
                 timestamp=float(position.entry_timestamp or 0.0),
                 strategy_id=position.strategy_id,
-                multiplier=fill.multiplier,
+                multiplier=effective_multiplier,
             )
             gross_pnl, charges, net_pnl = pnl_engine.calculate_realized_pnl(
-                entry_fill=entry_fill, exit_fill=fill, multiplier=fill.multiplier)
+                entry_fill=entry_fill, exit_fill=fill,
+                multiplier=effective_multiplier)
         else:
             gross_pnl, charges, net_pnl = 0.0, 0.0, 0.0
         try:
