@@ -215,6 +215,55 @@ def test_operator_can_attribute_broker_confirmed_manual_fill_to_supplied_signal_
         persistence.close()
 
 
+def test_operator_manual_import_uses_stop_from_exact_persisted_reversal_signal(
+        tmp_path, monkeypatch):
+    engine, env, broker, persistence = _adoption_runtime(
+        tmp_path, monkeypatch, omit_prior_from_recent_window=True)
+    source_signal_id = "REVERSAL-LONG-STOP-REFERENCE"
+    source_stop = 228050.0
+    source_trigger = 228902.0
+    persistence.save_signal({
+        "signal_id": source_signal_id, "strategy_id": "silver_01",
+        "instrument": "SILVERM", "side": "LONG", "signal_type": "entry",
+        "timestamp": CANDLE_TS, "candle_timestamp": CANDLE_TS,
+        "open": 228374.0, "high": 228900.0, "low": 228100.0,
+        "close": 228895.0, "trigger_price": source_trigger,
+        "stop_price": source_stop, "quantity": 1,
+        "signal_metadata": {"is_reversal_entry": True},
+    })
+    newer_closed = [1790746200.0, 228895.0, 229140.0, 228700.0,
+                    228871.0, 300.0]
+    env.data_adapter = SimpleNamespace(
+        fetch_candle_state=lambda *_args: {"closed": [newer_closed], "forming": None},
+        get_live_ltp=lambda _symbol: 229107.0,
+    )
+    body = {
+        "strategy_id": "silver_01", "broker_order_id": BROKER_ORDER,
+        "signal_candle_timestamp": CANDLE_TS,
+        "operator_confirmed_manual_fill": True,
+        "operator_signal_candle": {
+            "timestamp": CANDLE_TS, "open": 228374.0, "high": 228900.0,
+            "low": 228100.0, "close": 228895.0,
+            "trigger_price": source_trigger, "stop_price": source_stop,
+            "source_signal_id": source_signal_id,
+        },
+    }
+    try:
+        result = live_api._adopt_broker_position(body)
+        position = env.runtimes.require("silver_01").position_manager.open_positions[0]
+        assert result["adopted"] is True
+        assert result["broker_order_sent"] is False
+        assert result["trigger_price"] == source_trigger
+        assert result["stop_price"] == source_stop
+        assert position.side.value == "LONG"
+        assert position.sl_state == "ARMED"
+        assert position.stop_price == source_stop
+        assert not broker._orders
+    finally:
+        engine.stop()
+        persistence.close()
+
+
 def test_correct_imported_stop_from_exact_historical_signal_candle(
         tmp_path, monkeypatch):
     engine, env, broker, persistence = _adoption_runtime(tmp_path, monkeypatch)

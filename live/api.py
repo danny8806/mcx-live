@@ -428,6 +428,7 @@ def _adopt_broker_position(body: dict) -> dict:
         closed = candle_state.get("closed") or []
         operator_candle = body.get("operator_signal_candle")
         operator_attribution = bool(body.get("operator_confirmed_manual_fill"))
+        operator_source_signal_id = ""
         if len(closed) < 2 and not operator_attribution:
             raise HTTPException(status_code=409,
                                 detail="two completed 15m candles are required for the structural stop")
@@ -445,12 +446,48 @@ def _adopt_broker_position(body: dict) -> dict:
             except (TypeError, ValueError):
                 raise HTTPException(status_code=422,
                                     detail="operator candle OHLC and levels must be numeric")
+            operator_source_signal_id = str(
+                operator_candle.get("source_signal_id") or "")
             o0, h0, low0, close0 = operator_ohlc
             if (operator_ts != candle_timestamp or h0 <= low0 or o0 <= 0
-                    or close0 <= 0 or operator_trigger != h0
-                    or operator_stop != low0):
+                    or close0 <= 0):
                 raise HTTPException(status_code=409,
-                                    detail="operator candle/trigger/stop does not match the supplied signal candle")
+                                    detail="operator candle does not match the supplied signal candle")
+            if operator_source_signal_id:
+                source_signal = _persistence.get_signal(operator_source_signal_id)
+                source_metadata = {}
+                if source_signal:
+                    try:
+                        source_metadata = json.loads(
+                            source_signal.get("signal_metadata") or "{}")
+                    except (TypeError, ValueError):
+                        source_metadata = {}
+                try:
+                    source_ts = float((source_signal or {}).get("candle_timestamp")
+                                      or (source_signal or {}).get("signal_timestamp")
+                                      or 0)
+                    source_ohlc = [float((source_signal or {}).get(k) or 0)
+                                   for k in ("open", "high", "low", "close")]
+                    source_trigger = float((source_signal or {}).get("trigger_price") or 0)
+                    source_stop = float((source_signal or {}).get("stop_price") or 0)
+                except (TypeError, ValueError):
+                    source_ts, source_ohlc, source_trigger, source_stop = 0, [], 0, 0
+                if (not source_signal
+                        or source_signal.get("strategy_id") != strategy_id
+                        or source_signal.get("instrument") != "SILVERM"
+                        or str(source_signal.get("side") or "").upper() != "LONG"
+                        or source_ts != candle_timestamp
+                        or source_ohlc != operator_ohlc
+                        or source_trigger != operator_trigger
+                        or source_stop != operator_stop
+                        or operator_trigger <= operator_stop
+                        or not (source_metadata.get("is_reversal_entry")
+                                or source_metadata.get("external_position_stop_reference"))):
+                    raise HTTPException(status_code=409,
+                                        detail="operator stop reference does not match an exact persisted SILVERM LONG signal")
+            elif operator_trigger != h0 or operator_stop != low0:
+                raise HTTPException(status_code=409,
+                                    detail="operator candle trigger/stop must match its high/low unless tied to an exact persisted signal")
             if candle is not None:
                 if list(map(float, candle[1:5])) != operator_ohlc:
                     raise HTTPException(status_code=409,
@@ -544,6 +581,7 @@ def _adopt_broker_position(body: dict) -> dict:
                 "external_position_import": True,
                 "external_position_source": "dhan_tradebook_operator_reconcile",
                 "operator_confirmed_manual_fill": operator_attribution,
+                "operator_stop_source_signal_id": operator_source_signal_id or None,
                 "broker_order_id": broker_order_id,
                 "broker_fill_id": broker_fill_id,
                 "signal_reason": "operator_attributed_to_latest_closed_15m_candle",
