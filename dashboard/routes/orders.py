@@ -199,7 +199,10 @@ def _list_fills_sync(strategy: Optional[str] = None, instrument: Optional[str] =
                 "side": f.side,
                 "quantity": f.quantity,
                 "price": f.price,
-                "timestamp": f.timestamp,
+                # Runtime fill timestamps may be ISO strings after broker
+                # recovery, while paper/runtime fills commonly use epochs.
+                # Normalize before sorting the merged memory+DB history.
+                "timestamp": _ts_to_epoch(f.timestamp),
                 "strategy_id": f.strategy_id,
                 "multiplier": f.multiplier,
             })

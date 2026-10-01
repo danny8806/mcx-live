@@ -217,6 +217,30 @@ def test_restart_cannot_replay_pending_candle_cancel_and_reject_its_trigger():
     assert validator._validate_live_order_ownership(env, order) is None
 
 
+def test_reversal_market_fallback_still_requires_reversal_gate():
+    """Relabeling a reversal LIMIT as MARKET fallback must not evade its gate."""
+    validator = object.__new__(TradingEngine)
+    validator._gate_for = lambda _sid: SimpleNamespace(
+        entries_allowed=True, reversal_enabled=False,
+        exit_enabled=True, sl_enabled=True)
+    strategy = SimpleNamespace(
+        enabled=True, _trigger_generation=4,
+        is_fired_trigger_signal=lambda signal_id: signal_id == "ENTRY-SIGNAL")
+    env = SimpleNamespace(
+        safe_mode=None, gate_enabled=True, strategies={"s1": strategy},
+        position_manager=SimpleNamespace(get_positions_by_strategy=lambda _sid: []),
+    )
+    fallback = SimpleNamespace(
+        order_role="FALLBACK_MARKET", strategy_id="s1", instrument="SILVERM",
+        side="SELL", quantity=1, trade_id="T1", lifecycle_id="T1",
+        parent_signal_id="ENTRY-SIGNAL", reversal_parent_signal_id="EXIT-SIGNAL",
+        trigger_state="FIRED", trigger_generation=4,
+    )
+
+    assert validator._validate_live_order_ownership(env, fallback) == \
+        "STRATEGY_REVERSAL_GATE_CLOSED"
+
+
 @pytest.mark.parametrize("status,should_cancel", [
     ("filled", False), ("unknown", False), ("cancelled", True),
 ])

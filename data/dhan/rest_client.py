@@ -566,6 +566,17 @@ class DhanRESTClient:
                     continue
                 raise DhanAuthError(f"{path}: {r.text[:200]}")
 
+            # A 404 is a completed lookup result, not a transient transport
+            # failure. Let the correlation-recovery layer apply its own
+            # bounded, purpose-built retries; sleeping/retrying here multiplied
+            # those attempts and delayed every pending-order reconciliation.
+            if r.status_code == 404:
+                try:
+                    dhan_body = r.json()
+                except Exception:
+                    dhan_body = r.text
+                raise DhanHTTPError(r.status_code, r.text, dhan_body)
+
             try:
                 dhan_body = r.json()
             except Exception:

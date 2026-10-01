@@ -454,22 +454,44 @@ class LivePositionFlowMixin:
         # Open / open-strategy position check (P0/P1) against the POSITION-OWNED
         # local SL — never against a broker-side protective order.
         pm = getattr(env, "position_manager", None)
-        positions = []
-        if pm is not None:
-            try:
-                positions = pm.get_positions_by_strategy(strategy_id) or []
-            except Exception:
-                positions = []
+        if pm is None:
+            if rec is not None:
+                rec.extra["priority_blocker_error"] = "position_manager_unavailable"
+            return 0
+        try:
+            positions = pm.get_positions_by_strategy(strategy_id) or []
+        except Exception as exc:
+            if rec is not None:
+                rec.extra["priority_blocker_error"] = (
+                    f"position_lookup_failed: {exc}")
+            return 0
         open_pos = [p for p in positions if getattr(p, "is_open", False)]
         monitor = self._sl_monitor(env)
+        if open_pos and monitor is None:
+            if rec is not None:
+                rec.extra["priority_blocker_error"] = "sl_monitor_unavailable"
+            return 0
         for pos in open_pos:
             state = str(getattr(pos, "sl_state", None) or "NONE")
             if state in ("NONE", "SL_UNAVAILABLE"):
                 return 0
             if state in ("TRIGGERED", "EXITING"):
                 return 1
-            if not monitor.active_for(getattr(pos, "position_id", "")):
+            try:
+                monitor_active = bool(monitor and monitor.active_for(
+                    getattr(pos, "position_id", "")))
+            except Exception as exc:
+                if rec is not None:
+                    rec.extra["priority_blocker_error"] = (
+                        f"sl_monitor_check_failed: {exc}")
                 return 0
+            if not monitor_active:
+                if rec is not None:
+                    rec.extra["priority_blocker_error"] = (
+                        f"sl_monitor_inactive:{getattr(pos, 'position_id', '')}")
+                return 0
+        if rec is not None:
+            rec.extra.pop("priority_blocker_error", None)
         # In-flight legs on the engine order book (P2/P4).
         engine = getattr(env, "execution_engine", None)
         if engine is not None:

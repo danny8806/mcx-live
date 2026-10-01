@@ -68,6 +68,13 @@ class Order:
     trigger_state: Optional[str] = None
     trigger_generation: Optional[int] = None
     trigger_source: Optional[str] = None
+    # Execution handoff evidence. NOT_SENT means a local validation/gate
+    # stopped the order; BROKER_RESPONSE_RECEIVED means the broker adapter
+    # returned a response; OUTCOME_UNKNOWN means a request may be in flight.
+    submission_outcome: str = "NOT_SENT"
+    submission_attempt_count: int = 0
+    rejection_retry_count: int = 0
+    submission_attempts: list[dict] = field(default_factory=list)
 
 
 @dataclass

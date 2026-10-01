@@ -499,7 +499,15 @@ class EnvironmentFactoryMixin:
             gate = self._gate_for(order.strategy_id)
             if not gate.entries_allowed:
                 return "STRATEGY_ENTRY_GATE_CLOSED"
-            if (role == "REVERSAL_ENTRY" and not gate.reversal_enabled):
+            # A reversal-entry LIMIT is relabeled FALLBACK_MARKET only after
+            # its own broker-confirmed cancel. Preserve its reversal intent so
+            # the recovery MARKET cannot bypass a reversal-gate shutdown.
+            is_reversal_intent = (
+                role == "REVERSAL_ENTRY"
+                or (role == "FALLBACK_MARKET" and bool(
+                    getattr(order, "reversal_parent_signal_id", None)))
+            )
+            if is_reversal_intent and not gate.reversal_enabled:
                 return "STRATEGY_REVERSAL_GATE_CLOSED"
         elif role == "REVERSAL_EXIT":
             if not self._gate_for(order.strategy_id).reversal_enabled:

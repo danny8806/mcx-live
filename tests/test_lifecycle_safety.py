@@ -2,10 +2,11 @@ from types import SimpleNamespace
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
+import threading
 import pytest
 
 from execution.live.engine import LiveExecutionEngine
-from execution.models import Fill, OrderState
+from execution.models import Fill, Order, OrderState
 from execution.price_model import PricePreset
 from portfolio.position_manager import PositionManager
 from persistence.manager import PersistenceManager
@@ -158,6 +159,122 @@ def test_old_long_stop_cannot_close_new_short_and_current_stop_submits_once():
     execution.submit_order(duplicate)
     assert duplicate.state == OrderState.REJECTED
     assert len(broker.placed) == 4  # exactly one current SHORT exit
+
+
+def test_concurrent_fallback_submissions_reserve_execution_key_before_broker_post():
+    entered_broker = threading.Event()
+    release_broker = threading.Event()
+
+    class BlockingBroker:
+        def __init__(self):
+            self.calls = []
+
+        def place_market_order(self, **payload):
+            self.calls.append(payload)
+            entered_broker.set()
+            assert release_broker.wait(2.0)
+            return {"broker_order_id": "B-FALLBACK", "status": "submitted"}
+
+        def update_price(self, instrument, price):
+            pass
+
+    broker = BlockingBroker()
+    engine = LiveExecutionEngine(broker)
+    common = dict(
+        strategy_id="silver_01", instrument="SILVERM", side="SELL",
+        quantity=1, order_type="MARKET", trigger_state="FIRED",
+        trade_id="T-REVERSAL", lifecycle_id="T-REVERSAL",
+        parent_signal_id="S-REVERSAL", order_role="FALLBACK_MARKET",
+        original_order_id="O-LIMIT", fallback_cancel_confirmed=True,
+    )
+    first = Order(order_id="O-FALLBACK-1", **common)
+    second = Order(order_id="O-FALLBACK-2", **common)
+    engine._orders[first.order_id] = first
+    engine._orders[second.order_id] = second
+    worker_errors = []
+
+    def submit_first():
+        try:
+            engine.submit_order(first)
+        except Exception as exc:  # surface worker errors in the main test
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=submit_first)
+    worker.start()
+    try:
+        assert entered_broker.wait(2.0)
+        # The first call is paused in the broker while the second races it.
+        engine.submit_order(second)
+    finally:
+        release_broker.set()
+        worker.join(2.0)
+
+    assert not worker.is_alive()
+    assert worker_errors == []
+    assert len(broker.calls) == 1
+    assert first.state == OrderState.SUBMITTED
+    assert second.state == OrderState.REJECTED
+    assert second.reason.startswith(f"DUPLICATE_EXECUTION_KEY:{first.order_id}:")
+
+
+def test_fast_rejected_market_fallback_is_still_deduplicated():
+    class RejectingBroker:
+        def __init__(self):
+            self.calls = []
+
+        def place_market_order(self, **payload):
+            self.calls.append(payload)
+            return {"broker_order_id": "B-REJECTED", "status": "rejected",
+                    "raw_status": "REJECTED", "reason": "RMS rejected"}
+
+    broker = RejectingBroker()
+    engine = LiveExecutionEngine(broker)
+    common = dict(
+        strategy_id="silver_01", instrument="SILVERM", side="SELL",
+        quantity=1, order_type="MARKET", trigger_state="FIRED",
+        trade_id="T-REVERSAL", lifecycle_id="T-REVERSAL",
+        parent_signal_id="S-REVERSAL", order_role="FALLBACK_MARKET",
+        original_order_id="O-LIMIT", fallback_cancel_confirmed=True,
+    )
+    first = Order(order_id="O-FALLBACK-1", **common)
+    second = Order(order_id="O-FALLBACK-2", **common)
+    engine._orders[first.order_id] = first
+    engine._orders[second.order_id] = second
+
+    engine.submit_order(first)
+    engine.submit_order(second)
+
+    assert first.state == OrderState.REJECTED
+    assert second.state == OrderState.REJECTED
+    assert second.reason.startswith(f"DUPLICATE_EXECUTION_KEY:{first.order_id}:")
+    assert len(broker.calls) == 1
+
+
+def test_confirmed_cancel_exit_limit_allows_distinct_exit_market_fallback():
+    broker = CountingBroker()
+    engine = LiveExecutionEngine(broker)
+    root = Order(
+        order_id="O-EXIT-LIMIT", strategy_id="s1", instrument="GOLDM",
+        side="SELL", quantity=1, order_type="LIMIT", trade_id="T1",
+        lifecycle_id="T1", parent_signal_id="S1", order_role="EXIT",
+        position_id="P1", parent_position_id="P1", position_generation=1,
+        trigger_state="FIRED", state=OrderState.CANCELED,
+    )
+    fallback = Order(
+        order_id="O-EXIT-MARKET", strategy_id="s1", instrument="GOLDM",
+        side="SELL", quantity=1, order_type="MARKET", trade_id="T1",
+        lifecycle_id="T1", parent_signal_id="S1", order_role="EXIT",
+        position_id="P1", parent_position_id="P1", position_generation=1,
+        trigger_state="FIRED", original_order_id=root.order_id,
+        fallback_cancel_confirmed=True,
+    )
+    engine._orders[root.order_id] = root
+    engine._orders[fallback.order_id] = fallback
+
+    engine.submit_order(fallback)
+
+    assert fallback.state == OrderState.FILLED
+    assert len(broker.placed) == 1
 
 
 def test_dema_atr_strategy_intent_stays_explicit_and_shared():

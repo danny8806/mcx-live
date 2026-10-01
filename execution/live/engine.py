@@ -25,6 +25,7 @@ from execution.live.broker_client import (
     BrokerGateClosed,
     LiveBrokerClient,
     OrderPlacementUnresolved,
+    PreTradeGateBlocked,
 )
 from execution.models import Fill, Order, OrderState
 from execution.price_model import (
@@ -82,6 +83,27 @@ class LiveExecutionEngine:
 
     def _now(self) -> float:
         return self._clock()
+
+    @staticmethod
+    def _execution_key(order: Order) -> tuple:
+        """Stable identity for one logical broker execution leg.
+
+        A confirmed-cancel fallback is distinct from its original LIMIT leg,
+        including exit fallbacks that intentionally retain the EXIT role. Two
+        fallback children of the same root remain the same leg and may never
+        both reach Dhan, even if the first child has already been rejected.
+        """
+        fallback_root = (getattr(order, "original_order_id", None)
+                         if getattr(order, "fallback_cancel_confirmed", False)
+                         else None)
+        return (
+            getattr(order, "lifecycle_id", None) or order.trade_id,
+            getattr(order, "parent_position_id", None),
+            getattr(order, "parent_signal_id", None) or order.entry_signal_id,
+            str(order.order_role or "").upper(),
+            getattr(order, "position_generation", None),
+            fallback_root,
+        )
 
     def update_price(self, instrument: str, price: float) -> None:
         with self._price_lock:
@@ -272,32 +294,36 @@ class LiveExecutionEngine:
                 return order
 
         # Execution-key idempotency covers callers that bypass OrderManager.
-        key = (order.lifecycle_id, order.parent_position_id,
-               order.parent_signal_id, role, order.position_generation)
+        key = self._execution_key(order)
         with self._lock:
+            # The initial state check above is only a fast-path. Two recovery
+            # workers can enter submit_order with the same Order before either
+            # reaches this section. Recheck under the shared engine lock, then
+            # reserve the execution key by moving the order to SUBMITTED before
+            # releasing the lock and making the broker call. Without this
+            # atomic reservation both workers could pass duplicate detection
+            # while the first order still appeared CREATED and POST twice.
+            if order.state != OrderState.CREATED:
+                raise ValueError(f"Cannot submit order in state {order.state}")
             for prior in self._orders.values():
-                prior_key = (getattr(prior, "lifecycle_id", None) or prior.trade_id,
-                             getattr(prior, "parent_position_id", None),
-                             getattr(prior, "parent_signal_id", None) or prior.entry_signal_id,
-                             str(prior.order_role or "").upper(),
-                             getattr(prior, "position_generation", None))
-                if prior is not order and prior_key == key and prior.state in (
-                        OrderState.SUBMITTED, OrderState.ACKNOWLEDGED,
-                        OrderState.PARTIALLY_FILLED, OrderState.FILLED):
+                prior_key = self._execution_key(prior)
+                if (prior is not order and prior_key == key
+                        and prior.state != OrderState.CREATED):
                     order.state = OrderState.REJECTED
-                    order.reason = f"DUPLICATE_EXECUTION_KEY:{prior.order_id}"
+                    order.reason = (f"DUPLICATE_EXECUTION_KEY:{prior.order_id}"
+                                    f":{getattr(prior.state, 'value', prior.state)}")
                     order.updated_at = self._now()
                     return order
-
-        order.state = OrderState.SUBMITTED
-        order.updated_at = self._now()
-        # §9.4 — record the REQUESTED price/type on the book before placement;
-        # the placement response is never trusted as the fill price (the fill
-        # always flows from the broker's own order records).
-        if order.requested_price is None:
-            order.requested_price = order.price
+            order.state = OrderState.SUBMITTED
+            order.updated_at = self._now()
+            # §9.4 — record the REQUESTED price/type on the book before
+            # placement; the placement response is never trusted as the fill
+            # price (the fill always flows from the broker's own order records).
+            if order.requested_price is None:
+                order.requested_price = order.price
 
         try:
+            order.submission_outcome = "BROKER_CALL_STARTED"
             result = self.broker.place_market_order(
                 side=order.side, quantity=order.quantity, instrument=order.instrument,
                 order_type=order.order_type, price=order.price,
@@ -306,6 +332,13 @@ class LiveExecutionEngine:
             )
         except BrokerGateClosed as e:
             order.state = OrderState.REJECTED
+            order.submission_outcome = "NOT_SENT"
+            order.reason = str(e)
+            order.updated_at = self._now()
+            return order
+        except PreTradeGateBlocked as e:
+            order.state = OrderState.REJECTED
+            order.submission_outcome = "NOT_SENT"
             order.reason = str(e)
             order.updated_at = self._now()
             return order
@@ -316,6 +349,7 @@ class LiveExecutionEngine:
             # durable pending row stays ENTRY_SENT and reconciliation keeps
             # asking the broker, which is the only authority that can resolve it.
             order.state = OrderState.SUBMITTED
+            order.submission_outcome = "OUTCOME_UNKNOWN"
             order.reason = str(e)
             order.filled_quantity = 0
             order.updated_at = self._now()
@@ -326,12 +360,19 @@ class LiveExecutionEngine:
             # message so the book/UI show the actual reason; the generic
             # sentinel is only used when the exception carries no usable detail.
             order.state = OrderState.REJECTED
+            # Pure adapter argument validation happens before its HTTP POST.
+            # Other exceptions can occur after the request crossed the client
+            # boundary, so preserve uncertainty instead of claiming not sent.
+            order.submission_outcome = (
+                "NOT_SENT" if isinstance(e, ValueError)
+                else "OUTCOME_UNKNOWN")
             order.reason = str(e) or "LIVE_BROKER_UNAVAILABLE"
             order.updated_at = self._now()
             return order
 
         if not result:
             order.state = OrderState.REJECTED
+            order.submission_outcome = "OUTCOME_UNKNOWN"
             order.reason = "LIVE_ORDER_NO_STATUS"
             order.updated_at = self._now()
             return order
@@ -341,6 +382,14 @@ class LiveExecutionEngine:
         # LIVE- id; register the broker-native id too so late broker events
         # (status polls / fills) route through the explicit mapping.
         broker_order_id = result.get("broker_order_id")
+        order.submission_outcome = "BROKER_RESPONSE_RECEIVED"
+        order.submission_attempt_count = int(
+            result.get("submission_attempt_count") or 1)
+        order.rejection_retry_count = int(
+            result.get("rejection_retry_count") or 0)
+        order.submission_attempts = list(result.get("submission_attempts") or [])
+        order.correlation_id = (result.get("correlation_id")
+                                or order.correlation_id)
         if broker_order_id and self.broker_router is not None:
             try:
                 self.broker_router.register_from_kwargs(

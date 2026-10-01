@@ -83,3 +83,23 @@ def test_old_reversal_signal_stays_deduplicated_while_broker_order_is_pending():
     # The fixture candle is intentionally older than the old one-hour cleanup
     # threshold. Age must not release a live broker order's dedup key.
     assert manager.submit_signal(_signal(), trade_id="duplicate-trade") is None
+
+
+def test_terminal_rejection_is_returned_for_audit_not_collapsed_to_none():
+    class RejectingExecution(_Execution):
+        def submit_order(self, order):
+            order.state = OrderState.REJECTED
+            order.reason = "STRATEGY_ENTRY_GATE_CLOSED"
+            order.submission_outcome = "NOT_SENT"
+            return order
+
+    manager = OrderManager(RejectingExecution())
+    rejected = manager.submit_signal(_signal(), trade_id="rejected-trade")
+
+    assert rejected is not None
+    assert rejected.state == OrderState.REJECTED
+    assert rejected.reason == "STRATEGY_ENTRY_GATE_CLOSED"
+    assert rejected.submission_outcome == "NOT_SENT"
+    # Terminal failures release dedup so a later genuinely new attempt can be
+    # evaluated, while the caller still receives this order for persistence.
+    assert manager.submit_signal(_signal(), trade_id="retry-trade") is not None

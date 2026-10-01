@@ -964,10 +964,26 @@ class SignalFlowMixin:
         self.publish_event("order_created", {"trade_id": trade.trade_id, "order_id": order.order_id,
             "signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
             "instrument": signal.instrument, "state": order.state.value,
+            "submission_outcome": getattr(order, "submission_outcome", "NOT_SENT"),
+            "reason": getattr(order, "reason", None),
             "execution_mode": env.mode}, env_name=env.name)
+        self.publish_event("order_submission_outcome", {
+            "trade_id": trade.trade_id, "order_id": order.order_id,
+            "signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
+            "instrument": signal.instrument, "state": order.state.value,
+            "submission_outcome": getattr(order, "submission_outcome", "NOT_SENT"),
+            "submission_attempt_count": getattr(order, "submission_attempt_count", 0),
+            "rejection_retry_count": getattr(order, "rejection_retry_count", 0),
+            "submission_attempts": getattr(order, "submission_attempts", []),
+            "broker_order_id": getattr(order, "_broker_order_id", None),
+            "reason": getattr(order, "reason", None),
+            "execution_mode": env.mode,
+        }, env_name=env.name)
         # Phase 9.6 — the LIVE pending order whose trigger fired is now sent to
         # the broker: record ENTRY_SENT with the broker correlation tie-back.
-        if live_pending is not None:
+        if (live_pending is not None
+                and getattr(order, "submission_outcome", "NOT_SENT")
+                != "NOT_SENT"):
             self._mark_live_pending_entry_sent(env, signal, trade, order)
         # A broker placement rejection is terminal even when Dhan returned no
         # broker order id. Settle the canonical trade and pending trigger now;

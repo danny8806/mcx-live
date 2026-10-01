@@ -53,6 +53,10 @@ class Http:
         return {}
 
 
+class DhanNotFound(RuntimeError):
+    status = 404
+
+
 def _transport(http, **kw):
     inst = DhanRestTransport(
         client_id="C1",
@@ -85,6 +89,9 @@ def test_failed_lookup_raises_unresolved_not_rejection():
     inst = _transport(http)
     with pytest.raises(OrderPlacementUnresolved):
         _place(inst)
+    # An ambiguous lookup must never trigger a second placement POST.
+    assert len(http.posts) == 1
+    assert len(http.gets) == 3
 
 
 def test_unresolved_error_carries_the_correlation_id():
@@ -95,13 +102,14 @@ def test_unresolved_error_carries_the_correlation_id():
     assert "CORR-XYZ" in str(ei.value)
 
 
-def test_unresolved_is_not_the_definitive_not_found_error():
-    """The two outcomes must not be the same exception type."""
+def test_empty_lookup_body_retries_lookup_and_stays_unresolved():
+    """An empty 200 body is ambiguous, not proof that placement never landed."""
     http_ok = Http(post_exc=TimeoutError("t"), lookup_body={})
-    with pytest.raises(RuntimeError) as ei:
+    with pytest.raises(OrderPlacementUnresolved) as ei:
         _place(_transport(http_ok))
-    assert not isinstance(ei.value, OrderPlacementUnresolved)
-    assert "found no order" in str(ei.value)
+    assert "UNRESOLVED" in str(ei.value)
+    assert len(http_ok.posts) == 1
+    assert len(http_ok.gets) == 3
 
 
 # ── 2. a successful lookup that FOUND the order adopts it ──────────────────
@@ -124,6 +132,47 @@ def test_successful_lookup_adopts_a_filled_order():
     res = _place(inst)
     assert res["broker_order_id"] == "B78"
     assert res["raw_status"] == "TRADED"
+
+
+def test_lookup_retries_transient_errors_until_the_order_is_found():
+    class RecoveringLookupHttp(Http):
+        def __init__(self):
+            super().__init__(post_exc=TimeoutError("response lost"))
+            self.lookup_count = 0
+
+        def _get(self, path):
+            self.gets.append(path)
+            self.lookup_count += 1
+            if self.lookup_count < 3:
+                raise ConnectionError("temporary lookup outage")
+            return {"orderId": "B-FOUND-AFTER-RETRY",
+                    "orderStatus": "PENDING"}
+
+    http = RecoveringLookupHttp()
+    result = _place(_transport(http), correlation_id="CORR-RECOVER")
+
+    assert result["broker_order_id"] == "B-FOUND-AFTER-RETRY"
+    assert result["note"] == "resolved_via_correlation_lookup"
+    assert len(http.posts) == 1  # ambiguous lookups never repost
+    assert len(http.gets) == 3
+
+
+def test_internal_typeerror_after_post_attempt_does_not_send_second_post():
+    class TypeErrorAfterAttempt(Http):
+        def __init__(self):
+            super().__init__(lookup_body={
+                "orderId": "B-TYPEERROR", "orderStatus": "PENDING"})
+
+        def _post(self, path, payload, retry_network=True):
+            self.posts.append((path, dict(payload)))
+            raise TypeError("transport decoder failed after request")
+
+    http = TypeErrorAfterAttempt()
+    result = _place(_transport(http), correlation_id="CORR-TYPEERROR")
+
+    assert result["broker_order_id"] == "B-TYPEERROR"
+    assert len(http.posts) == 1
+    assert len(http.gets) == 1
 
 
 @pytest.mark.parametrize(
@@ -170,8 +219,9 @@ def test_resolver_reports_a_broker_order():
 
 
 def test_resolver_distinguishes_not_found_from_unresolved():
+    # Empty 200 responses are ambiguous; only the broker's 404 is definitive.
     http = Http(lookup_body={})
-    assert _transport(http).order_by_correlation_id("C")["status"] == "not_found"
+    assert _transport(http).order_by_correlation_id("C")["status"] == "unresolved"
     http2 = Http(lookup_exc=ConnectionError("down"))
     assert _transport(http2).order_by_correlation_id("C")["status"] == "unresolved"
 
@@ -189,6 +239,37 @@ def test_explicit_dhan_order_error_is_rejected_without_correlation_lookup():
     assert rec["raw_status"] == "REJECTED"
     assert "Order rejected" in rec["reason"]
     assert http.gets == []
+    assert len(http.posts) == 4  # initial attempt plus exactly three retries
+    assert len({payload["correlationId"] for _, payload in http.posts}) == 4
+    assert rec["submission_attempt_count"] == 4
+    assert rec["rejection_retry_count"] == 3
+    assert [attempt["status"] for attempt in rec["submission_attempts"]] == [
+        "rejected", "rejected", "rejected", "rejected"]
+
+
+def test_bounded_rejection_retries_stop_after_verified_acceptance():
+    class RejectionThenAccepted(Http):
+        def __init__(self):
+            super().__init__()
+
+        def _post(self, path, payload, retry_network=True):
+            self.posts.append((path, dict(payload)))
+            n = len(self.posts)
+            if n < 3:
+                return {"orderId": f"B-REJ-{n}", "orderStatus": "REJECTED",
+                        "omsErrorDescription": f"temporary rejection {n}"}
+            return {"orderId": "B-ACCEPTED", "orderStatus": "PENDING"}
+
+    http = RejectionThenAccepted()
+    result = _place(_transport(http), correlation_id="REJECT-RETRY")
+
+    assert result["status"] == "submitted"
+    assert result["broker_order_id"] == "B-ACCEPTED"
+    assert result["submission_attempt_count"] == 3
+    assert result["rejection_retry_count"] == 2
+    assert [attempt["status"] for attempt in result["submission_attempts"]] == [
+        "rejected", "rejected", "submitted"]
+    assert len({payload["correlationId"] for _, payload in http.posts}) == 3
 
 
 def test_correlation_http_404_is_authoritative_not_found():
@@ -200,15 +281,150 @@ def test_correlation_http_404_is_authoritative_not_found():
     assert rec["status"] == "not_found"
 
 
-def test_placement_timeout_plus_correlation_http_404_is_definitive_absence():
+def test_poller_correlation_resolver_retries_transient_404_then_adopts_order():
+    class DelayedIndexHttp(Http):
+        def __init__(self):
+            super().__init__()
+            self.lookup_count = 0
+
+        def _get(self, path):
+            self.gets.append(path)
+            self.lookup_count += 1
+            if self.lookup_count == 1:
+                raise DhanNotFound("correlation index lag")
+            return [{"orderId": "B-POLLER-RECOVERED",
+                     "orderStatus": "PENDING", "quantity": 1}]
+
+    http = DelayedIndexHttp()
+    result = _transport(http).order_by_correlation_id("CORR-POLLER")
+
+    assert result["broker_order_id"] == "B-POLLER-RECOVERED"
+    assert result["status"] == "submitted"
+    assert len(http.gets) == 2
+
+
+def test_poller_resolver_reports_not_found_only_after_every_lookup_is_404():
+    http = Http(lookup_exc=DhanNotFound("no correlation"))
+
+    result = _transport(http).order_by_correlation_id("CORR-ABSENT")
+
+    assert result["status"] == "not_found"
+    assert len(http.gets) == 3
+
+
+def test_resolver_coerces_empty_list_to_unresolved_not_not_found():
+    http = Http(lookup_body=[])
+    rec = _transport(http).order_by_correlation_id("EMPTY")
+    assert rec["status"] == "unresolved"
+    assert "no usable order record" in rec["reason"]
+    assert len(http.gets) == 3
+
+
+def test_repeated_correlation_http_404_is_bounded_confirmed_absence():
     class NotFound(RuntimeError):
         status = 404
 
     http = Http(post_exc=TimeoutError("response lost"),
                 lookup_exc=NotFound("no such correlation"))
-    with pytest.raises(RuntimeError, match="found no order") as exc:
+    with pytest.raises(RuntimeError, match="confirmed no order") as exc:
         _place(_transport(http))
     assert not isinstance(exc.value, OrderPlacementUnresolved)
+    # Each placement attempt requires the full bounded lookup sequence to
+    # return 404 before another POST is eligible.
+    assert len(http.posts) == 3
+    assert len(http.gets) == 9
+
+
+def test_transient_correlation_404_then_found_does_not_repost():
+    class DelayedIndexHttp(Http):
+        def __init__(self):
+            super().__init__(post_exc=TimeoutError("response lost"))
+            self.lookup_count = 0
+
+        def _get(self, path):
+            self.gets.append(path)
+            self.lookup_count += 1
+            if self.lookup_count == 1:
+                raise DhanNotFound("index not ready")
+            return {"orderId": "B-DELAYED-INDEX", "orderStatus": "PENDING"}
+
+    http = DelayedIndexHttp()
+    result = _place(_transport(http), correlation_id="CORR-DELAYED")
+
+    assert result["broker_order_id"] == "B-DELAYED-INDEX"
+    assert len(http.posts) == 1
+    assert len(http.gets) == 2
+
+
+def test_confirmed_absence_retries_post_and_sends_the_intent_to_dhan():
+    class RetryHttp(Http):
+        def __init__(self):
+            super().__init__(lookup_exc=DhanNotFound("no order"))
+            self._post_count = 0
+
+        def _post(self, path, payload, retry_network=True):
+            self.posts.append((path, dict(payload)))
+            self._post_count += 1
+            if self._post_count == 1:
+                raise TimeoutError("first response lost")
+            return {"orderId": "B-RETRY", "orderStatus": "PENDING"}
+
+    http = RetryHttp()
+    result = _place(_transport(http), correlation_id="CORR-RETRY")
+
+    assert result["broker_order_id"] == "B-RETRY"
+    assert result["status"] == "submitted"
+    assert len(http.posts) == 2
+    assert len(http.gets) == 3
+    assert {payload["correlationId"] for _, payload in http.posts} == {
+        "CORR-RETRY"}
+
+
+def test_retries_after_each_confirmed_absence_but_stops_when_order_lands():
+    class RetryHttp(Http):
+        def __init__(self):
+            super().__init__(lookup_exc=DhanNotFound("no order"))
+            self._post_count = 0
+
+        def _post(self, path, payload, retry_network=True):
+            self.posts.append((path, dict(payload)))
+            self._post_count += 1
+            if self._post_count < 3:
+                raise TimeoutError("response lost")
+            return {"orderId": "B-THIRD", "orderStatus": "PENDING"}
+
+    http = RetryHttp()
+    result = _place(_transport(http), correlation_id="CORR-THIRD")
+
+    assert result["broker_order_id"] == "B-THIRD"
+    assert len(http.posts) == 3
+    assert len(http.gets) == 6
+
+
+def test_market_fallback_submission_uses_same_safe_delivery_retry():
+    class RetryHttp(Http):
+        def __init__(self):
+            super().__init__(lookup_exc=DhanNotFound("no order"))
+            self._post_count = 0
+
+        def _post(self, path, payload, retry_network=True):
+            self.posts.append((path, dict(payload)))
+            self._post_count += 1
+            if self._post_count == 1:
+                raise TimeoutError("fallback response lost")
+            return {"orderId": "B-MARKET", "orderStatus": "PENDING"}
+
+    http = RetryHttp()
+    result = _transport(http).place_market_order(
+        side="SELL", quantity=1, instrument="GOLDM", order_type="MARKET",
+        correlation_id="CORR-MARKET")
+
+    assert result["broker_order_id"] == "B-MARKET"
+    assert len(http.posts) == 2
+    assert len(http.gets) == 3
+    assert all(payload["orderType"] == "MARKET" for _, payload in http.posts)
+    assert all(payload["price"] == payload["triggerPrice"] == 0.0
+               for _, payload in http.posts)
 
 
 def test_resolver_without_a_correlation_id_is_unresolved_not_not_found():
@@ -246,6 +462,7 @@ def test_engine_parks_unresolved_placement_as_submitted():
 
     assert out.state == OrderState.SUBMITTED, \
         "unresolved placement must stay pending, never be rejected"
+    assert out.submission_outcome == "OUTCOME_UNKNOWN"
     assert "UNRESOLVED" in (out.reason or "")
 
 
@@ -275,6 +492,7 @@ def test_engine_still_rejects_a_definitive_broker_rejection():
     order.correlation_id = "CORR2"
     out = eng.submit_order(order)
     assert out.state == OrderState.REJECTED
+    assert out.submission_outcome == "OUTCOME_UNKNOWN"
     assert "insufficient funds" in (out.reason or "")
 
 
@@ -311,6 +529,7 @@ def test_engine_order_state_follows_dhan_placement_result(broker_result, expecte
                   trigger_state="FIRED")
     out = eng.submit_order(order)
     assert out.state == OrderState(expected_state)
+    assert out.submission_outcome == "BROKER_RESPONSE_RECEIVED"
     assert getattr(out, "_broker_order_id", None) == broker_result["broker_order_id"]
     if expected_state == "rejected":
         assert out.reason == "RMS rejected"

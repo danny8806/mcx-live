@@ -697,6 +697,11 @@ class OrderWatcher:
         # P0..P4 gate: exits, SL and reversal leg must outrank an entry.
         blocker = self._highest_priority_blocker(rec)
         if blocker is not None:
+            blocker_error = rec.extra.get("priority_blocker_error")
+            if blocker_error:
+                self._fallback_wait_alert(
+                    rec, "priority_block_check_unavailable",
+                    error=str(blocker_error))
             return "LOCK"
         if classification == SIGNAL_EXPIRED and rec.trigger_crossed:
             # A fired trigger is still valid intent for its already-submitted
@@ -899,10 +904,14 @@ class OrderWatcher:
     def _highest_priority_blocker(self, rec: OrderWatchRecord) -> Optional[int]:
         """Any P0-P4 condition must complete before this entry proceeds."""
         if self._blocker_fn is not None:
+            rec.extra.pop("priority_blocker_error", None)
             try:
-                return self._blocker_fn(rec.strategy_id, rec)
-            except Exception:  # pragma: no cover - defensive
-                pass
+                result = self._blocker_fn(rec.strategy_id, rec)
+                return result
+            except Exception as exc:  # fail closed; never fall back to weaker checks
+                rec.extra["priority_blocker_error"] = (
+                    f"priority_blocker_callback_failed: {exc}")
+                return 0
         engine = self._engine
         if engine is None:
             return None

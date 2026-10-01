@@ -27,6 +27,7 @@ def test_order_persistence_includes_assigned_broker_order_id():
         parent_position_id="POS-1", position_generation=1,
         original_order_id=None, trigger_state="FIRED",
         trigger_generation=None, trigger_source="operator_action",
+        submission_outcome="BROKER_RESPONSE_RECEIVED", reason=None,
         _broker_order_id="23826092913404",
         reversal_parent_signal_id="REV-EXIT-1",
     )
@@ -36,3 +37,49 @@ def test_order_persistence_includes_assigned_broker_order_id():
 
     assert saved[0]["broker_order_id"] == "23826092913404"
     assert saved[0]["reversal_parent_signal_id"] == "REV-EXIT-1"
+    assert saved[0]["submission_outcome"] == "BROKER_RESPONSE_RECEIVED"
+    assert saved[0]["reason"] is None
+
+
+def test_order_database_keeps_submission_evidence_across_later_status_update(tmp_path):
+    from persistence.manager import PersistenceManager
+
+    db_path = tmp_path / "orders.db"
+    persistence = PersistenceManager(
+        state_path=str(tmp_path / "state.json"), db_path=str(db_path),
+        execution_mode="LIVE",
+    )
+    persistence.save_signal({
+        "signal_id": "S-AUDIT", "strategy_id": "silver_01",
+        "instrument": "SILVERM", "side": "SHORT", "signal_type": "SHORT",
+        "timestamp": 1790845200, "quantity": 1,
+    })
+    persistence.save_trade({
+        "trade_id": "T-AUDIT", "strategy_id": "silver_01",
+        "instrument": "SILVERM", "side": "SHORT", "status": "pending",
+        "entry_signal_id": "S-AUDIT",
+    })
+    base = {
+        "order_id": "LIVE-AUDIT", "strategy_id": "silver_01",
+        "instrument": "SILVERM", "side": "SELL", "quantity": 1,
+        "order_type": "LIMIT", "price": 100.0, "state": "rejected",
+        "filled_quantity": 0, "average_fill_price": 0.0,
+        "created_at": "2026-10-01T09:00:00+00:00",
+        "updated_at": "2026-10-01T09:00:00+00:00",
+        "trade_id": "T-AUDIT", "signal_id": "S-AUDIT",
+        "reason": "Dhan RMS rejection",
+        "submission_outcome": "BROKER_RESPONSE_RECEIVED",
+    }
+    persistence.save_order(base)
+    # A later poller update may not know the original handoff evidence. It must
+    # update status without erasing the fact that Dhan answered the POST.
+    persistence.save_order({**base, "state": "rejected",
+                            "updated_at": "2026-10-01T09:00:01+00:00"})
+    row = persistence.query_one(
+        "SELECT reason, submission_outcome FROM orders WHERE order_id=?",
+        ("LIVE-AUDIT",),
+    )
+    assert row == {
+        "reason": "Dhan RMS rejection",
+        "submission_outcome": "BROKER_RESPONSE_RECEIVED",
+    }

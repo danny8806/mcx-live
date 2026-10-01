@@ -106,6 +106,14 @@ def _is_raw_terminal(raw_status: object) -> bool:
 # stage; the abnormal-terminal stages sit above plain submitted.
 _STATUS_RANK = {"submitted": 0, "rejected": 1, "cancelled": 1, "expired": 1, "filled": 2}
 
+# A lost POST response is retried only after Dhan's correlation endpoint has
+# authoritatively confirmed that no order exists. Ambiguous lookups never
+# reach this retry path. The bound prevents a broker outage from holding the
+# strategy tick indefinitely or generating an unbounded stream of requests.
+_MAX_CONFIRMED_ABSENCE_RETRIES = 2
+_MAX_CORRELATION_LOOKUP_RETRIES = 2
+_MAX_DEFINITIVE_REJECTION_RETRIES = 3
+
 
 class DhanRestTransport(LiveBrokerClient):
     """Live account authority backed by Dhan v2 REST (orders/positions/funds)."""
@@ -226,7 +234,12 @@ class DhanRestTransport(LiveBrokerClient):
     def place_market_order(self, side: str, quantity: int, instrument: str,
                            order_type: str = "MARKET", price: Optional[float] = None,
                            trigger_price: Optional[float] = None,
-                           correlation_id: Optional[str] = None) -> dict:
+                           correlation_id: Optional[str] = None,
+                           _confirmed_absence_retries: int = 0,
+                           _rejection_retries: int = 0,
+                           _attempt_history: Optional[list] = None) -> dict:
+        if _attempt_history is None:
+            _attempt_history = []
         side_u = str(side).upper()
         # INVARIANT 10 — the last gate before the wire, checked FIRST.  This
         # system has NO broker-side protective stop: a stop-loss is the local
@@ -296,12 +309,30 @@ class DhanRestTransport(LiveBrokerClient):
         # UNKNOWN, and re-POSTing could create a duplicate order.  Any failure
         # is recovered via the broker correlation lookup (single economic
         # order), never by a blind retry.
+        resp = None
+        placement_error = None
         try:
             resp = self._http._post("/orders", payload, retry_network=False)
-        except TypeError:
-            # HTTP layers that don't expose the placement-retry knob (fakes).
-            resp = self._http._post("/orders", payload)
+        except TypeError as exc:
+            # Compatibility for older injected HTTP adapters that do not
+            # accept the retry_network keyword. Catch only Python's exact
+            # signature-mismatch case: an internal TypeError may occur after
+            # a request was sent and must never cause a second POST.
+            signature_mismatch = (
+                "retry_network" in str(exc)
+                and "unexpected keyword argument" in str(exc))
+            if signature_mismatch:
+                try:
+                    resp = self._http._post("/orders", payload)
+                except Exception as fallback_exc:
+                    placement_error = fallback_exc
+            else:
+                placement_error = exc
         except Exception as exc:
+            placement_error = exc
+
+        if placement_error is not None:
+            exc = placement_error
             place_status = getattr(exc, "status", None)
             self._audit(_AUDIT_ACTION.get(order_type_u, "PLACE_ORDER"),
                         "/orders", "POST", payload, error=exc,
@@ -315,7 +346,14 @@ class DhanRestTransport(LiveBrokerClient):
                     and getattr(exc, "dhan_error_type", None) == "Order_Error"):
                 reason = (getattr(exc, "text", None)
                           or getattr(exc, "body", None) or str(exc))
-                return {
+                _attempt_history.append({
+                    "attempt": _rejection_retries + 1,
+                    "correlation_id": correlation_id,
+                    "http_status": int(place_status),
+                    "status": "rejected",
+                    "reason": str(reason),
+                })
+                rejected = {
                     "broker_order_id": None,
                     "status": "rejected",
                     "raw_status": "REJECTED",
@@ -332,9 +370,15 @@ class DhanRestTransport(LiveBrokerClient):
                     "average_fill_price": 0.0,
                     "last_accounted_qty": 0,
                 }
+                return self._retry_definitive_rejection(
+                    rejected, side_u, quantity, instrument, order_type_u,
+                    limit_price, trigger, correlation_id,
+                    _confirmed_absence_retries, _rejection_retries,
+                    _attempt_history)
             return self._resolve_unknown_placement(
                 correlation_id, side_u, quantity, instrument,
-                order_type_u, limit_price, trigger, exc)
+                order_type_u, limit_price, trigger, exc,
+                confirmed_absence_retries=_confirmed_absence_retries)
         self._audit(_AUDIT_ACTION.get(order_type_u, "PLACE_ORDER"),
                     "/orders", "POST", payload, response=resp, http_status=200,
                     correlation_id=correlation_id)
@@ -342,7 +386,8 @@ class DhanRestTransport(LiveBrokerClient):
             return self._resolve_unknown_placement(
                 correlation_id, side_u, quantity, instrument,
                 order_type_u, limit_price, trigger,
-                RuntimeError(f"Dhan returned malformed placement body: {resp!r}"))
+                RuntimeError(f"Dhan returned malformed placement body: {resp!r}"),
+                confirmed_absence_retries=_confirmed_absence_retries)
         resp = _coerce_status_body(resp)
         broker_order_id = resp.get("orderId") or resp.get("order_id")
         raw_status = resp.get("orderStatus") or resp.get("order_status") or "PENDING"
@@ -350,11 +395,20 @@ class DhanRestTransport(LiveBrokerClient):
                   or resp.get("errorMessage")
                   or resp.get("reason") or None)
         normalized_status = _normalize_status(raw_status)
+        _attempt_history.append({
+            "attempt": _rejection_retries + 1,
+            "correlation_id": correlation_id,
+            "http_status": 200,
+            "broker_order_id": broker_order_id,
+            "raw_status": str(raw_status).upper(),
+            "status": normalized_status,
+            "reason": str(reason) if reason else None,
+        })
         if (not broker_order_id
                 and normalized_status in ("rejected", "cancelled", "expired")):
             # Dhan can report a terminal error without an order id. This
             # is still explicit placement truth and must settle locally.
-            return {
+            terminal = {
                 "broker_order_id": None, "status": _placement_state(normalized_status),
                 "raw_status": str(raw_status).upper(),
                 "reason": reason or f"Dhan placement status: {raw_status}",
@@ -367,6 +421,15 @@ class DhanRestTransport(LiveBrokerClient):
                 "filled_quantity": 0, "average_fill_price": 0.0,
                 "last_accounted_qty": 0,
             }
+            if normalized_status == "rejected":
+                return self._retry_definitive_rejection(
+                    terminal, side_u, quantity, instrument, order_type_u,
+                    limit_price, trigger, correlation_id,
+                    _confirmed_absence_retries, _rejection_retries,
+                    _attempt_history)
+            return self._placement_attempt_metadata(
+                terminal, _rejection_retries + 1, _rejection_retries,
+                _attempt_history)
         if not broker_order_id:
             # HTTP success without an order id is not proof of rejection:
             # recover by correlation id instead of making the engine mark
@@ -374,45 +437,106 @@ class DhanRestTransport(LiveBrokerClient):
             return self._resolve_unknown_placement(
                 correlation_id, side_u, quantity, instrument,
                 order_type_u, limit_price, trigger,
-                RuntimeError(f"Dhan placement response has no order id: {resp}"))
+                RuntimeError(f"Dhan placement response has no order id: {resp}"),
+                confirmed_absence_retries=_confirmed_absence_retries)
         with self._lock:
             existing = self._orders.get(str(broker_order_id))
-            if existing is not None:
-                return dict(existing, status=_placement_state(existing.get("status")))
-            now = self._clock()
-            rec = {
-                "broker_order_id": str(broker_order_id),
-                "status": normalized_status,
-                "raw_status": str(raw_status).upper(),
-                "reason": reason,
-                "side": side_u,
-                "quantity": quantity,
-                "instrument": instrument,
-                "price": None,
-                "requested_order_type": order_type_u,
-                "requested_price": limit_price,
-                "requested_trigger_price": trigger,
-                "correlation_id": correlation_id,
-                "timestamp": now,
-                "filled_quantity": 0,
-                "average_fill_price": 0.0,
-                "last_accounted_qty": 0,
-            }
-            self._orders[broker_order_id] = rec
-            # A FILLED status is never taken from the placement response - the
-            # fill always flows through the status poll with the exchange
-            # price.  A TERMINAL FAILURE is different: Dhan has already settled
-            # the order (e.g. a 100-qty margin rejection), so reporting
-            # "submitted" would leave the engine believing a dead order is
-            # working until the next poll - holding the entry slot and, worse,
-            # counting it as exposure.
-            if rec["status"] in ("rejected", "cancelled", "expired"):
-                return dict(rec, status=rec["status"])
-            return dict(rec, status="submitted")
+            if existing is None:
+                now = self._clock()
+                rec = {
+                    "broker_order_id": str(broker_order_id),
+                    "status": normalized_status,
+                    "raw_status": str(raw_status).upper(),
+                    "reason": reason,
+                    "side": side_u,
+                    "quantity": quantity,
+                    "instrument": instrument,
+                    "price": None,
+                    "requested_order_type": order_type_u,
+                    "requested_price": limit_price,
+                    "requested_trigger_price": trigger,
+                    "correlation_id": correlation_id,
+                    "timestamp": now,
+                    "filled_quantity": 0,
+                    "average_fill_price": 0.0,
+                    "last_accounted_qty": 0,
+                }
+                self._orders[broker_order_id] = rec
+            else:
+                rec = dict(existing)
+        if existing is not None:
+            prior = dict(rec, status=_placement_state(rec.get("status")))
+            if prior["status"] == "rejected":
+                return self._retry_definitive_rejection(
+                    prior, side_u, quantity, instrument, order_type_u,
+                    limit_price, trigger, correlation_id,
+                    _confirmed_absence_retries, _rejection_retries,
+                    _attempt_history)
+            return self._placement_attempt_metadata(
+                prior, _rejection_retries + 1, _rejection_retries,
+                _attempt_history)
+        # A FILLED status is never taken from the placement response - the
+        # fill always flows through the status poll with the exchange price. A
+        # terminal failure is immediate broker truth and must not be presented
+        # as a working order.
+        if rec["status"] in ("rejected", "cancelled", "expired"):
+            terminal = dict(rec, status=rec["status"])
+            if rec["status"] == "rejected":
+                return self._retry_definitive_rejection(
+                    terminal, side_u, quantity, instrument, order_type_u,
+                    limit_price, trigger, correlation_id,
+                    _confirmed_absence_retries, _rejection_retries,
+                    _attempt_history)
+            return self._placement_attempt_metadata(
+                terminal, _rejection_retries + 1, _rejection_retries,
+                _attempt_history)
+        return self._placement_attempt_metadata(
+            dict(rec, status="submitted"), _rejection_retries + 1,
+            _rejection_retries, _attempt_history)
+
+    @staticmethod
+    def _placement_attempt_metadata(result: dict, attempts: int,
+                                    retries: int, history: list) -> dict:
+        result = dict(result)
+        result["submission_attempt_count"] = int(attempts)
+        result["rejection_retry_count"] = int(retries)
+        result["submission_attempts"] = list(history)
+        return result
+
+    def _retry_definitive_rejection(
+            self, rejected: dict, side_u: str, quantity: int,
+            instrument: str, order_type_u: str, limit_price: float,
+            trigger: float, correlation_id: str,
+            confirmed_absence_retries: int, rejection_retries: int,
+            history: list) -> dict:
+        """Retry only a broker-confirmed rejection, at most three times.
+
+        Each retry has a distinct Dhan correlation id and re-enters the full
+        validation/payload path. Unknown transport outcomes are handled by the
+        separate correlation-resolution logic and are never retried here.
+        Every response summary is returned for persistence/diagnostics.
+        """
+        if rejection_retries >= _MAX_DEFINITIVE_REJECTION_RETRIES:
+            return self._placement_attempt_metadata(
+                rejected, rejection_retries + 1, rejection_retries, history)
+        retry_number = rejection_retries + 1
+        suffix = f"-R{retry_number}"
+        next_correlation_id = f"{str(correlation_id)[:30-len(suffix)]}{suffix}"
+        return self.place_market_order(
+            side=side_u, quantity=quantity, instrument=instrument,
+            order_type=order_type_u,
+            price=None if order_type_u == "MARKET" else limit_price,
+            trigger_price=None if order_type_u == "MARKET" else trigger,
+            correlation_id=next_correlation_id,
+            _confirmed_absence_retries=confirmed_absence_retries,
+            _rejection_retries=retry_number,
+            _attempt_history=history,
+        )
 
     def _resolve_unknown_placement(self, correlation_id, side_u, quantity,
                                    instrument, order_type_u, limit_price,
-                                   trigger, origin: BaseException) -> dict:
+                                   trigger, origin: BaseException,
+                                   confirmed_absence_retries: int = 0) -> dict:
         """Recover a placement whose broker outcome is unknown.
 
         Called when the ``POST /orders`` network response was lost.  The order
@@ -422,44 +546,68 @@ class DhanRestTransport(LiveBrokerClient):
         * an existing broker order -> adopted into the transport book exactly
           once (``note="resolved_via_correlation_lookup"``), so downstream
           reconciliation sees a single economic order;
-        * no broker order -> the placement definitively did NOT execute, raised
-          so the engine marks the signal REJECTED with the explicit origin.
+        * authoritative no-order response -> retry the same intent with the
+          same correlation id, bounded to two retries. The same id lets a late
+          first response be resolved as one economic order; ambiguous lookups
+          never retry.
         """
-        with self._lock:
-            lookup_ok = True
+        lookup_body = None
+        lookup_error = None
+        all_lookups_confirmed_absent = True
+        lookup_path = f"/orders/external/{correlation_id}"
+        for attempt in range(_MAX_CORRELATION_LOOKUP_RETRIES + 1):
             try:
-                body = self._http._get(f"/orders/external/{correlation_id}") or {}
+                response = self._http._get(lookup_path)
             except Exception as exc:
-                self._audit("ORDER_BY_CORRELATION",
-                            f"/orders/external/{correlation_id}", "GET",
+                self._audit("ORDER_BY_CORRELATION", lookup_path, "GET",
                             error=exc,
                             http_status=getattr(exc, "status", None) or 400,
                             correlation_id=correlation_id)
-                body = {}
-                # Dhan's explicit 404 on the external-order endpoint is
-                # authoritative absence. Other lookup errors do not prove
-                # whether a timed-out POST reached the broker.
-                lookup_ok = getattr(exc, "status", None) == 404
+                # Retry even a 404: correlation indexing can race the order
+                # POST. A single not-found response is not enough to justify
+                # another order submission. Any ambiguous response prevents
+                # us from proving absence.
+                if getattr(exc, "status", None) == 404:
+                    lookup_error = exc
+                else:
+                    all_lookups_confirmed_absent = False
+                    lookup_error = exc
             else:
-                self._audit("ORDER_BY_CORRELATION",
-                            f"/orders/external/{correlation_id}", "GET",
-                            response=body, http_status=200,
+                self._audit("ORDER_BY_CORRELATION", lookup_path, "GET",
+                            response=response, http_status=200,
                             correlation_id=correlation_id)
-            oid = body.get("orderId") or body.get("order_id")
-            if oid:
-                oid = str(oid)
+                lookup_body = _coerce_status_body(response)
+                if lookup_body.get("orderId") or lookup_body.get("order_id"):
+                    break
+                # An empty/malformed 200 body does not prove that the POST
+                # failed to land. Retry the lookup and remain unresolved if
+                # Dhan still gives no usable order record.
+                all_lookups_confirmed_absent = False
+                lookup_error = RuntimeError(
+                    f"correlation lookup returned no order record: {response!r}")
+
+            if attempt < _MAX_CORRELATION_LOOKUP_RETRIES:
+                time.sleep(0.1 * (2 ** attempt))
+
+        confirmed_absence = all_lookups_confirmed_absent
+
+        oid = ((lookup_body or {}).get("orderId")
+               or (lookup_body or {}).get("order_id"))
+        if oid:
+            oid = str(oid)
+            with self._lock:
                 known = self._orders.get(oid)
                 if known is not None:
                     return dict(known, status=_placement_state(known.get("status")),
                                 note="resolved_via_correlation_lookup")
-                raw_status = (body.get("orderStatus")
-                              or body.get("order_status") or "PENDING")
+                raw_status = ((lookup_body or {}).get("orderStatus")
+                              or (lookup_body or {}).get("order_status") or "PENDING")
                 rec = {
                     "broker_order_id": oid,
                     "status": _normalize_status(raw_status),
                     "raw_status": str(raw_status).upper(),
-                    "reason": (body.get("omsErrorDescription")
-                               or body.get("errorMessage") or None),
+                    "reason": ((lookup_body or {}).get("omsErrorDescription")
+                               or (lookup_body or {}).get("errorMessage") or None),
                     "side": side_u,
                     "quantity": quantity,
                     "instrument": instrument,
@@ -476,18 +624,33 @@ class DhanRestTransport(LiveBrokerClient):
                 self._orders[oid] = rec
                 return dict(rec, status=_placement_state(rec.get("status")),
                             note="resolved_via_correlation_lookup")
-        if not lookup_ok:
+        if not confirmed_absence:
             # A failed lookup is UNRESOLVED, never "rejected". Raising the
             # generic error here used to let the engine mark the order
             # REJECTED while the exchange may hold a live order, leaving the
             # local book flat against real broker exposure.
             raise OrderPlacementUnresolved(
-                f"place_order outcome UNRESOLVED and correlation lookup FAILED "
-                f"({correlation_id}); the order may have reached the exchange: "
-                f"{origin}")
+                f"place_order outcome UNRESOLVED after "
+                f"{_MAX_CORRELATION_LOOKUP_RETRIES + 1} correlation lookups "
+                f"({correlation_id}); the order may have reached Dhan: "
+                f"{lookup_error or origin}")
+        if confirmed_absence_retries < _MAX_CONFIRMED_ABSENCE_RETRIES:
+            # A successful lookup with no matching broker order (including
+            # Dhan's explicit external-order 404) proves this attempt did not
+            # land. Retry only this confirmed-absence case. Reuse the
+            # correlation id so an unexpectedly late first result can still
+            # be resolved without minting another logical order identity.
+            delay = 0.1 * (2 ** confirmed_absence_retries)
+            time.sleep(delay)
+            return self.place_market_order(
+                side=side_u, quantity=quantity, instrument=instrument,
+                order_type=order_type_u, price=limit_price,
+                trigger_price=trigger, correlation_id=correlation_id,
+                _confirmed_absence_retries=confirmed_absence_retries + 1)
         raise RuntimeError(
-            f"place_order broker outcome UNKNOWN and correlation lookup found "
-            f"no order ({correlation_id}): {origin}")
+            f"place_order not delivered after "
+            f"{_MAX_CONFIRMED_ABSENCE_RETRIES + 1} attempts; Dhan confirmed no "
+            f"order for correlation {correlation_id}: {origin}")
 
     # ── Phase 5 wire primitives ─────────────────────────────────────────
 
@@ -500,32 +663,48 @@ class DhanRestTransport(LiveBrokerClient):
         :meth:`order_status`. This is the only way to learn whether it reached
         the exchange.
 
-        Returns a status dict, ``{}`` when the broker authoritatively has no such
-        order, or ``{"status": "unresolved"}`` when the lookup itself failed.
-        The distinction is the whole point: "no order" is proof of
-        non-execution, while "lookup failed" is not.
+        Returns a status dict, ``not_found`` only for Dhan's explicit 404, or
+        ``unresolved`` when the lookup failed or returned no usable order
+        record. An empty 200 response is not proof of non-execution.
         """
         cid = str(correlation_id or "").strip()
         if not cid:
             return {"status": "unresolved", "reason": "missing_correlation_id"}
-        try:
-            body = self._http._get(f"/orders/external/{cid}") or {}
-        except Exception as exc:
-            self._audit("ORDER_BY_CORRELATION", f"/orders/external/{cid}",
-                        "GET", error=exc,
-                        http_status=getattr(exc, "status", None) or 400,
-                        correlation_id=cid)
-            if getattr(exc, "status", None) == 404:
-                return {"status": "not_found", "correlation_id": cid,
-                        "reason": f"broker_no_such_order: {exc}"}
+        path = f"/orders/external/{cid}"
+        body = None
+        all_404 = True
+        last_error = None
+        for attempt in range(_MAX_CORRELATION_LOOKUP_RETRIES + 1):
+            try:
+                response = self._http._get(path)
+            except Exception as exc:
+                self._audit("ORDER_BY_CORRELATION", path, "GET", error=exc,
+                            http_status=getattr(exc, "status", None) or 400,
+                            correlation_id=cid)
+                last_error = exc
+                if getattr(exc, "status", None) != 404:
+                    all_404 = False
+            else:
+                self._audit("ORDER_BY_CORRELATION", path, "GET",
+                            response=response, http_status=200,
+                            correlation_id=cid)
+                candidate = _coerce_status_body(response)
+                if candidate.get("orderId") or candidate.get("order_id"):
+                    body = candidate
+                    break
+                all_404 = False
+                last_error = RuntimeError(
+                    "correlation lookup returned no usable order record")
+            if attempt < _MAX_CORRELATION_LOOKUP_RETRIES:
+                time.sleep(0.1 * (2 ** attempt))
+        if body is None and all_404:
+            return {"status": "not_found", "correlation_id": cid,
+                    "reason": f"broker_no_such_order after retries: {last_error}"}
+        if body is None:
             return {"status": "unresolved",
-                    "reason": f"correlation_lookup_failed: {exc}",
+                    "reason": f"correlation_lookup_unresolved: {last_error}",
                     "correlation_id": cid}
-        self._audit("ORDER_BY_CORRELATION", f"/orders/external/{cid}", "GET",
-                    response=body, http_status=200, correlation_id=cid)
         oid = body.get("orderId") or body.get("order_id")
-        if not oid:
-            return {"status": "not_found", "correlation_id": cid}
         oid = str(oid)
         with self._lock:
             rec = self._orders.get(oid)
@@ -977,9 +1156,16 @@ class DhanRestTransport(LiveBrokerClient):
                 return []
             self._audit("ORDER_TRADES", f"/trades/{order_id}", "GET",
                         response=rows, http_status=200)
+            # Dhan's documented response example for /trades/{order-id} is a
+            # single trade object, while deployments may return a list when an
+            # order has multiple partial executions. Normalize both shapes so
+            # the audit/reconciliation path does not silently drop the
+            # documented object form.
+            if isinstance(rows, dict):
+                rows = [rows]
             if not isinstance(rows, list):
                 return []
-            return [dict(r) for r in rows]
+            return [dict(r) for r in rows if isinstance(r, dict)]
 
     def order_by_correlation(self, correlation_id: str) -> Optional[dict]:
         """Resolve a broker order by our correlation id
@@ -1119,18 +1305,30 @@ class DhanRestTransport(LiveBrokerClient):
                 body = _coerce_status_body(body)
                 rec = self._orders[bid]
                 raw_status = body.get("orderStatus") or rec.get("raw_status") or "PENDING"
-                rec["raw_status"] = str(raw_status).upper()
-                rec["status"] = _normalize_status(raw_status)
                 # Real Dhan field is "filledQty" (live-verified); the other
                 # spellings are tolerated defensively.
-                traded_qty = int(body.get("filledQty")
-                                 or body.get("tradedQuantity")
-                                 or body.get("tradedQty")
-                                 or 0)
-                avg_price = float(
-                    body.get("averageTradedPrice")
-                    or body.get("averageFillPrice")
-                    or 0.0)
+                traded_raw = next((body[name] for name in
+                                   ("filledQty", "tradedQuantity", "tradedQty")
+                                   if body.get(name) is not None), 0)
+                avg_raw = next((body[name] for name in
+                                ("averageTradedPrice", "averageFillPrice")
+                                if body.get(name) is not None), 0.0)
+                try:
+                    traded_qty = int(traded_raw)
+                    avg_price = float(avg_raw)
+                    if (traded_qty < 0 or avg_price < 0
+                            or not math.isfinite(avg_price)):
+                        raise ValueError("negative/non-finite fill data")
+                except (TypeError, ValueError, OverflowError) as exc:
+                    # One malformed status row must not abort polling every
+                    # other live order. Keep this order's last known truth and
+                    # retry it on the next cycle.
+                    self._audit("ORDER_STATUS_DECODE", f"/orders/{bid}",
+                                "GET", response=body, error=exc,
+                                correlation_id=rec.get("correlation_id"))
+                    continue
+                rec["raw_status"] = str(raw_status).upper()
+                rec["status"] = _normalize_status(raw_status)
                 # The broker's order-level detail (rejection reason: funds,
                 # settlement, product, rate-limit) stays with the order so the
                 # book and the engine's reason string carry the real message.
@@ -1138,11 +1336,31 @@ class DhanRestTransport(LiveBrokerClient):
                                  or body.get("errorMessage")
                                  or body.get("reason")
                                  or rec.get("reason") or None)
+                previously_reported = int(rec.get("filled_quantity") or 0)
+                previous_accounted = int(rec.get("last_accounted_qty") or 0)
+                previous_average = float(rec.get("average_fill_price") or 0.0)
+                # REST snapshots can arrive out of order around a partial
+                # fill. Never regress cumulative quantity or apply a stale
+                # average to a later fill delta.
+                if traded_qty < previously_reported:
+                    traded_qty = previously_reported
+                    avg_price = previous_average
                 rec["filled_quantity"] = traded_qty
+                delta = traded_qty - previous_accounted
+                # Dhan's averageTradedPrice is the cumulative average for the
+                # order, not the price of the latest delta. Recover the
+                # weighted average price of the newly observed delta so
+                # applying multiple PART_TRADED updates preserves the broker's
+                # cumulative average instead of reusing it as every fill price.
+                delta_average = avg_price
+                if delta > 0 and previous_accounted > 0 and avg_price > 0:
+                    delta_average = (
+                        avg_price * traded_qty
+                        - previous_average * previous_accounted
+                    ) / delta
                 if avg_price > 0:
                     rec["average_fill_price"] = avg_price
-                delta = traded_qty - int(rec.get("last_accounted_qty") or 0)
-                if delta > 0 and avg_price > 0:
+                if delta > 0 and delta_average > 0 and math.isfinite(delta_average):
                     seq = self._fill_seq.get(bid, 0) + 1
                     self._fill_seq[bid] = seq
                     broker_fill_id = f"{bid}:fill:{seq}"
@@ -1152,7 +1370,7 @@ class DhanRestTransport(LiveBrokerClient):
                         "status": "filled",
                         "side": rec.get("side"),
                         "quantity": delta,
-                        "price": avg_price,
+                        "price": delta_average,
                         "timestamp": self._clock(),
                         "instrument": rec.get("instrument"),
                     }

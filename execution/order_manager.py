@@ -50,7 +50,9 @@ class OrderManager:
             multiplier: Contract multiplier for the instrument
             
         Returns:
-            Order if created, None if rejected.
+            The terminal Order is returned even when rejected, so the caller
+            can persist/report its reason and submission outcome. None means
+            the signal was deduplicated or no order was created.
             Fills produced by the order are collected and MUST be drained (and
             the order persisted BEFORE them) by the caller via drain_fills().
         """
@@ -106,11 +108,15 @@ class OrderManager:
                             collect.append(fill)
                             break
             elif order.state == OrderState.REJECTED:
-                # Order rejected — clean up memory
+                # Keep the rejected Order as the return value. SignalFlow must
+                # persist and publish it so operators can distinguish a local
+                # pre-broker block from a Dhan rejection. It is still removed
+                # from active/dedup memory because no working broker order
+                # remains; callers receive the terminal order for auditing.
                 self._pending_signals.pop(key, None)
                 self._pending_signal_orders.pop(key, None)
                 self._active_orders.pop(order.order_id, None)
-                return None
+                return order
 
             # Prune entries for terminal orders (FILLED / CANCELED) to
             # avoid unbounded memory growth over a long session.

@@ -400,8 +400,10 @@ class PersistenceManager:
                     protected_order_id, correlation_id, lifecycle_id,
                     parent_signal_id, position_id, parent_position_id,
                     position_generation, original_order_id, trigger_state,
-                    trigger_generation, trigger_source, reversal_parent_signal_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    trigger_generation, trigger_source, reversal_parent_signal_id,
+                    reason, submission_outcome, submission_attempt_count,
+                    rejection_retry_count, submission_attempts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     state=excluded.state, filled_quantity=excluded.filled_quantity,
                     average_fill_price=excluded.average_fill_price,
@@ -432,7 +434,20 @@ class PersistenceManager:
                         trigger_generation=COALESCE(excluded.trigger_generation, orders.trigger_generation),
                         trigger_source=COALESCE(excluded.trigger_source, orders.trigger_source),
                         reversal_parent_signal_id=COALESCE(excluded.reversal_parent_signal_id,
-                                                           orders.reversal_parent_signal_id)
+                                                           orders.reversal_parent_signal_id),
+                        reason=COALESCE(excluded.reason, orders.reason),
+                        submission_outcome=CASE
+                            WHEN excluded.submission_outcome='NOT_SENT'
+                            THEN orders.submission_outcome
+                            ELSE excluded.submission_outcome END,
+                        submission_attempt_count=MAX(
+                            orders.submission_attempt_count,
+                            excluded.submission_attempt_count),
+                        rejection_retry_count=MAX(
+                            orders.rejection_retry_count,
+                            excluded.rejection_retry_count),
+                        submission_attempts=COALESCE(excluded.submission_attempts,
+                                                     orders.submission_attempts)
                     """, (
                 order.get("order_id"),
                 order.get("strategy_id"),
@@ -467,6 +482,12 @@ class PersistenceManager:
                 order.get("trigger_generation"),
                 order.get("trigger_source"),
                 order.get("reversal_parent_signal_id"),
+                order.get("reason"),
+                order.get("submission_outcome", "NOT_SENT"),
+                int(order.get("submission_attempt_count", 0) or 0),
+                int(order.get("rejection_retry_count", 0) or 0),
+                (json.dumps(order.get("submission_attempts"), separators=(",", ":"))
+                 if order.get("submission_attempts") is not None else None),
             ))
 
     def save_fill(self, fill: dict) -> None:

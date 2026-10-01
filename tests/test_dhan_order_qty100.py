@@ -378,8 +378,12 @@ def test_a_strategy_only_monitors_the_entry_fire_and_never_re_fires():
     assert order.state == OrderState.REJECTED
     assert "margin" in (order.reason or "").lower()
 
-    # Monitoring the outcome touched the wire exactly once.
-    assert len(http.posts) == 1
+    # Each definitive rejection was verified, then retried at most three
+    # times. No retry creates local exposure or arms an SL.
+    assert len(http.posts) == 4
+    assert len({payload["correlationId"] for _, payload in http.posts}) == 4
+    assert order.submission_attempt_count == 4
+    assert order.rejection_retry_count == 3
     assert http.gets == [], "a rejection needs no recovery lookup"
 
     # Nothing is exposed, so nothing can be stopped out.
@@ -403,13 +407,14 @@ def test_a_rejected_entry_does_not_block_the_next_attempt():
     engine.submit_order(first)
     assert first.state == OrderState.REJECTED
 
-    # A NEW signal may be attempted afterwards; it is a new order, not a
-    # silent retry of the rejected one.
+    # A NEW signal is a new four-attempt bounded sequence, independent of the
+    # previous terminal rejection.
     second = engine.create_order(_entry_signal("s1"), multiplier=10.0,
                                  trade_id="T-s1-E2")
     second.order_role = "ENTRY"
     engine.submit_order(second)
 
-    assert len(http.posts) == 2
+    assert len(http.posts) == 8
+    assert len({payload["correlationId"] for _, payload in http.posts}) == 8
     assert second.order_id != first.order_id
     assert second.state == OrderState.REJECTED
