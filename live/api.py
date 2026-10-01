@@ -321,6 +321,30 @@ def _adopt_broker_position(body: dict) -> dict:
                 if pos is None:
                     raise HTTPException(status_code=409,
                                         detail="imported order exists without its open position")
+                saved_fill = next((row for row in _persistence.get_fills()
+                                   if str(row.get("broker_order_id") or "")
+                                   == broker_order_id), None)
+                if saved_fill:
+                    execution = env.execution_engine
+                    with execution._lock:
+                        if not any(f.fill_id == saved_fill.get("fill_id")
+                                   for f in execution._fills):
+                            from execution.models import Fill
+                            memory_fill = Fill(**{
+                                key: saved_fill.get(key) for key in (
+                                    "fill_id", "order_id", "instrument", "side",
+                                    "quantity", "price", "timestamp", "strategy_id",
+                                    "multiplier", "entry_signal_id", "trade_id",
+                                    "lifecycle_id", "position_id",
+                                    "position_generation")
+                                if key in saved_fill
+                            })
+                            memory_fill.broker_fill_id = saved_fill.get("broker_fill_id")
+                            memory_fill.broker_order_id = saved_fill.get("broker_order_id")
+                            execution._fills.append(memory_fill)
+                            broker_map = getattr(execution, "_broker_fill_map", None)
+                            if isinstance(broker_map, dict):
+                                broker_map[str(saved_fill.get("broker_fill_id"))] = memory_fill.fill_id
                 return {"adopted": True, "already_adopted": True,
                         "broker_order_id": broker_order_id,
                         "position": pos.snapshot()}
@@ -402,15 +426,45 @@ def _adopt_broker_position(body: dict) -> dict:
             raise HTTPException(status_code=503, detail="REST candle adapter unavailable")
         candle_state = adapter.fetch_candle_state("SILVERM", "15") or {}
         closed = candle_state.get("closed") or []
-        if len(closed) < 2:
+        operator_candle = body.get("operator_signal_candle")
+        operator_attribution = bool(body.get("operator_confirmed_manual_fill"))
+        if len(closed) < 2 and not operator_attribution:
             raise HTTPException(status_code=409,
                                 detail="two completed 15m candles are required for the structural stop")
         candle = next((c for c in closed if float(c[0]) == candle_timestamp), None)
+        if operator_attribution:
+            if not isinstance(operator_candle, dict):
+                raise HTTPException(status_code=422,
+                                    detail="operator_signal_candle is required for manual-fill attribution")
+            try:
+                operator_ts = float(operator_candle.get("timestamp"))
+                operator_ohlc = [float(operator_candle[k]) for k in
+                                 ("open", "high", "low", "close")]
+                operator_stop = float(operator_candle.get("stop_price"))
+                operator_trigger = float(operator_candle.get("trigger_price"))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422,
+                                    detail="operator candle OHLC and levels must be numeric")
+            o0, h0, low0, close0 = operator_ohlc
+            if (operator_ts != candle_timestamp or h0 <= low0 or o0 <= 0
+                    or close0 <= 0 or operator_trigger != h0
+                    or operator_stop != low0):
+                raise HTTPException(status_code=409,
+                                    detail="operator candle/trigger/stop does not match the supplied signal candle")
+            if candle is not None:
+                if list(map(float, candle[1:5])) != operator_ohlc:
+                    raise HTTPException(status_code=409,
+                                        detail="operator candle OHLC conflicts with the broker candle")
+                idx = closed.index(candle)
+            else:
+                candle = [operator_ts, o0, h0, low0, close0, 0.0]
+                idx = 0
+        else:
+            idx = closed.index(candle) if candle is not None else 0
         if candle is None:
             raise HTTPException(status_code=409,
                                 detail="requested SILVERM 15m signal candle is not present in completed candles")
-        idx = closed.index(candle)
-        if idx == 0:
+        if idx == 0 and not operator_attribution:
             history_fn = getattr(adapter, "fetch_historical_candles", None)
             if callable(history_fn):
                 try:
@@ -445,19 +499,37 @@ def _adopt_broker_position(body: dict) -> dict:
         except (TypeError, ValueError):
             raise HTTPException(status_code=409,
                                 detail="Dhan fill timestamp cannot be verified")
-        if not (candle_end <= fill_time <= candle_end + 900.0):
+        if (not operator_attribution
+                and not (candle_end <= fill_time <= candle_end + 900.0)):
             raise HTTPException(status_code=409,
                                 detail="Dhan fill is outside the selected candle's trigger window")
+        if operator_attribution and fill_time > time.time() + 60.0:
+            raise HTTPException(status_code=409,
+                                detail="Dhan fill timestamp is in the future")
 
         o, h, low, close = map(float, candle[1:5])
-        prev = closed[idx - 1]
-        trigger, stop = entry_levels("LONG", h, low,
-                                     float(prev[2]), float(prev[3]))
+        if operator_attribution:
+            trigger = float(operator_candle["trigger_price"])
+            stop = float(operator_candle["stop_price"])
+        else:
+            prev = closed[idx - 1]
+            trigger, stop = entry_levels("LONG", h, low,
+                                         float(prev[2]), float(prev[3]))
         if stop <= 0 or trigger <= stop:
             raise HTTPException(status_code=409,
                                 detail="signal-candle trigger/stop levels are invalid")
         forming = candle_state.get("forming") or []
         live_price = float(forming[4]) if len(forming) > 4 else 0.0
+        if live_price <= 0:
+            # At an exchange candle boundary Dhan can briefly return no
+            # forming REST row while the live WebSocket quote is healthy.
+            # Missing candle data is not a zero-price stop crossing.
+            ltp_fn = getattr(adapter, "get_live_ltp", None)
+            if callable(ltp_fn):
+                try:
+                    live_price = float(ltp_fn("SILVERM") or 0.0)
+                except Exception:
+                    live_price = 0.0
         if live_price <= stop:
             raise HTTPException(status_code=409,
                                 detail="current broker candle is at/below the long stop; adoption halted")
@@ -471,6 +543,7 @@ def _adopt_broker_position(body: dict) -> dict:
                 "executed": True, "entry_price": fill_price,
                 "external_position_import": True,
                 "external_position_source": "dhan_tradebook_operator_reconcile",
+                "operator_confirmed_manual_fill": operator_attribution,
                 "broker_order_id": broker_order_id,
                 "broker_fill_id": broker_fill_id,
                 "signal_reason": "operator_attributed_to_latest_closed_15m_candle",
@@ -539,6 +612,17 @@ def _adopt_broker_position(body: dict) -> dict:
         fill.broker_trade_id = broker_fill_id
         fill.cumulative_filled_quantity = 1
         _engine._handle_fill(fill, signal.signal_id, env_name="live")
+
+        # Operator imports bypass the broker order-status collector that
+        # normally appends fills to the execution-engine memory book. Keep the
+        # in-memory ledger aligned with the durable fill written by FillFlow.
+        with execution._lock:
+            if not any(existing_fill.fill_id == fill.fill_id
+                       for existing_fill in execution._fills):
+                execution._fills.append(fill)
+            broker_map = getattr(execution, "_broker_fill_map", None)
+            if isinstance(broker_map, dict):
+                broker_map[broker_fill_id] = fill.fill_id
 
         position = next((p for p in runtime.position_manager.get_positions_by_strategy(
             strategy_id) if p.instrument == "SILVERM" and p.is_open), None)

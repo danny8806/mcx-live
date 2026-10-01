@@ -1001,6 +1001,35 @@ class FillFlowMixin:
             }, env_name=getattr(env, "name", None))
             return False
 
+        # A reversal may have a broker-confirmed-flat instrument while the
+        # environment-wide startup reconciliation gate is still closed (for
+        # example, another instrument is unresolved or the first position
+        # snapshot failed). Do not convert this paired entry to FIRED yet:
+        # SignalFlow would reject it at the global gate, terminalize its
+        # durable trigger, and lose the only reversal entry. Keep the exact
+        # entry parked; the periodic broker-authoritative reconciliation
+        # retries it once the environment is safe for entries again.
+        reconciled_envs = getattr(self, "_reconciled_envs", None)
+        if (getattr(env, "is_live", False) and reconciled_envs is not None
+                and getattr(env, "name", None) not in reconciled_envs):
+            pending.status = "waiting_for_flat"
+            strategy.pending_entry = pending
+            strategy.state = StrategyState.EXIT_ORDER_SUBMITTED
+            metadata.update(pending=True, triggered=False,
+                            trigger_state="ARMED")
+            signal.metadata = metadata
+            registry = getattr(env, "pending_triggers", None)
+            if registry is not None:
+                registry.sync_strategy(strategy)
+            self.publish_event("reversal_entry_waiting_for_reconciliation", {
+                "signal_id": signal.signal_id,
+                "strategy_id": strategy_id,
+                "instrument": signal.instrument,
+                "reason": "environment_not_reconciled",
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
+            return False
+
         metadata["reversal_entry_trigger_level"] = signal.trigger_price
         metadata.update(
             pending=False, triggered=True, trigger_state="FIRED",

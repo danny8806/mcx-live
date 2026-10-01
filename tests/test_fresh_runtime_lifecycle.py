@@ -427,6 +427,60 @@ def test_new_reversal_replaces_parked_entry_while_flat_query_is_in_flight(tmp_pa
         persistence.close()
 
 
+def test_reversal_entry_waits_for_environment_reconciliation_then_submits(tmp_path):
+    """A confirmed-flat reversal survives a closed startup-reconciliation gate."""
+    engine, env, broker, persistence = _runtime(tmp_path)
+    strategy = env.strategies["gold_02"]
+    try:
+        initial = _long_candle_signal(engine, env, broker, strategy)
+        _fire_and_submit(engine, env, broker, strategy, initial)
+        strategy._prev_fast_close = 100.0
+        strategy._prev_htf_value = 100.0
+        strategy._prev_fast_high = 103.0
+        strategy._prev_fast_low = 99.0
+        _live_price(engine, env, broker, 99.0)
+        reversal_exit = strategy.on_bar(
+            Bar("GOLDM", "15m", 3, 4, 100, 101, 96, 99, 1),
+            SimpleNamespace(htf_value=100.0), 100.0)
+        assert reversal_exit is not None
+        paired_entry = strategy.pending_entry.signal
+        engine._process_signal(reversal_exit, "live")
+        _live_price(engine, env, broker, reversal_exit.trigger_price)
+        assert strategy.on_tick(reversal_exit.trigger_price, time.time()) is reversal_exit
+
+        # Model the live failure: Dhan has confirmed the old position flat,
+        # but the environment-wide reconcile flag is still closed.
+        engine._reconciled_envs.discard("live")
+        engine._process_signal(reversal_exit, "live")
+        assert [o.order_role for o in env.execution_engine._orders.values()] == [
+            "ENTRY", "REVERSAL_EXIT"]
+        assert not env.position_manager.open_positions
+        assert strategy.pending_entry is not None
+        assert strategy.pending_entry.signal is paired_entry
+        assert strategy.pending_entry.status == "waiting_for_flat"
+        assert paired_entry.metadata["trigger_state"] == "ARMED"
+        durable = next(row for row in persistence.get_pending_orders(
+            execution_mode="LIVE") if row.get("signal_id") == paired_entry.signal_id)
+        assert durable["status"] == "armed"
+
+        # The normal periodic reconcile reopens the gate and retries the same
+        # paired signal exactly once through the standard order/fill/SL flow.
+        engine._reconcile_strategy_positions("live")
+        orders = list(env.execution_engine._orders.values())
+        assert [o.order_role for o in orders] == [
+            "ENTRY", "REVERSAL_EXIT", "REVERSAL_ENTRY"]
+        assert orders[-1].entry_signal_id == paired_entry.signal_id
+        assert orders[-1].state == OrderState.FILLED
+        assert strategy.pending_entry is None
+        position = env.position_manager.open_positions[0]
+        assert position.is_open and not position.is_long
+        assert position.sl_state == "ARMED"
+        assert env.sl_monitor.armed_ids() == [position.position_id]
+    finally:
+        engine.stop()
+        persistence.close()
+
+
 def test_historical_rejection_poll_cannot_erase_fired_gold_entry_before_submit(tmp_path):
     """Reproduce the live poller race that rejected GOLDM before Dhan POST.
 

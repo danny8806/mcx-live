@@ -127,10 +127,15 @@ def test_imports_exact_dhan_fill_and_arms_candle_stop_once(tmp_path, monkeypatch
         assert len(env.runtimes.require("silver_01").position_manager.open_positions) == 1
         assert len(persistence.get_open_positions("silver_01")) == 1
         assert persistence.fill_by_broker_fill_id(BROKER_FILL)
+        assert any(f.fill_id == f"DHAN-{BROKER_FILL}"
+                   for f in env.execution_engine._fills)
         assert not broker._orders  # import did not submit a second Dhan order
 
+        env.execution_engine._fills.clear()
         duplicate = live_api._adopt_broker_position(body)
         assert duplicate["already_adopted"] is True
+        assert any(f.fill_id == f"DHAN-{BROKER_FILL}"
+                   for f in env.execution_engine._fills)
         assert len(persistence.get_fills()) == 1
         assert len(persistence.get_trades("silver_01")) == 1
     finally:
@@ -167,6 +172,43 @@ def test_import_fetches_prior_candle_when_recent_window_does_not_include_it(
         assert result["adopted"] is True
         assert result["stop_price"] == 228100.0
         assert result["position"]["sl_state"] == "ARMED"
+        assert not broker._orders
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_operator_can_attribute_broker_confirmed_manual_fill_to_supplied_signal_candle(
+        tmp_path, monkeypatch):
+    engine, env, broker, persistence = _adoption_runtime(
+        tmp_path, monkeypatch, omit_prior_from_recent_window=True)
+    newer_closed = [1790746200.0, 228895.0, 229140.0, 228700.0,
+                    228871.0, 300.0]
+    env.data_adapter = SimpleNamespace(
+        fetch_candle_state=lambda *_args: {"closed": [newer_closed], "forming": None},
+        get_live_ltp=lambda _symbol: 229107.0,
+    )
+    body = {
+        "strategy_id": "silver_01", "broker_order_id": BROKER_ORDER,
+        "signal_candle_timestamp": CANDLE_TS,
+        "operator_confirmed_manual_fill": True,
+        "operator_signal_candle": {
+            "timestamp": CANDLE_TS, "open": 228374.0, "high": 228900.0,
+            "low": 228100.0, "close": 228895.0,
+            "trigger_price": 228900.0, "stop_price": 228100.0,
+        },
+    }
+    try:
+        result = live_api._adopt_broker_position(body)
+        position = env.runtimes.require("silver_01").position_manager.open_positions[0]
+        assert result["adopted"] is True
+        assert result["broker_order_sent"] is False
+        assert result["trigger_price"] == 228900.0
+        assert result["stop_price"] == 228100.0
+        assert position.side.value == "LONG"
+        assert position.sl_state == "ARMED"
+        assert position.stop_price == 228100.0
+        assert persistence.fill_by_broker_fill_id(BROKER_FILL)
         assert not broker._orders
     finally:
         engine.stop()
