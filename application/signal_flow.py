@@ -37,6 +37,93 @@ def _pending_row_has_unresolved_order(row: Optional[dict]) -> bool:
 
 
 class SignalFlowMixin:
+    def _park_reversal_entry_for_retry(self, signal, env, reason: str) -> bool:
+        """Keep a fired reversal entry durable when a recoverable safety gate closes.
+
+        The paired entry is retried by broker reconciliation after flatness is
+        re-confirmed. This never bypasses the gate and never promises a broker
+        acceptance or fill.
+        """
+        metadata = getattr(signal, "metadata", None) or {}
+        if (not env.is_live or not metadata.get("is_reversal_entry")
+                or str(metadata.get("trigger_state", "")).upper() != "FIRED"):
+            return False
+        strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
+        if strategy is None:
+            return False
+        from strategies.types import PendingEntry
+        original_trigger = metadata.get(
+            "reversal_entry_trigger_level", signal.trigger_price)
+        try:
+            original_trigger = float(original_trigger)
+        except (TypeError, ValueError):
+            original_trigger = float(signal.trigger_price or 0.0)
+        metadata.update(
+            pending=True, triggered=False, trigger_state="ARMED",
+            pending_gate_wait_reason=str(reason),
+            reversal_entry_trigger_level=original_trigger,
+        )
+        signal.metadata = metadata
+        signal.trigger_price = original_trigger
+        current = getattr(strategy, "pending_entry", None)
+        if getattr(getattr(current, "signal", None), "signal_id", None) != signal.signal_id:
+            strategy.pending_entry = PendingEntry(
+                signal=signal, trigger_price=original_trigger,
+                side=str(signal.side or signal.signal_type.value).upper(),
+                status="waiting_for_flat", created_at=time.time())
+        else:
+            current.status = "waiting_for_flat"
+            current.trigger_price = original_trigger
+        strategy.state = StrategyState.EXIT_ORDER_SUBMITTED
+        registry = getattr(env, "pending_triggers", None)
+        if registry is not None:
+            registry.sync_strategy(strategy)
+        persistence = getattr(env, "persistence", None)
+        if persistence is not None:
+            try:
+                self._persist_signal(signal, "entry", env.name)
+                persistence.save_pending_order({
+                    "pending_order_id": signal.signal_id,
+                    "signal_id": signal.signal_id,
+                    "trade_id": None,
+                    "status": PendingOrderState.ARMED.value,
+                    "strategy_id": signal.strategy_id,
+                    "instrument": signal.instrument,
+                    "direction": str(signal.side or signal.signal_type.value).upper(),
+                    "trigger_price": original_trigger,
+                    "trigger_state": "ARMED",
+                    "trigger_generation": metadata.get("trigger_generation"),
+                    "trigger_source": f"reversal_entry_wait:{reason}",
+                    "signal_timestamp": signal.timestamp,
+                    "quantity": signal.quantity,
+                })
+                registry = getattr(env, "pending_triggers", None)
+                if registry is not None:
+                    registry.update_live_row(signal.signal_id, {
+                        "status": PendingOrderState.ARMED.value,
+                        "trigger_state": "ARMED",
+                        "trigger_source": f"reversal_entry_wait:{reason}",
+                    })
+            except Exception as exc:
+                log.exception("[Engine] could not persist parked reversal entry %s",
+                              signal.signal_id)
+                self.publish_event("reversal_entry_park_persist_failed", {
+                    "signal_id": signal.signal_id,
+                    "strategy_id": signal.strategy_id,
+                    "reason": reason,
+                    "error": str(exc),
+                    "execution_mode": env.mode,
+                }, env_name=env.name)
+                return False
+        self.publish_event("reversal_entry_waiting_for_entry_gate", {
+            "signal_id": signal.signal_id,
+            "strategy_id": signal.strategy_id,
+            "instrument": signal.instrument,
+            "reason": reason,
+            "execution_mode": env.mode,
+        }, env_name=env.name)
+        return True
+
     def _retire_fired_live_pending(self, signal, env, reason: str) -> None:
         """Do not restore an already-fired trigger after a local gate rejects it."""
         metadata = getattr(signal, "metadata", None) or {}
@@ -537,9 +624,11 @@ class SignalFlowMixin:
                     {"env": env.name}, env)
                 log.error("[Engine] entry BLOCKED: env %s has no confirmed "
                           "broker position state", env.name)
-                self._retire_fired_live_pending(
-                    signal, env, "startup_reconciliation_failed")
-                self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+                if not self._park_reversal_entry_for_retry(
+                        signal, env, "startup_reconciliation_failed"):
+                    self._retire_fired_live_pending(
+                        signal, env, "startup_reconciliation_failed")
+                    self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
             health = getattr(self, "market_data_health", None)
             if health is not None and not health.is_healthy(signal.instrument):
@@ -551,8 +640,10 @@ class SignalFlowMixin:
                      "stale_after_seconds": health.stale_after}, env)
                 log.error("[Engine] entry BLOCKED: market data unhealthy for %s "
                           "(age=%s)", signal.instrument, age)
-                self._retire_fired_live_pending(signal, env, "market_data_unhealthy")
-                self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+                if not self._park_reversal_entry_for_retry(
+                        signal, env, "market_data_unhealthy"):
+                    self._retire_fired_live_pending(signal, env, "market_data_unhealthy")
+                    self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
             ok, reject_reason = self._validate_strategy_risk_gate(signal, env, gates)
             if not ok:
@@ -630,9 +721,11 @@ class SignalFlowMixin:
             safe_mode = env.safe_mode if env.safe_mode is not None else self.safe_mode
             market_status = env.market_status if env.market_status is not None else self.market_status
             if safe_mode.is_active or not market_status.is_trading_allowed:
-                self._retire_fired_live_pending(
-                    signal, env, "safe_mode_or_market_closed")
-                self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+                if not self._park_reversal_entry_for_retry(
+                        signal, env, "safe_mode_or_market_closed"):
+                    self._retire_fired_live_pending(
+                        signal, env, "safe_mode_or_market_closed")
+                    self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
             account = env.account_engines.get(signal.strategy_id)
             multiplier = self.config.instrument(signal.instrument).get("multiplier", 1.0)

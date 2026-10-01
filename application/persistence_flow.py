@@ -451,6 +451,10 @@ class PersistenceFlowMixin:
                     "signal_mid_dema_atr": saved.get("mid_value"),
                     "signal_fast_dema_atr": saved.get("fast_dema"),
                 }
+                pending_source = str(row.get("trigger_source") or "")
+                if pending_source.startswith("reversal_entry_wait:"):
+                    metadata["pending_gate_wait_reason"] = pending_source.split(
+                        ":", 1)[1]
                 try:
                     import json
                     metadata.update(json.loads(saved.get("signal_metadata") or "{}"))
@@ -484,8 +488,10 @@ class PersistenceFlowMixin:
                 except (TypeError, ValueError):
                     pass
                 entry_status = ("waiting_for_flat"
-                                if metadata.get("is_reversal_entry")
-                                and strategy.position_side is not None else "pending")
+                                if (metadata.get("is_reversal_entry")
+                                    and (strategy.position_side is not None
+                                         or metadata.get("pending_gate_wait_reason")))
+                                else "pending")
                 pending = PendingEntry(signal=signal, trigger_price=float(row["trigger_price"]),
                                        side=side, status=entry_status, created_at=created_at)
                 strategy.pending_entry = pending

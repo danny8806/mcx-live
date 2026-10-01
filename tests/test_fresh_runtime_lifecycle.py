@@ -21,7 +21,7 @@ from execution.live.order_watcher import OrderWatcher
 from execution.live.poller import LiveBrokerPoller
 from persistence.manager import PersistenceManager
 from portfolio.position_manager import Position, PositionSide
-from strategies.types import PendingEntry
+from strategies.types import PendingEntry, SignalType
 from trading_engine import TradingEngine
 
 
@@ -476,6 +476,47 @@ def test_reversal_entry_waits_for_environment_reconciliation_then_submits(tmp_pa
         assert position.is_open and not position.is_long
         assert position.sl_state == "ARMED"
         assert env.sl_monitor.armed_ids() == [position.position_id]
+    finally:
+        engine.stop()
+        persistence.close()
+
+
+def test_reversal_entry_survives_stale_feed_gate_and_retries_after_recovery(tmp_path):
+    """A temporary feed-health block parks, then retries the same paired entry."""
+    engine, env, broker, persistence = _runtime(tmp_path)
+    strategy = env.strategies["gold_02"]
+    try:
+        signal = _long_candle_signal(engine, env, broker, strategy)
+        signal.side = "SHORT"
+        signal.signal_type = SignalType.SHORT
+        signal.metadata.update({
+            "is_reversal": True,
+            "is_reversal_entry": True,
+            "pending": False,
+            "triggered": True,
+            "trigger_state": "FIRED",
+            "reversal_entry_trigger_level": signal.trigger_price,
+        })
+        engine._arm_live_pending(signal, env)
+        strategy.pending_entry = None
+        engine.market_data_health.mark_unhealthy("GOLDM")
+
+        engine._process_signal(signal, "live")
+        assert not env.execution_engine._orders
+        assert strategy.pending_entry is not None
+        assert strategy.pending_entry.signal is signal
+        assert strategy.pending_entry.status == "waiting_for_flat"
+        row = persistence.get_pending_order(signal.signal_id, execution_mode="LIVE")
+        assert row["status"] == "armed"
+        assert row["trigger_source"] == "reversal_entry_wait:market_data_unhealthy"
+
+        # Recovery uses the normal broker reconciliation and ordinary order path.
+        _live_price(engine, env, broker, 102.0)
+        engine._reconcile_strategy_positions("live")
+        orders = list(env.execution_engine._orders.values())
+        assert [order.order_role for order in orders] == ["REVERSAL_ENTRY"]
+        assert orders[0].state == OrderState.FILLED
+        assert env.position_manager.open_positions[0].side == PositionSide.SHORT
     finally:
         engine.stop()
         persistence.close()
