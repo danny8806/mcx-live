@@ -16,10 +16,11 @@ def long_crossover(
     mid_line: Optional[float] = None,
     candle_low: Optional[float] = None,
 ) -> bool:
-    """Close above the 1h line after this candle crossed below it."""
-    if htf_line is None or candle_low is None or not (
-        candle_low < htf_line and close > htf_line
-    ):
+    """Close above the 1h line after the old close-cross OR a candle cross."""
+    if htf_line is None or close <= htf_line:
+        return False
+    if not (previous_close <= htf_line
+            or (candle_low is not None and candle_low < htf_line)):
         return False
     return mid_line is None or mid_line < htf_line
 
@@ -31,10 +32,11 @@ def short_crossover(
     mid_line: Optional[float] = None,
     candle_high: Optional[float] = None,
 ) -> bool:
-    """Close below the 1h line after this candle crossed above it."""
-    if htf_line is None or candle_high is None or not (
-        candle_high > htf_line and close < htf_line
-    ):
+    """Close below the 1h line after the old close-cross OR a candle cross."""
+    if htf_line is None or close >= htf_line:
+        return False
+    if not (previous_close >= htf_line
+            or (candle_high is not None and candle_high > htf_line)):
         return False
     return mid_line is None or mid_line > htf_line
 

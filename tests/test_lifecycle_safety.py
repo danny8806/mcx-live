@@ -161,13 +161,15 @@ def test_old_long_stop_cannot_close_new_short_and_current_stop_submits_once():
 
 
 def test_dema_atr_strategy_intent_stays_explicit_and_shared():
-    # Signal candle must cross the hourly line and close back through it;
-    # the previous candle close does not gate the signal.
+    # Keep the original prior-close crossover and add a strict current-candle
+    # cross as an alternative path. Both retain the 15m DEMA confirmation.
     assert long_crossover(101, 105, 100, 98, candle_low=99)
+    assert long_crossover(101, 99, 100, 98, candle_low=101)  # gap-up old rule
     assert not long_crossover(101, 105, 100, 98, candle_low=100)
     assert not long_crossover(101, 99, 100, 100, candle_low=99)
     assert not long_crossover(99, 105, 100, 98, candle_low=99)
     assert short_crossover(99, 95, 100, 102, candle_high=101)
+    assert short_crossover(99, 101, 100, 102, candle_high=99)  # gap-down old rule
     assert not short_crossover(99, 95, 100, 102, candle_high=100)
     assert not short_crossover(99, 101, 100, 100, candle_high=101)
     assert not short_crossover(101, 95, 100, 102, candle_high=101)
