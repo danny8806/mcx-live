@@ -15,7 +15,7 @@ from strategies.types import Signal, SignalType
 from strategies.intent import (
     entry_levels, long_crossover, reversal_levels, short_crossover,
 )
-from execution.live.order_watcher import OrderWatchRecord, OrderWatcher
+from execution.live.order_watcher import OrderWatchRecord, OrderWatcher, SIGNAL_EXPIRED
 from trading_engine import TradingEngine
 
 
@@ -466,6 +466,40 @@ def test_first_dhan_pending_confirmation_immediately_selects_market_fallback():
 
     assert watcher._decide(rec, "A_PENDING_BUT_VALID", now=10.0) == \
         "MARKET_FALLBACK"
+
+
+def test_triggered_entry_past_signal_age_still_uses_safe_fallback():
+    watcher = OrderWatcher(engine=SimpleNamespace(_orders={}), config={
+        "live": {"order_watcher": {
+            "market_fallback_enabled": True,
+            "market_fallback_timeout_ms": 0,
+            "max_order_age_ms": 60000,
+        }}
+    })
+    rec = OrderWatchRecord(
+        internal_order_id="limit-expired-trigger", broker_order_id="broker-3",
+        order_role="ENTRY", status="SUBMITTED", submitted_at=10.0,
+        requested_quantity=1, remaining_quantity=1, rest_verified=True,
+        trigger_crossed=True,
+    )
+
+    # A trigger-crossed entry can outlive the generic 60s signal-age budget
+    # while it rests at Dhan. It must still go through the safe fallback path.
+    assert watcher._decide(rec, SIGNAL_EXPIRED, now=71.0) == "MARKET_FALLBACK"
+
+
+def test_terminal_enum_exit_does_not_lock_new_entry():
+    completed_exit = SimpleNamespace(
+        order_id="old-exit", strategy_id="s1", order_role="EXIT",
+        state=OrderState.FILLED,
+    )
+    watcher = OrderWatcher(engine=SimpleNamespace(_orders={"old-exit": completed_exit}))
+    rec = OrderWatchRecord(
+        internal_order_id="new-entry", broker_order_id="broker-4",
+        strategy_id="s1", order_role="ENTRY", status="SUBMITTED",
+    )
+
+    assert watcher._highest_priority_blocker(rec) is None
 
 
 def test_partial_limit_fill_waits_for_market_fallback_then_protects_actual_qty():

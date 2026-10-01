@@ -698,6 +698,19 @@ class OrderWatcher:
         blocker = self._highest_priority_blocker(rec)
         if blocker is not None:
             return "LOCK"
+        if classification == SIGNAL_EXPIRED and rec.trigger_crossed:
+            # A fired trigger is still valid intent for its already-submitted
+            # LIMIT. If that LIMIT remains broker-pending past the ordinary
+            # signal-age window, finish the requested cancel -> REST-confirm ->
+            # MARKET fallback instead of abandoning a now-triggered entry.
+            # _do_market_fallback enforces fresh price, cancel confirmation,
+            # broker REST verification, and remaining-quantity sizing.
+            if not rec.rest_verified:
+                return "VERIFY"
+            if rec.status in ("FILLED", "PARTIALLY_FILLED"):
+                return "WAIT"
+            return ("MARKET_FALLBACK"
+                    if self._market_fallback_eligible(rec, now) else "CANCEL")
         if classification in (ORDER_REJECTED, ORDER_CANCELLED, ORDER_EXPIRED,
                               SIGNAL_EXPIRED):
             # Terminal state that must not be re-driven blindly (never a
@@ -903,8 +916,13 @@ class OrderWatcher:
             # Never lock an order on its OWN leg (self-lock fix).
             if getattr(o, "order_id", None) == rec.internal_order_id:
                 continue
-            state = str(getattr(o, "state", "") or "").lower()
-            if state not in ("filled", "canceled", "cancelled", "rejected"):
+            raw_state = getattr(o, "state", "") or ""
+            # Enum.__str__ yields "OrderState.FILLED" on supported Python
+            # versions; normalize through .value so terminal exit legs do not
+            # remain false blockers for a subsequent entry/fallback.
+            state = str(getattr(raw_state, "value", raw_state)).upper()
+            if state not in ("FILLED", "CANCELED", "CANCELLED", "REJECTED",
+                             "EXPIRED"):
                 return _PRIORITY_RANK.get(role, P2_EXIT)
         return None
 
