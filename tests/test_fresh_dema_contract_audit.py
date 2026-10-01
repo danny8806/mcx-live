@@ -53,7 +53,7 @@ def test_same_hourly_value_allows_new_buy_after_confirmed_stop_exit():
     strategy.just_entered = False
 
     opposite = strategy.on_bar(
-        _candle(3, 99.0, 100.0, 97.0),
+        _candle(3, 99.0, 101.0, 97.0),
         SimpleNamespace(htf_value=100.0), 100.0)
     assert opposite is not None and opposite.side is None
     second = strategy.on_bar(

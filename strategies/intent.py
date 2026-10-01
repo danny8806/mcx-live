@@ -14,9 +14,12 @@ def long_crossover(
     previous_close: float,
     htf_line: Optional[float],
     mid_line: Optional[float] = None,
+    candle_low: Optional[float] = None,
 ) -> bool:
-    """Cross above the 1h line, confirmed by 15m being below that line."""
-    if htf_line is None or not (close > htf_line and previous_close <= htf_line):
+    """Close above the 1h line after this candle crossed below it."""
+    if htf_line is None or candle_low is None or not (
+        candle_low < htf_line and close > htf_line
+    ):
         return False
     return mid_line is None or mid_line < htf_line
 
@@ -26,9 +29,12 @@ def short_crossover(
     previous_close: float,
     htf_line: Optional[float],
     mid_line: Optional[float] = None,
+    candle_high: Optional[float] = None,
 ) -> bool:
-    """Cross below the 1h line, confirmed by 15m being above that line."""
-    if htf_line is None or not (close < htf_line and previous_close >= htf_line):
+    """Close below the 1h line after this candle crossed above it."""
+    if htf_line is None or candle_high is None or not (
+        candle_high > htf_line and close < htf_line
+    ):
         return False
     return mid_line is None or mid_line > htf_line
 

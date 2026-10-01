@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from trading_engine import StrategyGate, TradingEngine, restore_strategy_gates
+from strategies.types import StrategyState
 
 
 def test_legacy_saved_gate_does_not_override_current_config():
@@ -73,6 +74,7 @@ def test_pause_terminalizes_live_trigger_before_clearing_memory():
     signal = SimpleNamespace(signal_id="signal-1")
     strategy = SimpleNamespace(
         enabled=True, pending_entry=SimpleNamespace(signal=signal),
+        state=StrategyState.PENDING_LONG, _last_armed_pending_id="signal-1",
         _cancel_trigger=lambda pending: calls.append(("cancel", pending.signal.signal_id)),
     )
     persistence = SimpleNamespace(
@@ -95,6 +97,8 @@ def test_pause_terminalizes_live_trigger_before_clearing_memory():
     assert calls == [("db", "signal-1", "operator_paused"),
                      ("cancel", "signal-1"), ("sync", None)]
     assert strategy.pending_entry is None
+    assert strategy.state == StrategyState.FLAT
+    assert strategy._last_armed_pending_id is None
     assert not strategy.enabled
 
 

@@ -297,7 +297,7 @@ def test_fresh_candle_trigger_entry_reversal_and_sl_full_runtime_cycle(tmp_path)
         strategy._prev_fast_low = 99.0
         _live_price(engine, env, broker, 101.0)
         next_entry = strategy.on_bar(
-            Bar("GOLDM", "15m", 5, 6, 100, 105, 100, 101, 1),
+            Bar("GOLDM", "15m", 5, 6, 100, 105, 99, 101, 1),
             SimpleNamespace(htf_value=100.0), 100.0)
         assert next_entry is not None
         assert next_entry.signal_id != entry.signal_id

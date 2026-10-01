@@ -161,10 +161,16 @@ def test_old_long_stop_cannot_close_new_short_and_current_stop_submits_once():
 
 
 def test_dema_atr_strategy_intent_stays_explicit_and_shared():
-    assert long_crossover(101, 99, 100, 98)
-    assert not long_crossover(101, 99, 100, 100)
-    assert short_crossover(99, 101, 100, 102)
-    assert not short_crossover(99, 101, 100, 100)
+    # Signal candle must cross the hourly line and close back through it;
+    # the previous candle close does not gate the signal.
+    assert long_crossover(101, 105, 100, 98, candle_low=99)
+    assert not long_crossover(101, 105, 100, 98, candle_low=100)
+    assert not long_crossover(101, 99, 100, 100, candle_low=99)
+    assert not long_crossover(99, 105, 100, 98, candle_low=99)
+    assert short_crossover(99, 95, 100, 102, candle_high=101)
+    assert not short_crossover(99, 95, 100, 102, candle_high=100)
+    assert not short_crossover(99, 101, 100, 100, candle_high=101)
+    assert not short_crossover(101, 95, 100, 102, candle_high=101)
 
     assert entry_levels("LONG", high=105, low=99,
                         previous_high=104, previous_low=98) == (105, 98)

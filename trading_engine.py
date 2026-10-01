@@ -741,6 +741,10 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 if pending is not None:
                     strat._cancel_trigger(pending)
                 strat.pending_entry = None
+                if hasattr(strat, "state"):
+                    strat.state = StrategyState.FLAT
+                if hasattr(strat, "_last_armed_pending_id"):
+                    strat._last_armed_pending_id = None
                 registry = getattr(env, "pending_triggers", None) if env is not None else None
                 if registry is not None:
                     registry.sync_strategy(strat)

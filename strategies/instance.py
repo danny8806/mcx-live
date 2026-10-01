@@ -356,10 +356,10 @@ class StrategyInstance:
                                    StrategyState.PENDING_SHORT)):
             cancel_and_reenter = None
             if self._check_long_cross(close, prev_close, htf_val, prev_htf_val,
-                                      mid_val, prev_mid_val):
+                                      mid_val, prev_mid_val, low):
                 cancel_and_reenter = "LONG"
             elif self._check_short_cross(close, prev_close, htf_val, prev_htf_val,
-                                         mid_val, prev_mid_val):
+                                         mid_val, prev_mid_val, high):
                 cancel_and_reenter = "SHORT"
             if cancel_and_reenter is not None:
                 old_pending_id = (self._last_armed_pending_id
@@ -427,11 +427,11 @@ class StrategyInstance:
             # Skip reversal detection when an exit order is already in flight
             # (EXIT_ORDER_SUBMITTED) to prevent double reversal on consecutive
             # bars before the first reversal's entry fills.
-            if self.position_side == "SHORT" and self._check_long_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val):
+            if self.position_side == "SHORT" and self._check_long_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val, low):
                 signal = self._create_reversal_signal("LONG", close, high, low, bar.start_ts, prev_high, prev_low,
                                                       htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
                                                       open_=bar.open)
-            elif self.position_side == "LONG" and self._check_short_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val):
+            elif self.position_side == "LONG" and self._check_short_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val, high):
                 signal = self._create_reversal_signal("SHORT", close, high, low, bar.start_ts, prev_high, prev_low,
                                                       htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
                                                       open_=bar.open)
@@ -577,15 +577,17 @@ class StrategyInstance:
         self, close: float, prev_close: float,
         htf_val: float, prev_htf_val: float,
         mid_val: Optional[float] = None, prev_mid_val: Optional[float] = None,
+        candle_low: Optional[float] = None,
     ) -> bool:
-        return long_crossover(close, prev_close, htf_val, mid_val)
+        return long_crossover(close, prev_close, htf_val, mid_val, candle_low)
 
     def _check_short_cross(
         self, close: float, prev_close: float,
         htf_val: float, prev_htf_val: float,
         mid_val: Optional[float] = None, prev_mid_val: Optional[float] = None,
+        candle_high: Optional[float] = None,
     ) -> bool:
-        return short_crossover(close, prev_close, htf_val, mid_val)
+        return short_crossover(close, prev_close, htf_val, mid_val, candle_high)
 
     # ═══════════════════════════════════════════════════════════════════════
     # SIGNAL CREATION
@@ -599,11 +601,13 @@ class StrategyInstance:
         """Detect a crossover and arm a local trigger; it never submits here."""
         if self.pending_entry is not None or self.pending_exit_trigger is not None:
             return None
-        if self._check_long_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val):
+        if self._check_long_cross(close, prev_close, htf_val, prev_htf_val,
+                                  mid_val, prev_mid_val, low):
             return self._entry_signal("LONG", close, high, low, timestamp, prev_high, prev_low,
                                       htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
                                       open_=open_)
-        elif self._check_short_cross(close, prev_close, htf_val, prev_htf_val, mid_val, prev_mid_val):
+        elif self._check_short_cross(close, prev_close, htf_val, prev_htf_val,
+                                     mid_val, prev_mid_val, high):
             return self._entry_signal("SHORT", close, high, low, timestamp, prev_high, prev_low,
                                       htf_val=htf_val, mid_val=mid_val, fast_dema_atr=fast_dema_atr,
                                       open_=open_)
