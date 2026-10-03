@@ -856,6 +856,20 @@ class SLFlowMixin:
                 log.exception("[SL] broker-verified stale-close restore failed for %s",
                               candidate.position_id)
                 continue
+            # This path restores a position after the engine's normal startup
+            # reconstruction has already run. Keep account ledgers in sync
+            # with the newly reopened exposure so reconciliation and risk
+            # views do not report zero local margin for a live position.
+            open_positions = [p for p in pm.open_positions if p.is_open]
+            for strategy_id, account in (
+                    getattr(env, "account_engines", {}) or {}).items():
+                account.used_margin = sum(
+                    p.margin for p in pm.get_positions_by_strategy(strategy_id)
+                    if p.is_open
+                )
+            account_engine = getattr(env, "account_engine", None)
+            if account_engine is not None:
+                account_engine.used_margin = sum(p.margin for p in open_positions)
             try:
                 self._persist_position(candidate, getattr(env, "name", None))
             except Exception:

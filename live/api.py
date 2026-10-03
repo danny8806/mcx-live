@@ -46,9 +46,14 @@ logger = logging.getLogger("live.api")
 
 ROUTE_MODULES = [
     analytics_routes,
+    # Fixed `/api/live/...` paths must be registered before parameterized
+    # `/api/{env}/...` routes. Otherwise Starlette routes `/api/live/positions`
+    # through positions.list_positions_env(env="live"), returning only the
+    # local book where the UI expects the broker-vs-local comparison payload.
+    live_ops,
     overview, strategies, positions, orders, trades, pnl, market_data,
     risk, health, reconciliation, alerts, settings, audit_log,
-    indicators, env_switch, broker_evidence, live_ops, reversals,
+    indicators, env_switch, broker_evidence, reversals,
 ]
 
 _engine = None            # TradingEngine (live_only)

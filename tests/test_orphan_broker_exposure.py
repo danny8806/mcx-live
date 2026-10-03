@@ -246,6 +246,7 @@ def test_unique_filled_entry_recovers_position_closed_by_old_false_flat_reconcil
     position = make_position(
         pid="P-STALE", strategy_id="S1", instrument="SILVERM",
         side=PositionSide.SHORT, qty=1, stop=110.0, trade_id="T-STALE")
+    position.margin = 157_087.5
     pm = make_pm([position])
     pm.abandon_stale_position(position.position_id)
     trade = SimpleNamespace(
@@ -282,6 +283,10 @@ def test_unique_filled_entry_recovers_position_closed_by_old_false_flat_reconcil
         "request_payload": json.dumps({"securityId": "SEC-1"})
     }] if order_id == "BRK-ENTRY-1" else [])
     env.runtimes = {"S1": SimpleNamespace(lifecycle=Lifecycle())}
+    strategy_account = SimpleNamespace(used_margin=0.0)
+    global_account = SimpleNamespace(used_margin=0.0)
+    env.account_engines = {"S1": strategy_account}
+    env.account_engine = global_account
 
     summary = h.sync_sl_from_broker("LIVE")
 
@@ -293,6 +298,8 @@ def test_unique_filled_entry_recovers_position_closed_by_old_false_flat_reconcil
     assert restored.sl_state == SLState.ARMED.value
     assert strategy.position_side == "SHORT"
     assert strategy.current_position_id == "P-STALE"
+    assert strategy_account.used_margin == 157_087.5
+    assert global_account.used_margin == 157_087.5
     assert summary["orphan_exposure"] is False
 
 
