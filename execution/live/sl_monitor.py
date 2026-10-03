@@ -401,9 +401,9 @@ class PositionOwnedSLMonitor:
         """Startup / crash recovery — INVARIANT 9.
 
         The broker is the only authority for "is there an open position".
-        Anything the local book holds that the broker does not confirm is
-        dropped (so a stale DB row can never arm an SL); anything the broker
-        confirms is armed from its OWN stop, optionally supplied by
+        Missing broker rows are unresolved evidence, not an executed exit.
+        Preserve local ownership and disarm uncertain exposure; anything the
+        broker confirms is armed from its OWN stop, optionally supplied by
         ``stop_resolver`` (which must never invent a level — returning None
         yields ``SL_UNAVAILABLE``).
 
@@ -436,13 +436,14 @@ class PositionOwnedSLMonitor:
                 match_idx = idx
                 break
             if match_idx is None:
-                # DB said OPEN, broker says FLAT (or unconfirmed) -> the
-                # position cannot be trusted to exist, so it cannot arm an SL.
-                self.close(getattr(lp, "position_id", ""))
-                summary["dropped_local"].append(
+                # A successful empty response can be transient (Dhan daily
+                # rollover). Never destroy the lifecycle, quantity, stop or
+                # accounting from absence alone, even across repeated polls.
+                self.disarm(getattr(lp, "position_id", ""))
+                summary["unavailable"].append(
                     {"position_id": getattr(lp, "position_id", None),
                      "strategy_id": sid, "instrument": instrument,
-                     "reason": "DB_OPEN_BROKER_NOT_CONFIRMED"})
+                     "reason": "BROKER_POSITION_UNCONFIRMED"})
                 continue
 
             consumed.add(match_idx)

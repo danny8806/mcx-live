@@ -1264,9 +1264,9 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 )
         # ── Position-owned SL recovery (INVARIANT 9) ──────────────────────
         # The BROKER is the only authority for "is there an open position".
-        # Never arm the local SL from the database alone: a local row the
-        # broker does not confirm is closed and its SL discarded; a
-        # broker-confirmed position is armed from its OWN stop.
+        # Never arm the local SL from the database alone; missing broker rows
+        # remain unresolved, while only a verified entry/order match may
+        # recover a prior false broker-flat close.
         for name, env in self._envs.items():
             if not env.is_live:
                 continue

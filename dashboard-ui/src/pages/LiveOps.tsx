@@ -320,7 +320,7 @@ export default function LiveOps() {
       {/* ── Row 5: Positions + P&L + Reconciliation ── */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: "12px" }}>
         <Panel title="POSITIONS — LOCAL vs DHAN" right={data?.positions && <span style={{ display: "flex", gap: "4px" }}>
-          <Badge ok={!data.positions.counts.MISMATCH} label={`${data.positions.counts.MISMATCH} mismatch`} warn />
+          <Badge ok={!((data.positions.counts.MISMATCH || 0) + (data.positions.counts.MISSING_LOCAL || 0) + (data.positions.counts.MISSING_DHAN || 0))} label={`${(data.positions.counts.MISMATCH || 0) + (data.positions.counts.MISSING_LOCAL || 0) + (data.positions.counts.MISSING_DHAN || 0)} mismatch`} warn />
         </span>}>
           <div style={{ display: "grid", gridTemplateColumns: "120px 60px 90px 90px 60px", gap: "8px", ...thStyle }}>
             <span>Strategy</span><span>Status</span><span>LOCAL</span><span>DHAN</span><span>Δqty</span>

@@ -57,6 +57,8 @@ def _health_sync():
             "components": result,
             "overall": health.get("overall_status", "unknown"),
             "market_status": market_status.get("market_state", "unknown"),
+            "calendar_reason": market_status.get("calendar_reason", ""),
+            "calendar_valid_through": market_status.get("calendar_valid_through"),
             "engine_status": market_status.get("engine_status", "unknown"),
             "data_status": market_status.get("data_status", "unknown"),
             "safe_mode": safe_mode,

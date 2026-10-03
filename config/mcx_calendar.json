@@ -1,0 +1,14 @@
+{
+  "source": "https://www.mcxindia.com/gu/market-operations/trading-surveillance/trading-holidays",
+  "verified_on": "2026-10-02",
+  "valid_from": "2026-10-02",
+  "valid_through": "2026-12-31",
+  "sessions": {
+    "2026-10-02": {"closed": true, "reason": "Mahatma Gandhi Jayanti"},
+    "2026-10-20": {"open": "17:00", "reason": "Dussehra: morning closed"},
+    "2026-11-08": {"closed": true, "reason": "Muhurat session: timings require verification"},
+    "2026-11-10": {"open": "17:00", "reason": "Diwali-Balipratipada: morning closed"},
+    "2026-11-24": {"open": "17:00", "reason": "Guru Nanak Jayanti: morning closed"},
+    "2026-12-25": {"closed": true, "reason": "Christmas"}
+  }
+}

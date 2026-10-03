@@ -891,6 +891,59 @@ class TradeLifecycleManager:
                          "pnl_available": False})
             return self._persist_trade(trade)
 
+    def reopen_trade_from_broker_position(self, trade_id: str,
+                                          position) -> bool:
+        """Restore a false broker-flat close from a verified open position.
+
+        This is deliberately narrower than a generic reopen: only a trade
+        closed by broker-flat reconciliation, with no exit order/fill/price,
+        can be restored. Caller must independently validate the live broker
+        net against the original filled entry order and position identity.
+        """
+        with self._lock:
+            trade = self._trade_in_scope(trade_id)
+            if trade is None or trade.status != TradeStatus.CLOSED.value:
+                return False
+            if str(trade.exit_reason or "").upper() not in {
+                    "BROKER_FLAT_RECONCILIATION", "STARTUP_BROKER_FLAT"}:
+                return False
+            if (trade.exit_order_id or trade.exit_fill_id
+                    or float(trade.exit_price or 0) > 0
+                    or float(trade.exit_timestamp or 0) > 0):
+                return False
+            if (position is None or not getattr(position, "is_open", False)
+                    or position.trade_id != trade_id
+                    or position.position_id != trade.position_id):
+                return False
+            previous = {name: getattr(trade, name) for name in (
+                "status", "exit_reason", "exit_order_id", "exit_fill_id",
+                "exit_price", "exit_timestamp", "exit_type", "gross_pnl",
+                "charges", "net_pnl", "closed_at", "updated_at", "quantity")}
+            trade.status = TradeStatus.OPEN.value
+            trade.exit_reason = ""
+            trade.exit_order_id = ""
+            trade.exit_fill_id = ""
+            trade.exit_price = 0.0
+            trade.exit_timestamp = 0.0
+            trade.exit_type = ""
+            trade.gross_pnl = 0.0
+            trade.charges = 0.0
+            trade.net_pnl = 0.0
+            trade.closed_at = 0.0
+            trade.updated_at = time.time()
+            trade.quantity = int(position.quantity)
+            if not self._persist_trade(trade):
+                for name, value in previous.items():
+                    setattr(trade, name, value)
+                return False
+            self._position_to_trade[position.position_id] = trade_id
+            self._record_event(
+                trade_id, "TRADE_REOPENED_FROM_BROKER_POSITION",
+                payload={"position_id": position.position_id,
+                         "quantity": int(position.quantity),
+                         "reason": "verified_entry_and_open_broker_net"})
+            return True
+
     # ═══════════════════════════════════════════
     # REVERSAL — atomic old close + new open
     # ═══════════════════════════════════════════

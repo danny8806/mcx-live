@@ -13,6 +13,8 @@ export default function Positions() {
   const [detailBusy, setDetailBusy] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [lastSuccessAt, setLastSuccessAt] = useState<number | null>(null);
+  const [brokerSnapshot, setBrokerSnapshot] = useState<any>(null);
+  const [brokerError, setBrokerError] = useState<string | null>(null);
   const mounted = useRef(true);
 
   useEffect(() => {
@@ -23,8 +25,21 @@ export default function Positions() {
   useEffect(() => {
     let timer: number;
     const load = async () => {
+      const [localResult, brokerResult] = await Promise.allSettled([
+        api.positions({ status: "all" }),
+        api.livePositions(),
+      ]);
+      if (brokerResult.status === "fulfilled") {
+        if (mounted.current) {
+          setBrokerSnapshot(brokerResult.value);
+          setBrokerError(null);
+        }
+      } else if (mounted.current) {
+        setBrokerError(brokerResult.reason?.message || String(brokerResult.reason));
+      }
       try {
-        const d = await api.positions({ status: "all" }) as any;
+        if (localResult.status === "rejected") throw localResult.reason;
+        const d = localResult.value as any;
         if (!Array.isArray(d?.positions)) throw new Error(d?.error || "Invalid positions response");
         if (mounted.current) {
           const all = d.positions;
@@ -76,10 +91,26 @@ export default function Positions() {
     { key: "closed", label: `Closed (${counts.closed})` },
     { key: "all", label: `All (${counts.all})` },
   ];
+  const brokerUnmatched = (brokerSnapshot?.positions ?? []).filter(
+    (row: any) => row.status !== "MATCHED",
+  );
 
   return (
     <div className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", overflow: "hidden" }}>
       {loadError && <div role="alert" className="desk-warning">Position refresh failed. Showing the last successful snapshot from {lastSuccessAt ? new Date(lastSuccessAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) : "unknown time"}: {loadError}</div>}
+      {brokerError ? <div role="alert" className="desk-warning">Dhan position comparison is unavailable: {brokerError}. An empty local list does not confirm that the broker account is flat.</div> : brokerUnmatched.length > 0 && <div role="alert" className="desk-warning" style={{ display: "block" }}>
+        <strong>Broker and local positions do not match — do not treat this account as flat.</strong>
+        <div style={{ marginTop: 6, fontSize: 10 }}>Dhan shows exposure without a matching open local position. Stop monitoring and ownership need operator reconciliation; this dashboard will not invent a local trade or send an order.</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 6, marginTop: 8 }}>
+          {brokerUnmatched.map((row: any) => <div key={row.instrument} style={{ border: "1px solid var(--border-subtle)", borderRadius: 4, padding: "6px 8px", background: "var(--bg-panel)" }}>
+            <b>{row.instrument}</b> · <span style={{ color: "var(--red)", fontWeight: 700 }}>{row.status}</span>
+            <div style={{ marginTop: 3 }}>Dhan: {row.dhan?.side ?? "—"} {row.dhan?.quantity ?? "—"} @ {safeINR(row.dhan?.average_entry_price)}</div>
+            <div>Local: {row.local ? `${row.local.side} ${row.local.quantity}` : "no open position record"}</div>
+            {row.dhan?.ltp != null && <div>LTP: {safeINR(row.dhan.ltp)}</div>}
+          </div>)}
+        </div>
+        <div style={{ marginTop: 6, fontSize: 9, color: "var(--text-muted)" }}>Dhan snapshot age: {brokerSnapshot?.dhan_position_age_seconds == null ? "unknown" : `${Math.max(0, Math.floor(brokerSnapshot.dhan_position_age_seconds))}s`}</div>
+      </div>}
       <div style={{ padding: "8px 12px", borderBottom: "1px solid var(--border-subtle)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <span style={{ fontSize: "10px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>
           POSITIONS ({list.length})
@@ -104,7 +135,7 @@ export default function Positions() {
       </div>
       {list.length === 0 ? (
         <div className="animate-fade-in-up" style={{ padding: "40px", textAlign: "center", color: "var(--text-muted)", fontSize: "10px" }}>
-          {view === "open" ? "No open positions — all flat" : "No positions in this view"}
+          {view === "open" ? (brokerError ? "No local position records; broker state unavailable" : brokerUnmatched.length ? "No local open positions — broker exposure is listed above" : "No open local positions") : "No positions in this view"}
         </div>
       ) : (
         <div className="ledger-grid-viewport">

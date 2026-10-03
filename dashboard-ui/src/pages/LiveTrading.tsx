@@ -1,4 +1,6 @@
 import { Activity, ArrowDownRight, ArrowUpRight, CircleCheck, Clock3, ShieldAlert, Waypoints } from "lucide-react";
+import { useEffect, useState } from "react";
+import { api } from "../lib/api";
 import { formatINR, formatTimestamp, pnlColor, safeINR, safeNum } from "../lib/utils";
 import { useDataSelector } from "../store/DataProvider";
 import { quoteIsFresh, quoteStatus, tickAge } from "../lib/market";
@@ -18,6 +20,8 @@ function Value({ label, value, emphasis }: { label: string; value: React.ReactNo
 }
 
 export default function LiveTrading() {
+  const [brokerPositions, setBrokerPositions] = useState<any>(null);
+  const [brokerPositionsError, setBrokerPositionsError] = useState<string | null>(null);
   const overview = useDataSelector<any>((s) => s.overview);
   const pnl = useDataSelector<any>((s) => s.pnl);
   const strategies = useDataSelector<any[]>((s) => s.strategies);
@@ -32,6 +36,23 @@ export default function LiveTrading() {
   const lastError = useDataSelector<string | null>((s) => s.lastError);
   const reconciliation = useDataSelector<any>((s) => s.reconciliation);
   const brokerPnl = useDataSelector<any>((s) => s.brokerPnl);
+  useEffect(() => {
+    let active = true;
+    const refresh = async () => {
+      try {
+        const snapshot = await api.livePositions();
+        if (active) {
+          setBrokerPositions(snapshot);
+          setBrokerPositionsError(null);
+        }
+      } catch (error: any) {
+        if (active) setBrokerPositionsError(error?.message || String(error));
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(refresh, 3000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
   if (!overview || snapshotStatus.overview !== "live") return <div className="desk-unavailable"><ShieldAlert size={21}/><div><strong>Current account snapshot unavailable</strong><p>The dashboard has not received a successful account snapshot, so positions, triggers, and P&amp;L cannot be confirmed.</p>{lastError && <small>{lastError}</small>}</div></div>;
 
   const open = positions.filter((position: any) => position.is_open);
@@ -48,6 +69,7 @@ export default function LiveTrading() {
   ].filter(Boolean) as any[]) : [];
   const workingOrders = orders.filter((order: any) => activeOrderStates.has(orderState(order)));
   const unclassifiedOrders = orders.filter((order: any) => !activeOrderStates.has(orderState(order)) && !new Set(["created", "filled", "rejected", "cancelled", "canceled", "expired", "complete", "completed"]).has(orderState(order)));
+  const unmatchedBrokerPositions = (brokerPositions?.positions ?? []).filter((position: any) => position.status !== "MATCHED");
 
   return <div className="live-floor">
     <section className="desk-hero">
@@ -58,6 +80,7 @@ export default function LiveTrading() {
     {overview.kill_switch && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Kill switch is active</b><small>Trading is halted according to the current runtime state.</small></div></div>}
     {reconciliation?.is_consistent === false && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Broker and local ledgers differ</b><small>{reconciliation.summary?.total_errors ?? reconciliation.errors?.length ?? "?"} reconciliation error(s). Check Reconciliation before relying on local fills or P&amp;L.</small></div></div>}
     {reconciliation?._fetch_error && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Reconciliation refresh failed</b><small>Last confirmed snapshot: {reconciliation._fetched_at ? formatTimestamp(reconciliation._fetched_at) : "unknown"}. Check Reconciliation.</small></div></div>}
+    {brokerPositionsError ? <div role="alert" className="desk-warning"><ShieldAlert size={20}/><div><b>Dhan position comparison unavailable</b><small>{brokerPositionsError}. Local flat state does not confirm the broker account is flat.</small></div></div> : unmatchedBrokerPositions.length > 0 && <div role="alert" className="desk-warning"><ShieldAlert size={20}/><div><b>Broker/local position mismatch — account is not confirmed flat</b><small>Local SL ownership may be unavailable. Do not rely on the local position count until this exposure is reconciled.</small><div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>{unmatchedBrokerPositions.map((position: any) => <span key={position.instrument} style={{ border: "1px solid var(--border-subtle)", borderRadius: 4, padding: "5px 8px" }}><b>{position.instrument}</b> · {position.status} · Dhan {position.dhan?.side} {position.dhan?.quantity} @ {safeINR(position.dhan?.average_entry_price)} · Local {position.local ? `${position.local.side} ${position.local.quantity}` : "none"}</span>)}</div></div></div>}
 
     <section className="desk-metrics">
       <Value label="Open positions" value={positionsKnown ? open.length : "—"}/>

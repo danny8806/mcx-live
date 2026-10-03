@@ -13,6 +13,7 @@ no second order type and no second framework is introduced.
 from __future__ import annotations
 
 import logging
+import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -555,16 +556,28 @@ class SLFlowMixin:
     def sync_sl_from_broker(self, env_name: Optional[str] = None) -> dict:
         """INVARIANT 9 — arm the SL only from broker-confirmed positions.
 
-        Never arms from the database alone: a local row the broker does not
-        confirm is CLOSED in the position book (not just dropped from the
-        monitor) so a stale DB row can never arm an SL, hold an entry
-        blocker, or be traded against.
+        Never arms from the database alone. An unconfirmed local position
+        remains owned but unarmed and blocks entries until broker evidence
+        agrees again or an attributable exit fill closes it.
         """
         env = self._env_for(env_name)
+
+        def _apply_reconciliation_gate(summary):
+            reconciled = getattr(self, "_reconciled_envs", None)
+            name = getattr(env, "name", env_name) if env is not None else env_name
+            if reconciled is not None and name:
+                if (summary.get("status") == "reconciled"
+                        and not summary.get("orphan_exposure")):
+                    reconciled.add(name)
+                else:
+                    reconciled.discard(name)
+            return summary
+
         if env is None:
-            return {"status": "failed", "error": "unknown_environment",
-                    "env": env_name, "armed": [], "unavailable": [],
-                    "dropped_local": [], "broker_only": []}
+            return _apply_reconciliation_gate({
+                "status": "failed", "error": "unknown_environment",
+                "env": env_name, "armed": [], "unavailable": [],
+                "dropped_local": [], "broker_only": []})
         # A previous broker-confirmed close may have succeeded in memory while
         # SQLite was temporarily unavailable. Retry its canonical row update on
         # every broker reconciliation before allowing the environment to be
@@ -575,9 +588,10 @@ class SLFlowMixin:
         broker = getattr(env, "broker", None)
         pm = getattr(env, "position_manager", None)
         if broker is None or pm is None or not hasattr(broker, "positions"):
-            return {"status": "failed", "error": "broker_unavailable",
-                    "env": env_name, "armed": [], "unavailable": [],
-                    "dropped_local": [], "broker_only": []}
+            return _apply_reconciliation_gate({
+                "status": "failed", "error": "broker_unavailable",
+                "env": env_name, "armed": [], "unavailable": [],
+                "dropped_local": [], "broker_only": []})
         state_lock = getattr(self, "_lock", None)
         if state_lock is not None:
             with state_lock:
@@ -592,9 +606,10 @@ class SLFlowMixin:
             # at all, so a transient API failure silently skipped the whole
             # broker-authoritative check.
             log.error("[SL] broker position query failed: %s", e)
-            return {"status": "failed", "error": f"broker_query_failed: {e}",
-                    "env": env_name, "armed": [], "unavailable": [],
-                    "dropped_local": [], "broker_only": []}
+            return _apply_reconciliation_gate({
+                "status": "failed", "error": f"broker_query_failed: {e}",
+                "env": env_name, "armed": [], "unavailable": [],
+                "dropped_local": [], "broker_only": []})
 
         # Broker I/O stays outside the state lock. Apply this response only
         # after taking the same lock used by tick, fill, and trigger paths so
@@ -605,20 +620,24 @@ class SLFlowMixin:
             if state_lock is not None:
                 with state_lock:
                     if self._sl_reconciliation_fingerprint(env) != before_fingerprint:
-                        return {
+                        return _apply_reconciliation_gate({
                             "status": "stale_snapshot",
                             "error": "local_lifecycle_changed_during_broker_query",
                             "env": getattr(env, "name", env_name),
                             "armed": [], "unavailable": [],
                             "dropped_local": [], "broker_only": [],
-                        }
-                    return worker(env, env_name, broker_positions)
-            return worker(env, env_name, broker_positions)
-        return SLFlowMixin._sync_sl_from_broker_snapshot(
-            self, env, env_name, broker_positions)
+                        })
+                    return _apply_reconciliation_gate(
+                        worker(env, env_name, broker_positions))
+            return _apply_reconciliation_gate(
+                worker(env, env_name, broker_positions))
+        return _apply_reconciliation_gate(
+            SLFlowMixin._sync_sl_from_broker_snapshot(
+                self, env, env_name, broker_positions))
 
     def _sync_sl_from_broker_snapshot(self, env, env_name, broker_positions) -> dict:
         pm = getattr(env, "position_manager", None)
+        broker = getattr(env, "broker", None)
 
         # Local open positions across every strategy.
         local_positions = []
@@ -651,7 +670,9 @@ class SLFlowMixin:
             if cur is None:
                 broker_net[inst] = {"instrument": inst, "signed": signed,
                                     "quantity": abs(signed),
-                                    "side": "LONG" if signed > 0 else "SHORT"}
+                                    "side": "LONG" if signed > 0 else "SHORT",
+                                    "average_entry_price": row.get(
+                                        "average_entry_price")}
             elif cur["signed"] != signed:
                 # Conflicting signed nets are not evidence of FLAT.  Do not
                 # mutate local ownership from an internally contradictory
@@ -682,6 +703,192 @@ class SLFlowMixin:
                 "armed": [], "unavailable": [], "dropped_local": [],
                 "broker_only": [], "env": env_name,
             }
+
+        # Recover only the false-close shape created by older startup logic:
+        # closed for broker-flat reconciliation, no exit order/fill, and a
+        # unique original FILLED entry whose identity, side, size and average
+        # still match Dhan's current net. This avoids leaving a real broker
+        # position permanently orphaned after deploying the no-false-close fix.
+        recovered_positions = []
+        closed_positions = list(getattr(pm, "closed_positions", []) or [])
+        execution = getattr(env, "execution_engine", None)
+        runtimes = getattr(env, "runtimes", None)
+        persistence = getattr(env, "persistence", None)
+        for inst, net in broker_net.items():
+            if net.get("quantity", 0) <= 0:
+                continue
+            open_for_instrument = [p for p in local_positions
+                                   if str(getattr(p, "instrument", "")) == inst]
+            if open_for_instrument:
+                continue
+            possible = []
+            for candidate in closed_positions:
+                if (str(getattr(candidate, "instrument", "")) != inst
+                        or ("LONG" if getattr(candidate, "is_long", False)
+                            else "SHORT") != net.get("side")
+                        or str(getattr(candidate, "exit_reason", "") or "").upper()
+                            not in {"STARTUP_BROKER_FLAT",
+                                    "BROKER_FLAT_RECONCILIATION"}
+                        or getattr(candidate, "exit_fills", None)
+                        or getattr(candidate, "exit_order_id", None)
+                        or getattr(candidate, "exit_started", False)):
+                    continue
+                strategy_id = str(getattr(candidate, "strategy_id", "") or "")
+                runtime = runtimes.get(strategy_id) if runtimes is not None else None
+                lifecycle = getattr(runtime, "lifecycle", None)
+                trade_id = str(getattr(candidate, "trade_id", "") or "")
+                trade = lifecycle.get_trade(trade_id) if lifecycle and trade_id else None
+                if (trade is None
+                        or str(getattr(trade, "status", "")).upper() != "CLOSED"
+                        or str(getattr(trade, "exit_reason", "") or "").upper()
+                            not in {"STARTUP_BROKER_FLAT",
+                                    "BROKER_FLAT_RECONCILIATION"}
+                        or getattr(trade, "exit_order_id", "")
+                        or getattr(trade, "exit_fill_id", "")
+                        or float(getattr(trade, "exit_price", 0) or 0) > 0
+                        or float(getattr(trade, "exit_timestamp", 0) or 0) > 0
+                        or not getattr(candidate, "entry_order_id", None)
+                        or str(getattr(trade, "entry_order_id", "") or "")
+                            != str(candidate.entry_order_id)):
+                    continue
+                order = (execution.get_order(candidate.entry_order_id)
+                         if execution is not None else None)
+                persisted_order = None
+                if persistence is not None:
+                    rows = persistence.get_orders(candidate.entry_order_id)
+                    persisted_order = rows[0] if rows else None
+                if order is None:
+                    order = persisted_order
+                def _field(obj, key, default=None):
+                    return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+                def _order_field(key, default=None):
+                    value = _field(order, key, default)
+                    if value in (None, "") and persisted_order is not None:
+                        value = _field(persisted_order, key, default)
+                    return value
+                state_obj = _order_field("state", "")
+                state = str(getattr(state_obj, "value", state_obj)).lower()
+                fill_qty = int(_order_field("filled_quantity", 0) or 0)
+                fill_price = float(_order_field("average_fill_price", 0) or 0)
+                order_side = str(_order_field("side", "") or "").upper()
+                order_role = str(_order_field("order_role", "") or "").upper()
+                order_trade_id = str(_order_field("trade_id", "") or "")
+                order_strategy = str(_order_field("strategy_id", "") or "")
+                order_instrument = str(_order_field("instrument", "") or "")
+                order_quantity = int(_order_field("quantity", 0) or 0)
+                order_security_id = str(_order_field("security_id", "") or "")
+                instrument_config = (getattr(broker, "instruments", {}) or {}).get(inst, {})
+                current_security_id = str(
+                    (instrument_config or {}).get("security_id") or "")
+                if current_security_id and not order_security_id:
+                    broker_order_id = str(
+                        _order_field("broker_order_id", "")
+                        or getattr(order, "_broker_order_id", "") or "")
+                    audit = getattr(broker, "audit", None)
+                    audit_reader = getattr(audit, "for_broker_order", None)
+                    if broker_order_id and callable(audit_reader):
+                        try:
+                            audit_rows = audit_reader(broker_order_id) or []
+                        except Exception:
+                            audit_rows = []
+                        for evidence in audit_rows:
+                            order_security_id = str(
+                                evidence.get("security_id") or "")
+                            if not order_security_id:
+                                payload = evidence.get("request_payload")
+                                if isinstance(payload, str):
+                                    try:
+                                        payload = json.loads(payload)
+                                    except (TypeError, ValueError):
+                                        payload = None
+                                if isinstance(payload, dict):
+                                    order_security_id = str(
+                                        payload.get("securityId")
+                                        or payload.get("security_id") or "")
+                            if order_security_id:
+                                break
+                expected_order_side = "BUY" if net["side"] == "LONG" else "SELL"
+                broker_avg = float(net.get("average_entry_price") or 0)
+                if (state != "filled" or fill_qty != int(net["quantity"])
+                        or order_quantity != fill_qty
+                        or int(getattr(trade, "quantity", 0) or 0) != fill_qty
+                        or order_side != expected_order_side
+                        or order_role != "ENTRY"
+                        or order_trade_id != trade_id
+                        or order_strategy != strategy_id
+                        or order_instrument != inst
+                        or (current_security_id and
+                            order_security_id != current_security_id)
+                        or not fill_price or not broker_avg
+                        or abs(fill_price - broker_avg) > 1.0
+                        or not getattr(candidate, "stop_price", None)
+                        or float(candidate.stop_price) <= 0):
+                    continue
+                possible.append((candidate, trade, lifecycle, runtime, fill_qty,
+                                 fill_price))
+            if len(possible) != 1:
+                continue
+            candidate, trade, lifecycle, runtime, fill_qty, fill_price = possible[0]
+            from portfolio.position_manager import PositionStatus
+            candidate.quantity = fill_qty
+            candidate.average_entry = fill_price
+            candidate.status = PositionStatus.OPEN
+            candidate.exit_reason = None
+            candidate.exit_started = False
+            candidate.exit_order_id = None
+            candidate.exit_signal_id = None
+            candidate.sl_state = SLState.UNAVAILABLE.value
+            candidate.sl_trigger_price = None
+            mark = next((float(row.get("ltp")) for row in broker_positions or []
+                         if str(row.get("instrument") or "") == inst
+                         and row.get("ltp") not in (None, "")), None)
+            if mark and mark > 0:
+                candidate.update_mark(mark)
+            if not lifecycle.reopen_trade_from_broker_position(
+                    candidate.trade_id, candidate):
+                candidate.status = PositionStatus.CLOSED
+                candidate.quantity = 0
+                candidate.exit_reason = "startup_broker_flat"
+                continue
+            try:
+                pm.restore_open_position(candidate)
+            except Exception:
+                log.exception("[SL] broker-verified stale-close restore failed for %s",
+                              candidate.position_id)
+                continue
+            try:
+                self._persist_position(candidate, getattr(env, "name", None))
+            except Exception:
+                log.exception("[SL] restored position persistence failed for %s",
+                              candidate.position_id)
+            strategy = (getattr(env, "strategies", {}) or {}).get(
+                candidate.strategy_id)
+            if strategy is not None:
+                from strategies.types import StrategyState
+                strategy.position_side = net["side"]
+                strategy.current_position_id = candidate.position_id
+                strategy.position_generation = candidate.position_generation
+                strategy.position_quantity = candidate.quantity
+                strategy.current_trade_id = candidate.trade_id
+                strategy.stop_price = candidate.stop_price
+                strategy.stop_exit_submitted = False
+                strategy.state = (StrategyState.LONG_POSITION
+                                  if net["side"] == "LONG"
+                                  else StrategyState.SHORT_POSITION)
+            local_positions.append(candidate)
+            recovered_positions.append({
+                "position_id": candidate.position_id,
+                "trade_id": candidate.trade_id,
+                "strategy_id": candidate.strategy_id,
+                "instrument": inst, "side": net["side"],
+                "quantity": fill_qty, "average_entry_price": fill_price,
+                "stop_price": candidate.stop_price,
+            })
+            self.publish_event("broker_position_recovered_from_stale_close", {
+                **recovered_positions[-1],
+                "reason": "unique_filled_entry_matches_broker_net",
+                "execution_mode": getattr(env, "mode", None),
+            }, env_name=getattr(env, "name", None))
 
         # A filled broker exit makes GET /positions flat before the order
         # poller/order-update path necessarily routes its fill.  Do not let
@@ -817,6 +1024,8 @@ class SLFlowMixin:
         summary = self._sl_monitor(env).resync_from_broker(
             resolved, sync_local_positions,
             stop_resolver=self._sl_stop_resolver(env))
+        if recovered_positions:
+            summary["recovered_from_stale_close"] = recovered_positions
 
         # Preserve ambiguous same-instrument owners for operator resolution,
         # but disarm their individually-owned stops: the broker net cannot tell
@@ -893,91 +1102,10 @@ class SLFlowMixin:
                 log.error("[SL] deferred entry protection failed for %s: %s",
                           getattr(pos, "position_id", None), e)
 
-        # A local row the broker does not confirm cannot exist: close it.
-        for entry in summary.get("dropped_local", []):
-            pid = entry.get("position_id")
-            if not pid:
-                continue
-            try:
-                stale_position = pm.abandon_stale_position(str(pid))
-            except Exception as e2:
-                log.error("[SL] could not close stale position %s: %s", pid, e2)
-                stale_position = None
-            if stale_position is not None and getattr(env, "persistence", None) is not None:
-                try:
-                    env.persistence.close_position_record(stale_position)
-                except Exception as e2:
-                    log.error("[SL] stale position close persistence failed for %s: %s",
-                              pid, e2)
-                    self._queue_position_close_persist(
-                        env, stale_position, "broker_flat_reconciliation", e2)
-            # A broker/manual close ends the pending reversal lifecycle too;
-            # a later fresh strategy signal may create a new entry.
-            stale_sid = (entry.get("strategy_id")
-                         or getattr(stale_position, "strategy_id", None))
-            if stale_position is not None and stale_position.trade_id:
-                runtime = (getattr(env, "runtimes", None).get(stale_sid)
-                           if getattr(env, "runtimes", None) is not None else None)
-                lifecycle = getattr(runtime, "lifecycle", None)
-                close_trade = getattr(
-                    lifecycle, "close_trade_from_broker_reconciliation", None)
-                if callable(close_trade):
-                    try:
-                        if not close_trade(
-                                stale_position.trade_id,
-                                "BROKER_FLAT_RECONCILIATION"):
-                            self._queue_trade_close_persist(
-                                env, lifecycle, stale_position.trade_id,
-                                "BROKER_FLAT_RECONCILIATION")
-                    except Exception as e2:
-                        log.error("[SL] broker-flat trade close failed for %s: %s",
-                                  stale_position.trade_id, e2)
-                        self._queue_trade_close_persist(
-                            env, lifecycle, stale_position.trade_id,
-                            "BROKER_FLAT_RECONCILIATION")
-                else:
-                    summary.setdefault("trade_close_unresolved", []).append({
-                        "trade_id": stale_position.trade_id,
-                        "position_id": stale_position.position_id,
-                        "reason": "lifecycle_owner_unavailable",
-                    })
-            strategy = (getattr(env, "strategies", {}) or {}).get(stale_sid)
-            if strategy is not None:
-                pending = getattr(strategy, "pending_entry", None)
-                pending_signal = getattr(pending, "signal", None)
-                pending_signal_id = getattr(pending_signal, "signal_id", None)
-                reset_strategy = getattr(self, "_reset_strategy_state", None)
-                if callable(reset_strategy):
-                    try:
-                        reset_strategy(stale_sid, keep_pending=False,
-                                       env_name=getattr(env, "name", None))
-                    except Exception as e2:
-                        log.error("[SL] strategy reset after broker-flat position %s "
-                                  "failed: %s", pid, e2)
-                if pending_signal_id:
-                    persistence = getattr(env, "persistence", None)
-                    if persistence is not None:
-                        try:
-                            persistence.terminalize_pending_order(
-                                str(pending_signal_id), status="resolved",
-                                reason="position_closed_manually_before_reversal_entry",
-                            )
-                        except Exception as e2:
-                            log.error("[SL] manual-close reversal cleanup failed "
-                                      "for %s: %s", pending_signal_id, e2)
-                    registry = getattr(env, "pending_triggers", None)
-                    if registry is not None:
-                        registry.remove_signal(str(pending_signal_id))
-                    self.publish_event("pending_reversal_cancelled_after_manual_close", {
-                        "signal_id": str(pending_signal_id),
-                        "strategy_id": stale_sid,
-                        "position_id": pid,
-                        "reason": "position_closed_manually_before_reversal_entry",
-                        "execution_mode": getattr(env, "mode", None),
-                    }, env_name=getattr(env, "name", None))
-            self.publish_event("sl_stale_local_position_closed", dict(
-                entry, execution_mode=getattr(env, "mode", None)),
-                env_name=getattr(env, "name", None))
+        # Missing/opposite broker rows stay OPEN with SL_UNAVAILABLE. Only
+        # an attributable exit fill (or an explicit, verified recovery) may
+        # retire ownership. This also preserves pending reversals and margin
+        # across empty responses, reconnects and process restarts.
 
         # A broker position the local book cannot attribute to any strategy.
         # It is NEVER auto-opened and NEVER auto-flattened: doing either would
@@ -985,31 +1113,40 @@ class SLFlowMixin:
         # and can never exit, so it must be surfaced loudly and must keep the
         # entry gate shut rather than let new risk stack on top of it.
         orphans = summary.get("broker_only") or []
+        orphan_fingerprint = tuple(sorted(
+            (str(entry.get("instrument") or ""),
+             str(entry.get("side") or ""), int(entry.get("quantity") or 0))
+            for entry in orphans
+        ))
+        orphan_changed = orphan_fingerprint != getattr(
+            env, "_sl_orphan_fingerprint", None)
+        env._sl_orphan_fingerprint = orphan_fingerprint
         if orphans:
-            for entry in orphans:
-                log.error("[SL] ORPHAN broker position: %s %s held at broker "
-                          "with no local position — UNPROTECTED, unattributable, "
-                          "entries stay blocked", entry.get("instrument"),
-                          entry.get("quantity"))
+            if orphan_changed:
+                for entry in orphans:
+                    log.error("[SL] ORPHAN broker position: %s %s held at broker "
+                              "with no local position — UNPROTECTED, unattributable, "
+                              "entries stay blocked", entry.get("instrument"),
+                              entry.get("quantity"))
+                    try:
+                        self.publish_event("broker_orphan_position", {
+                            "instrument": entry.get("instrument"),
+                            "quantity": entry.get("quantity"),
+                            "reason": "broker_position_without_local_book",
+                            "execution_mode": getattr(env, "mode", None),
+                        }, env_name=getattr(env, "name", None))
+                    except Exception as e:
+                        log.error("[SL] orphan event publish failed: %s", e)
                 try:
-                    self.publish_event("broker_orphan_position", {
-                        "instrument": entry.get("instrument"),
-                        "quantity": entry.get("quantity"),
-                        "reason": "broker_position_without_local_book",
-                        "execution_mode": getattr(env, "mode", None),
-                    }, env_name=getattr(env, "name", None))
+                    self.telegram.on_risk_alert({
+                        "severity": "CRITICAL",
+                        "type": "broker_orphan_position",
+                        "message": (f"Broker holds {len(orphans)} position(s) with no "
+                                    f"local record: "
+                                    f"{[o.get('instrument') for o in orphans]}"),
+                    })
                 except Exception as e:
-                    log.error("[SL] orphan event publish failed: %s", e)
-            try:
-                self.telegram.on_risk_alert({
-                    "severity": "CRITICAL",
-                    "type": "broker_orphan_position",
-                    "message": (f"Broker holds {len(orphans)} position(s) with no "
-                                f"local record: "
-                                f"{[o.get('instrument') for o in orphans]}"),
-                })
-            except Exception as e:
-                log.warning("[SL] orphan risk alert failed: %s", e)
+                    log.warning("[SL] orphan risk alert failed: %s", e)
         summary["orphan_exposure"] = bool(orphans)
         summary["orphans"] = orphans
 

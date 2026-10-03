@@ -1222,7 +1222,7 @@ def test_fresh_runtime_newer_reversal_replaces_both_old_triggers_and_lineage(tmp
 
 
 def test_fresh_runtime_manual_broker_close_retires_position_sl_and_reversal(tmp_path):
-    """Broker-flat reconciliation removes the old SL and parked reversal."""
+    """A flat snapshot without an exit fill is unresolved, never a fake close."""
     engine, env, broker, persistence = _runtime(tmp_path)
     strategy = env.strategies["gold_02"]
     try:
@@ -1244,15 +1244,21 @@ def test_fresh_runtime_manual_broker_close_retires_position_sl_and_reversal(tmp_
         # Simulate an operator closing the exposure in Dhan, outside this app.
         broker._net_positions["GOLDM"] = 0
         summary = engine.sync_sl_from_broker(env_name="live")
-        assert summary["status"] == "reconciled"
-        assert not env.position_manager.open_positions
-        assert position.sl_state == "CLOSED"
+        assert summary["status"] == "protection_incomplete"
+        assert env.position_manager.open_positions == [position]
+        assert position.is_open
+        assert position.sl_state == "SL_UNAVAILABLE"
         assert position.position_id not in env.sl_monitor.armed_ids()
-        assert strategy.pending_entry is None
-        assert strategy.pending_exit_trigger is None
-        assert strategy.position_side is None
-        assert parked_entry.metadata["trigger_state"] == "CANCELLED"
-        assert strategy.on_tick(reversal.trigger_price, time.time()) is None
+        assert strategy.pending_entry is not None
+        assert strategy.pending_entry.signal is parked_entry
+        assert strategy.pending_exit_trigger is not None
+        assert strategy.position_side == "LONG"
+        assert parked_entry.metadata["trigger_state"] != "CANCELLED"
+        retry_signal = strategy.on_tick(reversal.trigger_price, time.time())
+        assert retry_signal is not None
+        # The pending trigger may fire, but the failed reconciliation must
+        # block the resulting live order until ownership is broker-confirmed.
+        engine._process_signal(retry_signal, "live")
         # Reconciliation is not a new signal and must not submit another entry.
         assert len(env.execution_engine._orders) == 1
     finally:

@@ -18,6 +18,7 @@ guess).
 """
 from __future__ import annotations
 
+import json
 import sys
 import os
 from types import SimpleNamespace
@@ -34,6 +35,8 @@ from test_position_owned_sl import (  # noqa: E402
     make_position,
 )
 from execution.models import OrderState  # noqa: E402
+from execution.live.sl_monitor import SLState  # noqa: E402
+from portfolio.position_manager import PositionSide  # noqa: E402
 
 
 def _live_env_with(broker_positions, positions=(), strategies=None):
@@ -126,6 +129,18 @@ def test_orphan_event_carries_instrument_and_quantity():
     assert ev["reason"] == "broker_position_without_local_book"
 
 
+def test_unchanged_orphan_is_alerted_once_not_written_on_every_poll():
+    h, env = _live_env_with(
+        [{"instrument": "GOLDM", "quantity": 1, "side": "LONG"}],
+        positions=[])
+    h.sync_sl_from_broker("LIVE")
+    h.sync_sl_from_broker("LIVE")
+    assert len(h.events_of("broker_orphan_position")) == 1
+    env.broker._positions[0]["quantity"] = 2
+    h.sync_sl_from_broker("LIVE")
+    assert len(h.events_of("broker_orphan_position")) == 2
+
+
 def test_a_missing_telegram_must_not_break_the_sync():
     """The alarm is best-effort; the gate decision is not."""
     h, env = _live_env_with(
@@ -207,7 +222,7 @@ def test_failed_broker_query_is_never_reported_as_flat():
         "a failed query must not claim the book is clean"
 
 
-def test_stale_broker_flat_position_is_closed_in_the_canonical_database():
+def test_missing_broker_position_never_closes_the_canonical_database():
     pos = make_position(pid="P-DB-CLOSE", instrument="NIFTY", stop=90.0)
     h, env = _live_env_with([], positions=[pos])
 
@@ -220,5 +235,100 @@ def test_stale_broker_flat_position_is_closed_in_the_canonical_database():
 
     env.persistence = Persistence()
     summary = h.sync_sl_from_broker("LIVE")
-    assert summary["dropped_local"][0]["position_id"] == "P-DB-CLOSE"
-    assert env.persistence.closed == ["P-DB-CLOSE"]
+    assert summary["dropped_local"] == []
+    assert summary["status"] == "protection_incomplete"
+    assert env.persistence.closed == []
+    assert pos.is_open
+
+
+def test_unique_filled_entry_recovers_position_closed_by_old_false_flat_reconcile():
+    """Recover only when Dhan and the original entry identity agree exactly."""
+    position = make_position(
+        pid="P-STALE", strategy_id="S1", instrument="SILVERM",
+        side=PositionSide.SHORT, qty=1, stop=110.0, trade_id="T-STALE")
+    pm = make_pm([position])
+    pm.abandon_stale_position(position.position_id)
+    trade = SimpleNamespace(
+        status="CLOSED", exit_reason="BROKER_FLAT_RECONCILIATION",
+        exit_order_id="", exit_fill_id="", exit_price=0,
+        exit_timestamp=0, entry_order_id=position.entry_order_id,
+        quantity=1, position_id=position.position_id)
+
+    class Lifecycle:
+        def get_trade(self, trade_id):
+            return trade if trade_id == "T-STALE" else None
+
+        def reopen_trade_from_broker_position(self, trade_id, recovered):
+            if trade_id != "T-STALE" or recovered.position_id != "P-STALE":
+                return False
+            trade.status = "OPEN"
+            return True
+
+    order = SimpleNamespace(
+        state=OrderState.FILLED, filled_quantity=1,
+        average_fill_price=100.0, side="SELL", quantity=1,
+        order_role="ENTRY", trade_id="T-STALE", strategy_id="S1",
+        instrument="SILVERM", broker_order_id="BRK-ENTRY-1")
+    strategy = FakeStrategy("S1", "SILVERM")
+    h = Harness()
+    env = h.add_env(FakeEnv(
+        "LIVE", {"S1": strategy}, pm,
+        FakeBroker([{"instrument": "SILVERM", "quantity": 1,
+                     "side": "SHORT", "average_entry_price": 100.0,
+                     "ltp": 101.0}]),
+        FakeExecutionEngine({position.entry_order_id: order})))
+    env.broker.instruments = {"SILVERM": {"security_id": "SEC-1"}}
+    env.broker.audit = SimpleNamespace(for_broker_order=lambda order_id: [{
+        "request_payload": json.dumps({"securityId": "SEC-1"})
+    }] if order_id == "BRK-ENTRY-1" else [])
+    env.runtimes = {"S1": SimpleNamespace(lifecycle=Lifecycle())}
+
+    summary = h.sync_sl_from_broker("LIVE")
+
+    assert summary["recovered_from_stale_close"][0]["trade_id"] == "T-STALE"
+    assert summary["recovered_from_stale_close"][0]["quantity"] == 1
+    restored = env.position_manager.get_position("P-STALE")
+    assert restored.is_open is True
+    assert restored.quantity == 1
+    assert restored.sl_state == SLState.ARMED.value
+    assert strategy.position_side == "SHORT"
+    assert strategy.current_position_id == "P-STALE"
+    assert summary["orphan_exposure"] is False
+
+
+def test_stale_close_recovery_refuses_quantity_mismatch():
+    position = make_position(
+        pid="P-STALE-QTY", strategy_id="S1", instrument="SILVERM",
+        side=PositionSide.SHORT, qty=1, stop=110.0, trade_id="T-STALE-QTY")
+    pm = make_pm([position])
+    pm.abandon_stale_position(position.position_id)
+    trade = SimpleNamespace(
+        status="CLOSED", exit_reason="BROKER_FLAT_RECONCILIATION",
+        exit_order_id="", exit_fill_id="", exit_price=0,
+        exit_timestamp=0, entry_order_id=position.entry_order_id,
+        quantity=1, position_id=position.position_id)
+
+    class Lifecycle:
+        def get_trade(self, trade_id):
+            return trade
+
+        def reopen_trade_from_broker_position(self, trade_id, recovered):
+            raise AssertionError("unmatched broker exposure must stay blocked")
+
+    h = Harness()
+    env = h.add_env(FakeEnv(
+        "LIVE", {"S1": FakeStrategy("S1", "SILVERM")}, pm,
+        FakeBroker([{"instrument": "SILVERM", "quantity": 2,
+                     "side": "SHORT", "average_entry_price": 100.0}]),
+        FakeExecutionEngine({position.entry_order_id: SimpleNamespace(
+            state=OrderState.FILLED, filled_quantity=1,
+            average_fill_price=100.0, side="SELL", quantity=1,
+            order_role="ENTRY", trade_id="T-STALE-QTY", strategy_id="S1",
+            instrument="SILVERM")})))
+    env.runtimes = {"S1": SimpleNamespace(lifecycle=Lifecycle())}
+
+    summary = h.sync_sl_from_broker("LIVE")
+
+    assert summary.get("recovered_from_stale_close", []) == []
+    assert summary["orphan_exposure"] is True
+    assert env.position_manager.open_positions == []

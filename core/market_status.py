@@ -14,12 +14,14 @@ Update frequency: checked on every access (state property)
 Timezone: IST (UTC+5:30)
 Session: MCX 09:00-23:30
 Weekends: PRE_MARKET/MARKET_OPEN/etc never trigger on Sat/Sun (minutes Since Monday used)
-Holidays: Not handled automatically (exchange calendar not available)
+Holidays: verified calendar overrides; uncovered dates stay closed.
 """
 from __future__ import annotations
 
 import time
 import threading
+import json
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Optional, Callable, List
@@ -96,6 +98,12 @@ class MarketStatus:
         self._reconcile_done_today: bool = False
         self._force_state_override: Optional[MarketState] = None
         self._on_transition_callbacks: List[Callable] = []
+        try:
+            self._calendar = json.loads((Path(__file__).resolve().parents[1]
+                                        / "config/mcx_calendar.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self._calendar = {}
+        self._calendar_reason = ""
 
     # --- Properties ---
 
@@ -242,7 +250,7 @@ class MarketStatus:
 
     def snapshot(self) -> dict:
         with self._lock:
-            current_state = self._force_state_override or self._market_state
+            current_state = self.state
             return {
                 "market_state": current_state.value,
                 # Don't persist force_state_override — it is transient and
@@ -258,6 +266,8 @@ class MarketStatus:
                 "reconcile_done_today": self._reconcile_done_today,
                 "session_open": self.session_open,
                 "session_close": self.session_close,
+                "calendar_reason": self._calendar_reason,
+                "calendar_valid_through": self._calendar.get("valid_through"),
             }
 
     def restore(self, data: dict) -> None:
@@ -316,15 +326,21 @@ class MarketStatus:
             self._reconcile_done_today = False
             self._session_date = current_date
 
-        # Weekend: stay OVERNIGHT
-        if weekday >= 5:
+        calendar = self._calendar
+        covered = (calendar.get("valid_from", "9999-12-31") <= current_date
+                   <= calendar.get("valid_through", "0001-01-01"))
+        session = (calendar.get("sessions") or {}).get(current_date, {})
+        self._calendar_reason = ("calendar_update_required" if not covered
+                                 else session.get("reason", "weekend" if weekday >= 5 else ""))
+        # Unknown dates must never silently revert to weekday-only trading.
+        if not covered or session.get("closed") or weekday >= 5:
             target = MarketState.OVERNIGHT
         else:
             hour, minute = now.hour, now.minute
             current_minutes = hour * 60 + minute
 
-            open_h, open_m = self._parse_time(self.session_open)
-            close_h, close_m = self._parse_time(self.session_close)
+            open_h, open_m = self._parse_time(session.get("open", self.session_open))
+            close_h, close_m = self._parse_time(session.get("close", self.session_close))
             open_minutes = open_h * 60 + open_m
             close_minutes_val = close_h * 60 + close_m
             pre_market_start = open_minutes - self.pre_market_minutes
@@ -465,6 +481,8 @@ class EnvMarketStatus(MarketStatus):
                 "reconcile_done_today": self._base._reconcile_done_today,
                 "session_open": self.session_open,
                 "session_close": self.session_close,
+                "calendar_reason": self._base._calendar_reason,
+                "calendar_valid_through": self._base._calendar.get("valid_through"),
             }
 
     def __repr__(self) -> str:

@@ -201,6 +201,29 @@ class SignalFlowMixin:
                 {"signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
                  "execution_mode": env.mode})
             return
+        if env.is_live and is_exit:
+            position_id = (metadata.get("position_id")
+                           or metadata.get("parent_position_id")
+                           or getattr(strategy, "current_position_id", None))
+            position_manager = getattr(env, "position_manager", None)
+            position = (position_manager.get_position(str(position_id))
+                        if position_id and position_manager is not None else None)
+            if (position is not None
+                    and str(getattr(position, "sl_state", "") or "").upper()
+                        == "SL_UNAVAILABLE"):
+                # The broker/local position mismatch invalidated local
+                # ownership. Do not submit an opposite-side exit which may
+                # open new risk against an unknown broker net.
+                self.publish_event("exit_blocked_unconfirmed_position", {
+                    "signal_id": signal.signal_id,
+                    "strategy_id": signal.strategy_id,
+                    "position_id": position.position_id,
+                    "trade_id": position.trade_id,
+                    "instrument": signal.instrument,
+                    "reason": "broker_position_unconfirmed",
+                    "execution_mode": env.mode,
+                }, env_name=env.name)
+                return
         # During the narrowly scoped live canary, only its explicitly marked
         # test lifecycle may create entries. The canary signal is armed as a
         # pending trigger; the normal Dhan WebSocket tick handler must fire it.

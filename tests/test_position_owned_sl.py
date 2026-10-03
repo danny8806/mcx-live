@@ -453,8 +453,7 @@ def test_exit_quantity_never_exceeds_open_quantity():
 def test_startup_arms_only_broker_confirmed_positions():
     h = Harness()
     real = make_position(pid="P-REAL", stop=90.0)
-    # The classic stale row: DB says OPEN, the broker is flat on that
-    # securityId.  It must be closed, not monitored.
+    # A missing broker row stays owned but unmonitored until resolved.
     stale = make_position(pid="P-STALE", instrument="SENSEX", stop=95.0)
     broker = FakeBroker([{"instrument": "NIFTY", "quantity": 10, "side": "LONG"}])
     env = h.add_env(FakeEnv("LIVE", {"S1": FakeStrategy("S1", "NIFTY")},
@@ -462,20 +461,21 @@ def test_startup_arms_only_broker_confirmed_positions():
     summary = h.sync_sl_from_broker("LIVE")
 
     assert [a["position_id"] for a in summary["armed"]] == ["P-REAL"]
-    assert [d["position_id"] for d in summary["dropped_local"]] == ["P-STALE"]
-    # The stale row is CLOSED in the book, not merely hidden from the SL.
+    assert summary["dropped_local"] == []
+    assert [d["position_id"] for d in summary["unavailable"]] == ["P-STALE"]
+    assert summary["status"] == "protection_incomplete"
     stale_now = env.position_manager.get_position("P-STALE")
-    assert stale_now.is_open is False
-    assert stale_now.status == PositionStatus.CLOSED
-    assert stale_now.sl_state == SLState.CLOSED.value
+    assert stale_now.is_open is True
+    assert stale_now.quantity == 10
+    assert stale_now.sl_state == SLState.UNAVAILABLE.value
     assert env.position_manager.get_position("P-REAL").is_open is True
     # A deep tick on the stale position must now do nothing.
     assert h._evaluate_position_sl(env, stale_now, 1.0, "LIVE") is None
     assert h.processed == []
 
 
-def test_broker_flat_external_close_releases_strategy_and_cancels_reversal():
-    """A manual/Dhan close retires the parked reversal with the old position."""
+def test_broker_absence_preserves_strategy_and_pending_reversal_until_exit_evidence():
+    """Absence alone cannot retire ownership or a parked reversal."""
     h = Harness()
     position = make_position(pid="P-EXTERNAL", stop=90.0)
     strategy = FakeStrategy("S1", "NIFTY")
@@ -497,12 +497,12 @@ def test_broker_flat_external_close_releases_strategy_and_cancels_reversal():
     h._reset_strategy_state = reset_strategy
     summary = h.sync_sl_from_broker("LIVE")
 
-    assert [row["position_id"] for row in summary["dropped_local"]] == ["P-EXTERNAL"]
-    assert env.position_manager.get_position("P-EXTERNAL").is_open is False
+    assert summary["dropped_local"] == []
+    assert summary["status"] == "protection_incomplete"
+    assert env.position_manager.get_position("P-EXTERNAL").is_open is True
     assert env.sl_monitor.armed_ids() == []
-    assert reset_calls == [("S1", False, "LIVE")]
-    assert strategy.position_side is None
-    assert strategy.pending_entry is None
+    assert reset_calls == []
+    assert strategy.pending_entry is pending
 
 
 def test_startup_treats_the_transports_dhan_fan_out_as_one_net():
@@ -530,10 +530,11 @@ def test_startup_treats_the_transports_dhan_fan_out_as_one_net():
         make_pm([a, b]), broker))
     summary = h.sync_sl_from_broker("LIVE")
     # Only the local LONG agrees with the broker's net direction, so only it
-    # is armed.  The local SHORT is contradicted by the broker and is closed.
+    # is armed. The local SHORT remains unresolved, without an executable SL.
     assert [u["position_id"] for u in summary["armed"]] == ["P-A"]
-    assert [d["position_id"] for d in summary["dropped_local"]] == ["P-B"]
-    assert env.position_manager.get_position("P-B").is_open is False
+    assert summary["dropped_local"] == []
+    assert [d["position_id"] for d in summary["unavailable"]] == ["P-B"]
+    assert env.position_manager.get_position("P-B").is_open is True
     # The duplicates were collapsed, not counted twice.
     assert summary["broker_only"] == []
 
@@ -546,9 +547,10 @@ def test_startup_never_arms_a_position_the_broker_holds_the_other_side_of():
                             make_pm([p]), broker))
     summary = h.sync_sl_from_broker("LIVE")
     assert summary["armed"] == []
-    assert [d["reason"] for d in summary["dropped_local"]] == [
-        "DB_OPEN_BROKER_NOT_CONFIRMED"]
-    assert env.position_manager.open_positions == []
+    assert summary["dropped_local"] == []
+    assert [d["reason"] for d in summary["unavailable"]] == [
+        "BROKER_POSITION_UNCONFIRMED"]
+    assert env.position_manager.open_positions == [p]
     assert summary["orphan_exposure"] is True
     assert summary["broker_only"][0]["instrument"] == "NIFTY"
     # Nothing is monitored, so no tick can ever mint an exit for it.
