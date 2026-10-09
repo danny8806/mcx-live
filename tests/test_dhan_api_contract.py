@@ -47,6 +47,38 @@ def test_documented_empty_202_cancel_ack_is_not_retried_or_treated_as_error():
     assert "json" not in session.calls[0][1]
 
 
+def test_dhan_candle_parser_rejects_mismatched_ohlc_arrays_instead_of_truncating():
+    client = DhanRESTClient()
+    with pytest.raises(ValueError, match="mismatched array lengths"):
+        client._to_candles({
+            "timestamp": [1, 2], "open": [10, 11], "high": [12, 13],
+            "low": [9], "close": [11, 12], "volume": [4, 5],
+        })
+
+
+def test_dhan_candle_parser_accepts_missing_optional_volume_as_zeroes():
+    client = DhanRESTClient()
+    assert client._to_candles({
+        "timestamp": [1], "open": [10], "high": [12], "low": [9],
+        "close": [11],
+    }) == [[1, 10, 12, 9, 11, 0]]
+
+
+def test_market_data_adapter_disconnect_stops_rest_token_scheduler():
+    from data.dhan.adapter import DhanDataAdapter
+
+    calls = []
+    adapter = DhanDataAdapter.__new__(DhanDataAdapter)
+    adapter.ws = SimpleNamespace(disconnect=lambda: calls.append("ws"))
+    adapter.rest = SimpleNamespace(stop_scheduler=lambda: calls.append("scheduler"))
+    adapter._connected = True
+
+    adapter.disconnect()
+
+    assert calls == ["ws", "scheduler"]
+    assert adapter._connected is False
+
+
 def test_get_404_returns_immediately_for_higher_level_bounded_retry():
     class NotFoundSession:
         def __init__(self):

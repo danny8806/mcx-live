@@ -14,7 +14,6 @@ interface Trade {
   entry_trigger_price: number;
   entry_price: number;
   entry_timestamp: number | string;
-  stop_loss_price: number;
   position_id: string;
   quantity: number;
   multiplier: number;
@@ -155,7 +154,7 @@ function TradeRow({ trade, isExpanded, onToggle }: {
             <div style={{ color: "var(--text-primary)" }}>{trade.entry_signal_id ? trade.entry_signal_id.slice(0, 12) + "..." : "—"}</div>
             <div style={{ color: "var(--text-muted)" }}>Event: {trade.entry_event_type || "—"}</div>
             <div style={{ color: "var(--text-muted)" }}>Action: {trade.entry_action || "—"}</div>
-            <div style={{ color: "var(--text-muted)" }}>Trigger: ₹{safeNum(trade.entry_trigger_price).toLocaleString("en-IN")}</div>
+            <div style={{ color: "var(--text-muted)" }}>Signal close reference: {trade.entry_trigger_price ? `₹${safeNum(trade.entry_trigger_price).toLocaleString("en-IN")}` : "—"}</div>
           </div>
 
           {/* Position */}
@@ -164,7 +163,6 @@ function TradeRow({ trade, isExpanded, onToggle }: {
             <div style={{ color: "var(--text-primary)" }}>ID: {trade.position_id ? trade.position_id.slice(0, 12) + "..." : "—"}</div>
             <div style={{ color: "var(--text-muted)" }}>Fill: {trade.entry_fill_id ? trade.entry_fill_id.slice(0, 12) + "..." : "—"}</div>
             <div style={{ color: "var(--text-muted)" }}>Order: {trade.entry_order_id ? trade.entry_order_id.slice(0, 12) + "..." : "—"}</div>
-            <div style={{ color: "var(--text-muted)" }}>SL: ₹{safeNum(trade.stop_loss_price).toLocaleString("en-IN")}</div>
           </div>
 
           {/* Exit */}
@@ -177,7 +175,7 @@ function TradeRow({ trade, isExpanded, onToggle }: {
               Reason: {trade.exit_reason || "—"}
             </div>
             <div style={{ color: "var(--text-muted)" }}>
-              Signal: {trade.exit_signal_id ? trade.exit_signal_id.slice(0, 12) + "..." : "— (SL/No signal)"}
+              Signal: {trade.exit_signal_id ? trade.exit_signal_id.slice(0, 12) + "..." : "— (no signal linked)"}
             </div>
             <div style={{ color: "var(--text-muted)" }}>
               Exit Fill: {trade.exit_fill_id ? trade.exit_fill_id.slice(0, 12) + "..." : "—"}

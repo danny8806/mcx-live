@@ -76,6 +76,7 @@ class PendingOrderState(str, Enum):
     EXPIRED = "expired"                        # entry never placed in time
     CANCELLED_BY_REVERSAL = "cancelled_by_reversal"  # superseded by a reversal
     CANCELLED_BY_INDICATOR_CHANGE = "cancelled_by_indicator_change"
+    CANCELLED_BY_STRATEGY_CHANGE = "cancelled_by_strategy_change"
     RESOLVED = "resolved"                      # broker termined the entry (rej/cancel)
 
 
@@ -84,12 +85,14 @@ _PENDING_ALLOWED: dict[PendingOrderState, set[PendingOrderState]] = {
         PendingOrderState.ARMED, PendingOrderState.EXPIRED,
         PendingOrderState.CANCELLED_BY_REVERSAL,
         PendingOrderState.CANCELLED_BY_INDICATOR_CHANGE,
+        PendingOrderState.CANCELLED_BY_STRATEGY_CHANGE,
         PendingOrderState.RESOLVED,
     },
     PendingOrderState.ARMED: {
         PendingOrderState.ENTRY_SENT, PendingOrderState.EXPIRED,
         PendingOrderState.CANCELLED_BY_REVERSAL,
         PendingOrderState.CANCELLED_BY_INDICATOR_CHANGE,
+        PendingOrderState.CANCELLED_BY_STRATEGY_CHANGE,
         PendingOrderState.RESOLVED,
     },
     PendingOrderState.ENTRY_SENT: {
@@ -98,6 +101,7 @@ _PENDING_ALLOWED: dict[PendingOrderState, set[PendingOrderState]] = {
     PendingOrderState.EXPIRED: set(),
     PendingOrderState.CANCELLED_BY_REVERSAL: set(),
     PendingOrderState.CANCELLED_BY_INDICATOR_CHANGE: set(),
+    PendingOrderState.CANCELLED_BY_STRATEGY_CHANGE: set(),
     PendingOrderState.RESOLVED: set(),
 }
 
@@ -202,10 +206,7 @@ class TradeContext:
     signal_candle_high: float = 0.0
     signal_candle_low: float = 0.0
     signal_candle_close: float = 0.0
-    signal_htf_value: float = 0.0
-    signal_mid_value: float = 0.0
-    signal_fast_dema: float = 0.0
-    signal_fast_atr: float = 0.0
+    signal_indicator_data: dict = field(default_factory=dict)
     signal_reason: str = ""
 
     # ── Timestamps ──
@@ -260,10 +261,7 @@ class TradeContext:
             "signal_candle_high": self.signal_candle_high,
             "signal_candle_low": self.signal_candle_low,
             "signal_candle_close": self.signal_candle_close,
-            "signal_htf_value": self.signal_htf_value,
-            "signal_mid_value": self.signal_mid_value,
-            "signal_fast_dema": self.signal_fast_dema,
-            "signal_fast_atr": self.signal_fast_atr,
+            "signal_indicator_data": dict(self.signal_indicator_data),
             "signal_reason": self.signal_reason,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -560,18 +558,10 @@ class TradeLifecycleManager:
             signal_candle_close = (
                 ctx.close if ctx is not None and ctx.close is not None
                 else metadata.get("signal_candle_close", metadata.get("close", 0.0)))
-            signal_htf_value = (
-                ctx.htf_value if ctx is not None and ctx.htf_value is not None
-                else metadata.get("signal_htf_value", metadata.get("htf_value", 0.0)))
-            signal_mid_value = (
-                ctx.mid_value if ctx is not None and ctx.mid_value is not None
-                else metadata.get("signal_mid_value", metadata.get("mid_value", 0.0)))
-            signal_fast_dema = (
-                ctx.dema if ctx is not None and ctx.dema is not None
-                else metadata.get("signal_fast_dema", metadata.get("dema", 0.0)))
-            signal_fast_atr = (
-                ctx.atr if ctx is not None and ctx.atr is not None
-                else metadata.get("signal_fast_atr", metadata.get("atr", 0.0)))
+            signal_indicator_data = dict(
+                ctx.indicator_values if ctx is not None else {
+                    key: value for key, value in metadata.items()
+                    if key.startswith("supertrend_")})
             signal_reason = metadata.get("signal_reason") or metadata.get("reason") or ""
 
             # Create the trade
@@ -592,10 +582,7 @@ class TradeLifecycleManager:
                 signal_candle_high=signal_candle_high,
                 signal_candle_low=signal_candle_low,
                 signal_candle_close=signal_candle_close,
-                signal_htf_value=signal_htf_value,
-                signal_mid_value=signal_mid_value,
-                signal_fast_dema=signal_fast_dema,
-                signal_fast_atr=signal_fast_atr,
+                signal_indicator_data=signal_indicator_data,
                 signal_reason=signal_reason,
             )
 
@@ -1099,13 +1086,8 @@ class TradeLifecycleManager:
                     "low": trade.signal_candle_low,
                     "close": trade.signal_candle_close,
                 },
-                "indicator_data": {
-                    "htf_value": trade.signal_htf_value,
-                    "mid_value": trade.signal_mid_value,
-                    "fast_dema": trade.signal_fast_dema,
-                    "fast_atr": trade.signal_fast_atr,
-                    "reason": trade.signal_reason,
-                },
+                "indicator_data": {**trade.signal_indicator_data,
+                                   "reason": trade.signal_reason},
             })
         except Exception as e:
             print(f"[Lifecycle] WARNING: failed to persist signal "

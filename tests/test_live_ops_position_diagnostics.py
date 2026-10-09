@@ -61,7 +61,6 @@ def test_position_diagnostics_deduplicate_dhan_instrument_mapping(monkeypatch):
     assert row["local"]["quantity"] == row["dhan"]["quantity"] == 1
     assert row["dhan"]["mapped_strategy_rows"] == 2
     assert row["dhan"]["unrealized_profit"] == 288
-    assert row["local"]["sl_state"] == "ARMED"
 
 
 def test_position_diagnostics_aggregate_local_strategy_owners(monkeypatch):

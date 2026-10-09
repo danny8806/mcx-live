@@ -56,6 +56,7 @@ class Position:
     # protective order exists in this system.
     #   NONE | ARMED | TRIGGERED | EXITING | CLOSED | SL_UNAVAILABLE
     sl_state: Optional[str] = None
+    sl_disabled: bool = False
     sl_trigger_price: Optional[float] = None  # market price that crossed stop
     sl_protected_at: Optional[float] = None  # engine clock when the SL was armed
     entry_order_id: Optional[str] = None     # broker entry order id
@@ -122,6 +123,7 @@ class Position:
             "entry_signal_id": self.entry_signal_id,
             "exit_signal_id": self.exit_signal_id,
             "sl_state": self.sl_state,
+            "sl_disabled": bool(self.sl_disabled),
             "sl_trigger_price": self.sl_trigger_price,
             "sl_protected_at": self.sl_protected_at,
             "entry_order_id": self.entry_order_id,
@@ -152,6 +154,7 @@ def merge_durable_open_position_rows(snapshot: dict, rows: list[dict]) -> dict:
     }
     durable_fields = (
         "entry_order_id", "exit_order_id", "sl_state", "sl_trigger_price",
+        "sl_disabled",
         "sl_protected_at", "stop_price", "entry_signal_id", "exit_signal_id",
         "trade_id", "lifecycle_id",
     )
@@ -483,6 +486,7 @@ class PositionManager:
                     entry_signal_id=pos_data.get("entry_signal_id"),
                     exit_signal_id=pos_data.get("exit_signal_id"),
                     sl_state=pos_data.get("sl_state"),
+                    sl_disabled=bool(pos_data.get("sl_disabled", False)),
                     sl_trigger_price=pos_data.get("sl_trigger_price"),
                     sl_protected_at=pos_data.get("sl_protected_at"),
                     entry_order_id=pos_data.get("entry_order_id"),
@@ -535,6 +539,7 @@ class PositionManager:
                     entry_signal_id=cp_data.get("entry_signal_id"),
                     exit_signal_id=cp_data.get("exit_signal_id"),
                     sl_state=cp_data.get("sl_state"),
+                    sl_disabled=bool(cp_data.get("sl_disabled", False)),
                     sl_trigger_price=cp_data.get("sl_trigger_price"),
                     sl_protected_at=cp_data.get("sl_protected_at"),
                     entry_order_id=cp_data.get("entry_order_id"),

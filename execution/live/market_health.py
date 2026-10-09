@@ -1,33 +1,11 @@
-"""Market-data health tracking for the local stop-loss monitor.
+"""Market-data freshness tracking used by the 15-minute strategy gate."""
 
-The stop is evaluated ONLY on a live tick.  That design means a silent market
-data outage does not merely delay an entry — it makes every open position
-UNPROTECTED, with nothing in the order book to show for it.  Dhan places no
-broker-side protective stop, so there is no fallback.
-
-This module makes that failure mode observable and enforceable:
-
-  * ``record_tick``   - called for every accepted market tick.
-  * ``is_healthy``    - is this instrument's feed fresh enough to trust?
-  * ``blind_positions`` - which open positions currently have NO working
-    stop because their feed has gone quiet.
-
-Two distinct rules follow from the source-of-truth hierarchy:
-
-  * A stale feed must never AUTHORISE a new trade.  Entries (and reversal
-    entries) are refused while the feed is unhealthy, because the trigger
-    would be evaluated on data we already know is unreliable.
-  * A stale feed must never SILENTLY hide an unprotected position.  Existing
-    positions keep their armed stop and are reported as blind; the system
-    never invents an exit from a price it does not have, because acting on
-    stale data is a different failure, not a fix.
-"""
 from __future__ import annotations
 
 import logging
 import threading
 import time
-from typing import Callable, Iterable, Optional
+from typing import Callable, Optional
 
 log = logging.getLogger("trading_engine")
 
@@ -120,20 +98,3 @@ class MarketDataHealthMonitor:
                 "stale_after": self._stale_after,
             }
         return out
-
-    def blind_positions(self, open_positions: Iterable) -> list:
-        """Open positions whose stop cannot currently be evaluated.
-
-        A position is blind when its instrument's feed is unhealthy.  The stop
-        is still armed and will fire on the next real tick; this reports the
-        window in which it cannot.
-        """
-        blind = []
-        for position in open_positions:
-            if not getattr(position, "is_open", False):
-                continue
-            instrument = getattr(position, "instrument", None)
-            if not instrument or self.is_healthy(instrument):
-                continue
-            blind.append(position)
-        return blind

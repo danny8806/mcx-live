@@ -53,6 +53,7 @@ services:
       - .env.live
     volumes:
       - live_db:/app/live/data/db
+      - supertrend_db:/app/live/data/db/supertrend
       - live_mcx_logs:/app/logs/live-mcx
     networks:
       - trading_backend
@@ -76,6 +77,11 @@ networks:
 
 volumes:
   live_db:
+    # Retained for Dhan token and contract-cache files; trade DB/state are in
+    # the fresh child volume below.
     name: live_mcx_db
+  supertrend_db:
+    # Empty trade/state storage for the SuperTrend-only runtime.
+    name: live_mcx_supertrend_db
   live_mcx_logs:
     name: live_mcx_logs

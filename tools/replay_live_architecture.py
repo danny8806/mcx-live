@@ -269,7 +269,7 @@ def run_replay(engine, persistence, stream: list[dict], out: dict[str, Any]) -> 
 
 
 def _capture_evaluations(engine, b: dict, out: list[dict]) -> None:
-    from strategies.instance import Bar
+    from core.timeframe_engine import Bar
     bar = Bar(instrument=b["instrument"], timeframe=b["timeframe"],
               start_ts=b["end_ts"] - 300.0, end_ts=b["end_ts"],
               open=b["open"], high=b["high"], low=b["low"], close=b["close"],

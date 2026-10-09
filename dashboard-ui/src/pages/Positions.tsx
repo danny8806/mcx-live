@@ -100,7 +100,7 @@ export default function Positions() {
       {loadError && <div role="alert" className="desk-warning">Position refresh failed. Showing the last successful snapshot from {lastSuccessAt ? new Date(lastSuccessAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) : "unknown time"}: {loadError}</div>}
       {brokerError ? <div role="alert" className="desk-warning">Dhan position comparison is unavailable: {brokerError}. An empty local list does not confirm that the broker account is flat.</div> : brokerUnmatched.length > 0 && <div role="alert" className="desk-warning" style={{ display: "block" }}>
         <strong>Broker and local positions do not match — do not treat this account as flat.</strong>
-        <div style={{ marginTop: 6, fontSize: 10 }}>Dhan shows exposure without a matching open local position. Stop monitoring and ownership need operator reconciliation; this dashboard will not invent a local trade or send an order.</div>
+        <div style={{ marginTop: 6, fontSize: 10 }}>Dhan shows exposure without a matching open local position. Reconcile the broker exposure and local trade record before treating the strategy as flat; the current SuperTrend profile does not create a separate stop-loss.</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 6, marginTop: 8 }}>
           {brokerUnmatched.map((row: any) => <div key={row.instrument} style={{ border: "1px solid var(--border-subtle)", borderRadius: 4, padding: "6px 8px", background: "var(--bg-panel)" }}>
             <b>{row.instrument}</b> · <span style={{ color: "var(--red)", fontWeight: 700 }}>{row.status}</span>
@@ -139,8 +139,8 @@ export default function Positions() {
         </div>
       ) : (
         <div className="ledger-grid-viewport">
-          <div className="ledger-grid-head" style={{ display: "grid", gridTemplateColumns: "70px 110px 50px 40px 80px 80px 55px 70px 60px 90px", gap: "8px", padding: "8px 12px", fontSize: "9px", color: "var(--text-disabled)", textTransform: "uppercase", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-table-header)", position: "sticky", top: 0, zIndex: 1 }}>
-            <span>Instrument</span><span>Strategy</span><span>Side</span><span>Qty</span><span>Entry</span><span>LTP/Exit</span><span>SL</span><span>Margin</span><span>Status</span><span style={{ textAlign: "right" }}>P&L</span>
+          <div className="ledger-grid-head" style={{ display: "grid", gridTemplateColumns: "70px 110px 50px 40px 80px 80px 70px 60px 90px", gap: "8px", padding: "8px 12px", fontSize: "9px", color: "var(--text-disabled)", textTransform: "uppercase", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-table-header)", position: "sticky", top: 0, zIndex: 1 }}>
+            <span>Instrument</span><span>Strategy</span><span>Side</span><span>Qty</span><span>Entry</span><span>LTP/Exit</span><span>Margin</span><span>Status</span><span style={{ textAlign: "right" }}>P&L</span>
           </div>
           {list.map((p: any) => {
             const closed = p.status === "closed";
@@ -150,14 +150,13 @@ export default function Positions() {
             const expanded = expandedId === p.position_id;
             return (
               <div key={p.position_id}>
-                <div className="ledger-grid-row hover-row" onClick={() => toggleDetail(p.position_id)} style={{ display: "grid", gridTemplateColumns: "70px 110px 50px 40px 80px 80px 55px 70px 60px 90px", gap: "8px", padding: "9px 12px", fontSize: "10px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center", cursor: "pointer" }}>
+                  <div className="ledger-grid-row hover-row" onClick={() => toggleDetail(p.position_id)} style={{ display: "grid", gridTemplateColumns: "70px 110px 50px 40px 80px 80px 70px 60px 90px", gap: "8px", padding: "9px 12px", fontSize: "10px", borderBottom: "1px solid var(--border-subtle)", alignItems: "center", cursor: "pointer" }}>
                   <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{p.instrument}</span>
                   <span style={{ color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.strategy_id}</span>
                   <span style={{ color: p.side === "LONG" ? "var(--green)" : "var(--red)", fontWeight: 600 }}>{p.side}</span>
                   <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{p.quantity}</span>
                   <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{safeINR(p.average_entry)}</span>
                   <span className="tabular-nums" style={{ color: "var(--text-primary)" }}>{mark ? safeINR(mark) : "—"}</span>
-                  <span className="tabular-nums" style={{ color: "var(--text-muted)" }}>{p.stop_price ? safeINR(p.stop_price) : "—"}</span>
                   <span className="tabular-nums" style={{ color: "var(--text-muted)" }}>{formatINR(p.margin, false)}</span>
                   <span style={{ color: closed ? "var(--text-muted)" : "var(--amber)", fontFamily: "monospace", fontSize: "9px" }}>{closed ? (p.exit_reason || "closed") : "open"}</span>
                   <span className="tabular-nums" style={{ color: pnlColor(pnl), fontWeight: 600, textAlign: "right" }}>

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import json
+import math
 import os
 import tempfile
 import threading
@@ -20,10 +22,13 @@ _settings_lock = threading.RLock()
 
 _GATE_FIELDS = {
     "live_gate", "entry_enabled", "exit_enabled", "reversal_enabled",
-    "sl_enabled", "close_only",
+    "close_only",
 }
-_ALLOWED_FIELDS = _GATE_FIELDS | {"quantity"}
+_ALLOWED_FIELDS = _GATE_FIELDS | {"quantity", "supertrend"}
 _LIVE_GATES = {"ON", "OFF", "CLOSE_ONLY", "EMERGENCY_STOP", "LOCKED"}
+_SUPERTREND_FIELDS = {"atr_period", "multiplier", "source", "atr_method"}
+_SUPERTREND_SOURCES = {"open", "high", "low", "close", "hl2", "hlc3", "ohlc4"}
+_SUPERTREND_ATR_METHODS = {"sma_tr", "wilder"}
 
 
 def init(engine, event_bus, *, config_path=None, resolved_config_path=None,
@@ -52,16 +57,39 @@ def _get_settings_sync():
     except Exception:
         tg_stats = {"enabled": False, "queue_size": 0,
                     "total_sent": 0, "total_failed": 0}
-    strategies = _engine.config.get("strategies", {})
+    strategies = _engine.config.get("strategies", {}) or {}
+    runtime_policy = _engine.config.get("strategy_runtime", {}) or {}
+    if runtime_policy.get("exclusive"):
+        allowed_ids = set((runtime_policy.get("allowlist", {}) or {}).keys())
+        strategies = {sid: cfg for sid, cfg in strategies.items()
+                      if sid in allowed_ids}
+        active_instruments = {cfg.get("instrument") for cfg in strategies.values()}
+        instruments = {name: cfg for name, cfg in
+                       (_engine.config.get("instruments", {}) or {}).items()
+                       if name in active_instruments}
+        indicator_settings = {
+            "mode": "strategy_owned",
+            "strategy": "SuperTrend",
+            "timeframe": "15m",
+            "higher_timeframe": False,
+        }
+    else:
+        instruments = _engine.config.get("instruments", {})
+        indicator_settings = _engine.config.get("indicators", {})
     return {
         "system": _engine.config.get("system", {}),
         "dhan": {"client_id": _mask_cid(_engine.config.get("dhan.client_id", "")),
                  "ws_url": _engine.config.get("dhan.ws_url", "")},
-        "instruments": _engine.config.get("instruments", {}),
+        "instruments": instruments,
         "strategies": strategies,
         "strategy_gates": {sid: _engine.strategy_gate(sid)
                            for sid in strategies},
-        "indicators": _engine.config.get("indicators", {}),
+        "indicators": indicator_settings,
+        "strategy_runtime": {
+            "exclusive": bool(runtime_policy.get("exclusive")),
+            "active_strategy_ids": sorted(strategies),
+            "only_completed_candles": "15m",
+        },
         "risk": _engine.config.get("risk", {}),
         "account": _engine.config.get("account", {}),
         "paper_execution": _engine.config.get("paper_execution", {}),
@@ -107,6 +135,39 @@ def _validate_update(body: dict) -> dict:
                             detail=f"unsupported setting field(s): {', '.join(unknown)}")
 
     update = dict(body)
+    if "supertrend" in update:
+        params = update["supertrend"]
+        if not isinstance(params, dict) or not params:
+            raise HTTPException(status_code=422,
+                                detail="supertrend must be a non-empty object")
+        unknown_params = sorted(set(params) - _SUPERTREND_FIELDS)
+        if unknown_params:
+            raise HTTPException(status_code=422,
+                                detail="unsupported SuperTrend field(s): "
+                                       + ", ".join(unknown_params))
+        params = dict(params)
+        if "atr_period" in params:
+            value = params["atr_period"]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise HTTPException(status_code=422,
+                                    detail="SuperTrend ATR period must be a positive integer")
+        if "multiplier" in params:
+            value = params["multiplier"]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or value <= 0):
+                raise HTTPException(status_code=422,
+                                    detail="SuperTrend multiplier must be positive")
+        if "source" in params:
+            params["source"] = str(params["source"]).lower()
+            if params["source"] not in _SUPERTREND_SOURCES:
+                raise HTTPException(status_code=422,
+                                    detail=f"SuperTrend source must be one of {sorted(_SUPERTREND_SOURCES)}")
+        if "atr_method" in params:
+            params["atr_method"] = str(params["atr_method"]).lower()
+            if params["atr_method"] not in _SUPERTREND_ATR_METHODS:
+                raise HTTPException(status_code=422,
+                                    detail=f"SuperTrend ATR method must be one of {sorted(_SUPERTREND_ATR_METHODS)}")
+        update["supertrend"] = params
     if "quantity" in update:
         value = update["quantity"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -165,6 +226,15 @@ def _save_strategy_settings_sync(strategy_id: str, body: dict):
 
     strategy = _engine.strategies[strategy_id]
     is_open = _has_open_position(strategy_id)
+    if "supertrend" in update:
+        if getattr(strategy, "strategy_type", None) != "supertrend":
+            raise HTTPException(status_code=409,
+                                detail="SuperTrend parameters apply only to a SuperTrend strategy")
+        if (is_open or strategy.pending_entry is not None
+                or getattr(strategy, "pending_exit_trigger", None) is not None
+                or _has_active_orders(strategy_id)):
+            raise HTTPException(status_code=409,
+                                detail="SuperTrend parameters can change only while flat with no pending trigger or order")
     if "quantity" in update and update["quantity"] != int(strategy.quantity):
         if is_open or strategy.pending_entry is not None or _has_active_orders(strategy_id):
             raise HTTPException(
@@ -173,14 +243,25 @@ def _save_strategy_settings_sync(strategy_id: str, body: dict):
             )
     gate = _engine.strategy_gate(strategy_id)
     next_gate = {**gate, **{k: v for k, v in update.items() if k in _GATE_FIELDS}}
-    if is_open and (not next_gate["exit_enabled"] or not next_gate["sl_enabled"]
+    if is_open and (not next_gate["exit_enabled"]
                     or next_gate["live_gate"] == "LOCKED"):
         raise HTTPException(
             status_code=409,
-            detail="an open position requires exits and stop-loss enabled; LOCKED is unavailable",
+            detail="an open position requires exits enabled; LOCKED is unavailable",
         )
 
-    with _settings_lock:
+    state_lock = getattr(_engine, "_lock", None) or nullcontext()
+    with _settings_lock, state_lock:
+        # Recheck against the event-processing lock immediately before saving
+        # and applying; a candle cannot arm a trigger between validation and
+        # indicator reconfiguration.
+        if "supertrend" in update and (
+                _has_open_position(strategy_id)
+                or strategy.pending_entry is not None
+                or getattr(strategy, "pending_exit_trigger", None) is not None
+                or _has_active_orders(strategy_id)):
+            raise HTTPException(status_code=409,
+                                detail="SuperTrend parameters can change only while flat with no pending trigger or order")
         try:
             raw = json.loads(_config_path.read_text(encoding="utf-8"))
             raw_strategy = raw.get("strategies", {}).get(strategy_id)
@@ -198,6 +279,11 @@ def _save_strategy_settings_sync(strategy_id: str, body: dict):
             raise HTTPException(status_code=503,
                                 detail=f"could not read active config: {exc}") from exc
 
+        if "supertrend" in update:
+            update["supertrend"] = {
+                **(raw_strategy.get("supertrend") or {}),
+                **update["supertrend"],
+            }
         raw_strategy.update(update)
         resolved_strategy.update(update)
         try:
@@ -226,6 +312,19 @@ def _save_strategy_settings_sync(strategy_id: str, body: dict):
             config_data["strategies"][strategy_id].update(update)
         if "quantity" in update:
             strategy.quantity = update["quantity"]
+        if "supertrend" in update:
+            current = dict(_engine.config.get("strategies", {})[strategy_id]
+                           .get("supertrend") or {})
+            current.update(update["supertrend"])
+            strategy.supertrend.configure(
+                atr_period=current.get("atr_period", strategy.supertrend.atr_period),
+                multiplier=current.get("multiplier", strategy.supertrend.multiplier),
+                source=current.get("source", strategy.supertrend.source_name),
+                atr_method=current.get("atr_method", strategy.supertrend.atr_method),
+            )
+            config_data = getattr(_engine.config, "_config", None)
+            if isinstance(config_data, dict):
+                config_data["strategies"][strategy_id]["supertrend"] = current
         gate_update = {k: v for k, v in update.items() if k in _GATE_FIELDS}
         if gate_update:
             _engine.set_strategy_gate(strategy_id, **gate_update)
@@ -245,6 +344,9 @@ def _save_strategy_settings_sync(strategy_id: str, body: dict):
         "strategy_id": strategy_id,
         "quantity": strategy.quantity,
         "gate": _engine.strategy_gate(strategy_id),
+        "supertrend": (strategy.supertrend.snapshot()
+                       if getattr(strategy, "strategy_type", None) == "supertrend"
+                       else None),
         "timestamp": time.time(),
     }
 
@@ -279,10 +381,10 @@ def _refresh_settings_sync():
                 strat.enabled = bool(cfg.get("enabled"))
                 applied.append({"strategy_id": name,
                                 "changed": {"enabled": strat.enabled}})
-            if cfg.get("fast_timeframe") != strat.fast_timeframe:
-                warnings.append(f"{name}: fast_timeframe change requires engine restart")
-            if cfg.get("htf_timeframe") != strat.htf_timeframe:
-                warnings.append(f"{name}: htf_timeframe change requires engine restart")
+            if (cfg.get("strategy_type") != "supertrend"
+                    or cfg.get("signal_timeframe") != "15m"):
+                warnings.append(
+                    f"{name}: runtime requires the configured 15m SuperTrend profile")
         _engine.notify_settings_refreshed()
     except Exception as e:
         return {"error": str(e)}

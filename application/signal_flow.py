@@ -28,14 +28,6 @@ def _strategy_positions_for_risk(signal_type, open_positions) -> int:
     return len(open_held)
 
 
-def _pending_row_has_unresolved_order(row: Optional[dict]) -> bool:
-    """An old trigger or broker submission must not coexist with a replacement."""
-    if not row:
-        return False
-    return str(row.get("status") or "pending").lower() in {
-        "pending", "armed", "entry_sent"}
-
-
 class SignalFlowMixin:
     def _park_reversal_entry_for_retry(self, signal, env, reason: str) -> bool:
         """Keep a fired reversal entry durable when a recoverable safety gate closes.
@@ -150,9 +142,8 @@ class SignalFlowMixin:
         if registry is not None:
             registry.remove_signal(signal_id)
 
-    def _preserve_position_after_exit_block(self, signal, env, *, cancel_reversal=False,
-                                            stop_exit_blocked=False) -> None:
-        """Keep exposure and its local SL state when an exit is gated off."""
+    def _preserve_position_after_exit_block(self, signal, env, *, cancel_reversal=False) -> None:
+        """Keep broker-owned exposure and strategy direction after a blocked exit."""
         strategy = (getattr(env, "strategies", {}) or {}).get(signal.strategy_id)
         if strategy is None or strategy.position_side not in ("LONG", "SHORT"):
             return
@@ -169,17 +160,13 @@ class SignalFlowMixin:
         strategy.state = (StrategyState.LONG_POSITION
                           if strategy.position_side == "LONG"
                           else StrategyState.SHORT_POSITION)
-        # Prevent duplicate stop signals while the operator's SL gate is off.
-        # A later explicit lifecycle action can still close the owned position.
-        if stop_exit_blocked:
-            strategy.stop_exit_submitted = True
 
     def _process_signal(self, signal, env_name: Optional[str] = None) -> None:
         """Move one strategy signal through the explicit durable lifecycle.
 
-        Signal creation and breakout execution are deliberately separate: a
-        pending breakout only writes the immutable signal; a trade id is born
-        only after a trigger has actually occurred.
+        A completed 15-minute candle is the signal and execution decision
+        point. Entries and exits use market orders; no candle-breakout trigger
+        or local stop order is evaluated here.
 
         All mutable lifecycle/execution/position state is resolved from the
         signal's OWN StrategyRuntime *inside the owning environment* — a signal
@@ -201,6 +188,36 @@ class SignalFlowMixin:
                 {"signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
                  "execution_mode": env.mode})
             return
+        config = getattr(self, "config", None)
+        runtime_policy = ((config.get("strategy_runtime", {}) or {})
+                          if config is not None else {})
+        if runtime_policy.get("exclusive"):
+            allowed = (runtime_policy.get("allowlist", {}) or {}).get(
+                signal.strategy_id)
+            paired_entry = metadata.get("reversal_entry_signal")
+            entry_intent = (not is_exit or paired_entry is not None
+                            or bool(metadata.get("is_reversal_entry")))
+            expected_type = (allowed or {}).get("strategy_type")
+            expected_instrument = (allowed or {}).get("instrument")
+            expected_timeframe = (allowed or {}).get("timeframe")
+            mismatch = (allowed is None
+                        or signal.instrument != expected_instrument
+                        or (expected_type and getattr(strategy, "strategy_type", None)
+                            != expected_type)
+                        or (expected_timeframe and getattr(
+                            strategy, "signal_timeframe", None) != expected_timeframe))
+            if entry_intent and mismatch:
+                self.publish_event("strategy_runtime_policy_blocked", {
+                    "signal_id": signal.signal_id,
+                    "strategy_id": signal.strategy_id,
+                    "instrument": signal.instrument,
+                    "reason": "exclusive_strategy_allowlist",
+                    "execution_mode": env.mode,
+                }, env_name=env.name)
+                log.error("[Engine] exclusive runtime policy blocked entry signal "
+                          "%s from %s (%s)", signal.signal_id,
+                          signal.strategy_id, signal.instrument)
+                return
         if env.is_live and is_exit:
             position_id = (metadata.get("position_id")
                            or metadata.get("parent_position_id")
@@ -208,43 +225,9 @@ class SignalFlowMixin:
             position_manager = getattr(env, "position_manager", None)
             position = (position_manager.get_position(str(position_id))
                         if position_id and position_manager is not None else None)
-            if (position is not None
-                    and str(getattr(position, "sl_state", "") or "").upper()
-                        == "SL_UNAVAILABLE"):
-                # The broker/local position mismatch invalidated local
-                # ownership. Do not submit an opposite-side exit which may
-                # open new risk against an unknown broker net.
-                self.publish_event("exit_blocked_unconfirmed_position", {
-                    "signal_id": signal.signal_id,
-                    "strategy_id": signal.strategy_id,
-                    "position_id": position.position_id,
-                    "trade_id": position.trade_id,
-                    "instrument": signal.instrument,
-                    "reason": "broker_position_unconfirmed",
-                    "execution_mode": env.mode,
-                }, env_name=env.name)
-                return
-        # During the narrowly scoped live canary, only its explicitly marked
-        # test lifecycle may create entries. The canary signal is armed as a
-        # pending trigger; the normal Dhan WebSocket tick handler must fire it.
-        # Normal strategy exits remain enabled during the test.
-        config = getattr(self, "config", None)
-        test_cfg = (config.get("live_test_order_cycle", {}) or {}) if config else {}
-        cancel_control = bool(metadata.get("cancel_only")) and bool(
-            metadata.get("cancel_inflight") or metadata.get("cancel_pending_only"))
-        if (env.is_live and test_cfg.get("enabled")
-                and signal.strategy_id == str(test_cfg.get("strategy_id", ""))
-                and signal.instrument == str(test_cfg.get("instrument", ""))
-                and not is_exit and not bool(metadata.get("test_cycle"))
-                and not cancel_control):
-            self.publish_event("live_test_cycle_signal_blocked", {
-                "signal_id": signal.signal_id,
-                "strategy_id": signal.strategy_id,
-                "instrument": signal.instrument,
-                "reason": "canary_only_entry_mode",
-                "execution_mode": env.mode,
-            }, env_name=env.name)
-            return
+        # Entries and exits in this runtime come only from the completed-candle
+        # SuperTrend flip. There is no canary-only signal interception or tick
+        # trigger path.
         try:
             runtime = env.runtimes.require(signal.strategy_id)
         except (KeyError, ValueError):
@@ -261,276 +244,6 @@ class SignalFlowMixin:
         lifecycle = runtime.lifecycle
         order_manager = runtime.order_manager
         position_manager = runtime.position_manager
-
-        # A DEMA change can retire a pending reversal entry while its old
-        # position/exit lifecycle must remain untouched. This local-trigger
-        # cancellation is intentionally separate from cancel_inflight, whose
-        # ordinary reset semantics are for flat entry replacement.
-        if bool(metadata.get("cancel_pending_only")):
-            old_pending_id = metadata.get("old_pending_id")
-            terminalized = False
-            cancellation_error = None
-            if (env.mode == "LIVE" and old_pending_id
-                    and env.persistence is not None):
-                try:
-                    terminalized = env.persistence.terminalize_pending_order(
-                        str(old_pending_id),
-                        status="cancelled_by_indicator_change",
-                        reason="hourly_dema_atr_changed",
-                    )
-                except Exception as exc:
-                    cancellation_error = exc
-                    log.error("[Engine] DEMA-change pending cancellation failed "
-                              "for %s: %s", old_pending_id, exc)
-                if not terminalized and cancellation_error is None:
-                    try:
-                        row = env.persistence.get_pending_order(
-                            str(old_pending_id), execution_mode="LIVE")
-                        if _pending_row_has_unresolved_order(row):
-                            cancellation_error = RuntimeError(
-                                "durable trigger row remained active")
-                    except Exception as exc:
-                        cancellation_error = exc
-            registry = getattr(env, "pending_triggers", None)
-            if registry is not None and old_pending_id:
-                registry.remove_signal(str(old_pending_id))
-            if cancellation_error is not None:
-                safe_mode = getattr(env, "safe_mode", None)
-                if safe_mode is not None:
-                    safe_mode.enter_safe_mode(
-                        "pending_trigger_state_mismatch",
-                        f"Could not terminalize stale trigger {old_pending_id}")
-            self.publish_event("pending_trigger_cancelled_by_dema_change", {
-                "old_signal_id": str(old_pending_id or ""),
-                "strategy_id": signal.strategy_id,
-                "instrument": signal.instrument,
-                "trigger_htf_dema_atr": metadata.get("trigger_htf_dema_atr"),
-                "current_htf_dema_atr": metadata.get("current_htf_dema_atr"),
-                "terminalized": bool(terminalized),
-                "error": str(cancellation_error) if cancellation_error else None,
-                "execution_mode": env.mode,
-            }, env_name=env.name)
-            return
-
-        # A newer candle can replace an untriggered reversal. The strategy
-        # cancels the old trigger in memory and includes its opposite-entry
-        # signal id on the new REVERSAL_EXIT intent. Keep the LIVE recovery
-        # journal in sync before any new reversal gates or pending rows run.
-        superseded_pending_id = metadata.get(
-            "superseded_pending_entry_signal_id")
-        if (env.mode == "LIVE" and superseded_pending_id
-                and env.persistence is not None):
-            try:
-                indicator_changed = (
-                    metadata.get("superseded_pending_termination")
-                    == "indicator_change")
-                superseded_status = (
-                    "cancelled_by_indicator_change" if indicator_changed
-                    else "cancelled_by_reversal")
-                terminalized = env.persistence.terminalize_pending_order(
-                    str(superseded_pending_id),
-                    status=superseded_status,
-                    reason=("hourly_dema_atr_changed" if indicator_changed
-                            else "reversal_signal_replaced_before_exit_trigger"))
-                registry = getattr(env, "pending_triggers", None)
-                if registry is not None:
-                    registry.remove_signal(str(superseded_pending_id))
-                self.publish_event("pending_reversal_entry_superseded", {
-                    "old_signal_id": str(superseded_pending_id),
-                    "new_reversal_signal_id": signal.signal_id,
-                    "strategy_id": signal.strategy_id,
-                    "instrument": signal.instrument,
-                    "terminalized": bool(terminalized),
-                    "status": superseded_status,
-                    "execution_mode": env.mode,
-                }, env_name=env.name)
-                if not terminalized:
-                    try:
-                        row = env.persistence.get_pending_order(
-                            str(superseded_pending_id), execution_mode="LIVE")
-                    except Exception:
-                        row = None
-                    if indicator_changed and _pending_row_has_unresolved_order(row):
-                        safe_mode = getattr(env, "safe_mode", None)
-                        if safe_mode is not None:
-                            safe_mode.enter_safe_mode(
-                                "pending_trigger_state_mismatch",
-                                f"Could not terminalize stale reversal entry "
-                                f"{superseded_pending_id}")
-                        self._preserve_position_after_exit_block(
-                            signal, env, cancel_reversal=True)
-                        return
-                    log.warning(
-                        "[Engine] superseded reversal pending %s had no row "
-                        "to terminalize before %s",
-                        superseded_pending_id, signal.signal_id)
-            except Exception as e:
-                # This cleanup is lifecycle hygiene; never convert it into a
-                # broker action. Surface the failure through logs and events
-                # so operators can identify a potentially stale durable row.
-                log.error(
-                    "[Engine] failed to terminalize superseded reversal "
-                    "pending %s before %s: %s",
-                    superseded_pending_id, signal.signal_id, e)
-                self.publish_event("pending_reversal_supersede_cleanup_failed", {
-                    "old_signal_id": str(superseded_pending_id),
-                    "new_reversal_signal_id": signal.signal_id,
-                    "strategy_id": signal.strategy_id,
-                    "instrument": signal.instrument,
-                    "error": str(e),
-                    "execution_mode": env.mode,
-                }, env_name=env.name)
-                if metadata.get("superseded_pending_termination") == "indicator_change":
-                    safe_mode = getattr(env, "safe_mode", None)
-                    if safe_mode is not None:
-                        safe_mode.enter_safe_mode(
-                            "pending_trigger_state_mismatch",
-                            f"Could not terminalize stale reversal entry "
-                            f"{superseded_pending_id}")
-                # Do not arm or execute the replacement while durable state
-                # still says the old opposite entry is active. Keep the
-                # existing broker position and its stop as the sole owner.
-                self._preserve_position_after_exit_block(
-                    signal, env, cancel_reversal=True)
-                return
-
-        # A bare opposite-side signal while this strategy holds an open
-        # position is a REVERSAL: it closes the held position (never opens a
-        # phantom/duplicate trade). Re-entry on the opposite side happens only
-        # via a later breakout trigger armed by the strategy.
-        if not is_exit and not is_pending:
-            sig_side = (signal.side or getattr(signal.signal_type, "value", "")).upper()
-            if sig_side in ("LONG", "SHORT"):
-                open_pos = next((
-                    p for p in position_manager.get_positions_by_strategy(signal.strategy_id)
-                    if p.is_open and p.instrument == signal.instrument), None)
-                if open_pos is not None:
-                    held_side = "LONG" if open_pos.is_long else "SHORT"
-                    if held_side != sig_side:
-                        from strategies.types import Signal as StratSignal
-                        reversal = StratSignal(
-                            signal_type=signal.signal_type,
-                            instrument=signal.instrument,
-                            strategy_id=signal.strategy_id,
-                            timestamp=signal.timestamp,
-                            trigger_price=signal.trigger_price,
-                            stop_price=signal.stop_price,
-                            quantity=signal.quantity,
-                        )
-                        reversal.signal_id = signal.signal_id
-                        reversal.lifecycle_id = signal.lifecycle_id
-                        reversal.parent_position_id = signal.parent_position_id
-                        reversal.position_generation = signal.position_generation
-                        reversal.metadata = dict(signal.metadata or {})
-                        reversal.metadata.update({
-                            "exit": True,
-                            "exit_reason": f"{held_side.lower()}_reversal",
-                            "is_reversal": True,
-                        })
-                        signal = reversal
-                        metadata = signal.metadata
-                        is_exit = True
-
-        # ═══════════════════════════════════════════════════════════════
-        # CANCEL IN-FLIGHT: when the strategy detected an opposite crossover
-        # while ENTRY_TRIGGERED or PENDING_* (a LIMIT rests at the broker,
-        # or a trigger is waiting), the signal carries cancel_inflight=True.
-        # Find and cancel any in-flight entry order, terminalize the old
-        # durable pending row (if LIVE), reset strategy state, then fall
-        # through to process the new signal normally.
-        # ═══════════════════════════════════════════════════════════════
-        if (not is_exit and bool(metadata.get("cancel_inflight"))
-                and strategy is not None):
-            old_trade_id = getattr(strategy, "current_trade_id", None)
-            if old_trade_id is not None:
-                exe = env.execution_engine
-                for o in list(getattr(exe, "_orders", {}).values()):
-                    if (o.strategy_id == signal.strategy_id
-                            and o.trade_id == old_trade_id
-                            and o.state.value in ("created", "submitted")):
-                        role = (getattr(o, "order_role", "") or "").upper()
-                        if role.startswith("ENTRY") or role == "REVERSAL_ENTRY":
-                            log.info("[Engine] cancel_inflight: cancelling %s "
-                                     "for %s (opposite signal %s)",
-                                     o.order_id, signal.strategy_id,
-                                     signal.signal_id)
-                            if not exe.cancel_order(o.order_id):
-                                # The old order may have filled during cancel
-                                # or its broker state may be unknown. Drop the
-                                # replacement trigger until reconciliation.
-                                self._reset_strategy_state(
-                                    signal.strategy_id, env_name=env.name)
-                                self.publish_event("pending_replacement_blocked", {
-                                    "signal_id": signal.signal_id,
-                                    "old_order_id": o.order_id,
-                                    "reason": "old_order_cancel_unconfirmed",
-                                    "execution_mode": env.mode,
-                                }, env_name=env.name)
-                                return
-                            break
-            # Terminalize the old durable pending row (Phase 9.6) so the
-            # superseded pending order doesn't stay ARMED forever in the DB.
-            # Use old_pending_id from metadata if available, otherwise fall
-            # back to _last_armed_pending_id.
-            old_pending_id = (metadata.get("old_pending_id")
-                              or getattr(strategy, "_last_armed_pending_id", None))
-            if old_pending_id is not None and env.persistence is not None:
-                try:
-                    expired = metadata.get("pending_termination") == "expired"
-                    indicator_changed = (
-                        metadata.get("pending_termination") == "indicator_change")
-                    terminal_status = (
-                        "expired" if expired else
-                        "cancelled_by_indicator_change" if indicator_changed else
-                        "cancelled_by_reversal")
-                    terminal_reason = (
-                        "pending_trigger_timed_out" if expired else
-                        "hourly_dema_atr_changed" if indicator_changed else
-                        "opposite_crossover_superseded")
-                    terminalized = env.persistence.terminalize_pending_order(
-                        old_pending_id,
-                        status=terminal_status,
-                        reason=terminal_reason)
-                    if indicator_changed and not terminalized:
-                        row = env.persistence.get_pending_order(
-                            str(old_pending_id), execution_mode="LIVE")
-                        if _pending_row_has_unresolved_order(row):
-                            raise RuntimeError(
-                                "durable trigger row remained active")
-                except Exception as e:
-                    log.warning("[Engine] cancel_inflight: failed to "
-                                "terminalize pending %s: %s", old_pending_id, e)
-                    if metadata.get("pending_termination") == "indicator_change":
-                        safe_mode = getattr(env, "safe_mode", None)
-                        if safe_mode is not None:
-                            safe_mode.enter_safe_mode(
-                                "pending_trigger_state_mismatch",
-                                f"Could not terminalize stale trigger {old_pending_id}")
-                        self._reset_strategy_state(
-                            signal.strategy_id, env_name=env.name)
-                        return
-                registry = getattr(env, "pending_triggers", None)
-                if registry is not None:
-                    registry.remove_signal(str(old_pending_id))
-            keep_current_trigger = bool(
-                strategy is not None
-                and getattr(strategy, "pending_entry", None) is not None
-                and getattr(strategy.pending_entry.signal, "signal_id", None)
-                    == signal.signal_id)
-            # This signal object is reused when its pending breakout later
-            # fires.  The cancellation is a one-shot candle-time action; if
-            # these markers survive on the signal, its second pass through
-            # _process_signal resets the strategy again and clears the fired
-            # trigger ownership immediately before live order validation.
-            metadata["cancel_inflight"] = False
-            metadata["cancel_inflight_consumed"] = True
-            self._reset_strategy_state(signal.strategy_id,
-                                       keep_pending=keep_current_trigger,
-                                       env_name=env.name)
-            # If this is a cancel-only signal (no new entry intended),
-            # skip further processing — no trade/order to create.
-            if bool(metadata.get("cancel_only")):
-                return
 
         # §66 — IDEMPOTENT REPLAY: a signal whose own trade already executed
         # its entry (entry_fill recorded => a real position exists) must never
@@ -579,35 +292,26 @@ class SignalFlowMixin:
                 signal, env, cancel_reversal=True)
             return
         if is_exit:
-            exit_reason_md = str((metadata or {}).get("exit_reason") or "").lower()
-            is_sl_exit = ("stop_loss" in exit_reason_md
-                          or resolve_order_role(signal) == "STOP_LOSS")
-            if is_sl_exit:
-                if not gates.sl_enabled:
-                    self._publish_gate_block(signal, "sl_disabled",
-                                             {"gate": gates.to_dict()}, env)
-                    self._preserve_position_after_exit_block(
-                        signal, env, stop_exit_blocked=True)
-                    return
-            elif not gates.exit_enabled:
+            if not gates.exit_enabled:
                 self._publish_gate_block(signal, "exit_disabled",
                                          {"gate": gates.to_dict()}, env)
                 self._preserve_position_after_exit_block(signal, env)
                 return
         else:
-            # Contract rollover: entries in an EXPIRING series are blocked
-            # from expiry −1 trading day until the next boot applies the
-            # switch.  This supersedes every other entry gate.
+            # Contract validation / rollover: entries stay blocked whenever
+            # the configured contract cannot be verified or is inside its
+            # rollover window. This supersedes every other entry gate.
             if (env.name, signal.instrument) in self._rollover_blocked:
                 self._publish_gate_block(
                     signal, "contract_rollover_blocked",
-                    {"rollover": "expiring_series_window"}, env)
+                    {"rollover": "contract_unverified_or_rollover_window"}, env)
                 try:
                     self.telegram.on_risk_alert({
                         "severity": "WARNING",
                         "type": "contract_rollover_blocked",
-                        "message": f"{signal.instrument}: entries blocked in the "
-                                   f"expiring series (rollover window)",
+                        "message": f"{signal.instrument}: entries blocked because "
+                                   "the active contract is unverified or in its "
+                                   "rollover window",
                         "strategy_id": signal.strategy_id,
                         "instrument": signal.instrument,
                     })
@@ -703,6 +407,43 @@ class SignalFlowMixin:
                               signal.signal_id)
                 return
             raise
+
+        # A SuperTrend reversal submits its old-position market exit first,
+        # then submits the opposite market entry only after Dhan confirms
+        # flatness. Journal that paired entry before the exit reaches Dhan:
+        # the later post-flat handoff requires an ARMED durable row, and a
+        # missing row would otherwise silently block the reversal entry.
+        paired_reversal_entry = metadata.get("reversal_entry_signal")
+        if (env.mode == "LIVE" and is_exit
+                and metadata.get("market_on_signal_close")
+                and metadata.get("is_reversal")
+                and paired_reversal_entry is not None):
+            try:
+                self._persist_signal(paired_reversal_entry, "entry", env_name)
+                self._arm_live_pending(paired_reversal_entry, env)
+            except Exception as exc:  # noqa: BLE001
+                self.publish_event("reversal_entry_journal_failed", {
+                    "signal_id": paired_reversal_entry.signal_id,
+                    "exit_signal_id": signal.signal_id,
+                    "strategy_id": signal.strategy_id,
+                    "instrument": signal.instrument,
+                    "reason": "opposite_entry_not_durable_before_exit",
+                    "error": str(exc),
+                    "execution_mode": env.mode,
+                }, env_name=env.name)
+                safe_mode = getattr(env, "safe_mode", None)
+                if safe_mode is not None:
+                    safe_mode.enter_safe_mode(
+                        "reversal_entry_journal_failed",
+                        f"Could not durably arm paired reversal entry "
+                        f"{paired_reversal_entry.signal_id}")
+                # Keep the existing broker position authoritative if the
+                # paired entry cannot survive restart/reconciliation.
+                self._preserve_position_after_exit_block(
+                    signal, env, cancel_reversal=True)
+                log.exception("[Engine] refusing reversal exit without a "
+                              "durable opposite-entry record")
+                return
         self.publish_event("signal_created", {
             "signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
             "instrument": signal.instrument, "signal_type": signal.signal_type.name,
@@ -737,6 +478,14 @@ class SignalFlowMixin:
                     }, env_name=env.name)
                     log.exception("[Engine] refusing LIVE trigger without durable row")
             return
+
+        # Immediate-after-close strategies still journal an ARMED durable
+        # signal before order creation. This preserves the LIVE no-RAM-only
+        # invariant while allowing the completed candle to submit directly.
+        if (env.mode == "LIVE"
+                and metadata.get("market_on_signal_close")
+                and not is_exit):
+            self._arm_live_pending(signal, env)
 
         # Exits reduce risk and remain available during a safety halt. Entries
         # must pass both the session/data gate and the (environment's) risk gate.
@@ -836,12 +585,6 @@ class SignalFlowMixin:
             if trade is None:
                 log.error("Exit signal %s has no explicit open trade", signal.signal_id)
                 return
-            # There is no broker-side protective SL, so a local SL exit is
-            # never suppressed here.  §9/§10 duplicate + race protection lives
-            # in the position-owned SL monitor's state machine (TRIGGERED ->
-            # EXITING), which is consulted immediately before the order is
-            # minted.  A second exit for an already-exiting position is blocked
-            # further down by validate_live_order_ownership.
         else:
             # §25/§28/§108 — EXIT-FIRST: a LIVE entry is only placed after the
             # broker proves the instrument FLAT (only when live.exit_first is
@@ -918,26 +661,26 @@ class SignalFlowMixin:
         exit_side = None
         if is_exit and position is not None:
             exit_side = "SELL" if position.is_long else "BUY"
-            # EVERY exit (local-SL fire, reversal, manual, emergency) moves the
-            # position-owned SL to EXITING before the order is minted, so a
-            # concurrent tick cannot race a second exit (§10: one authoritative
-            # exit state per position).
-            self._mark_sl_exiting(env, position)
 
+        order_submit_started = time.perf_counter()
         order = order_manager.submit_signal(
             signal, multiplier=multiplier, trade_id=trade.trade_id, side=exit_side,
         )
+        submit_ms = (time.perf_counter() - order_submit_started) * 1000
+        log.info("[ExecutionTiming] env=%s strategy=%s instrument=%s signal=%s "
+                 "submit_response_ms=%.1f result=%s indicator_ms=%s",
+                 env.name, signal.strategy_id, signal.instrument,
+                 signal.signal_id, submit_ms,
+                 (getattr(getattr(order, "state", None), "value", None)
+                  if order is not None else "deduplicated_or_not_created"),
+                 (metadata.get("indicator_calculation_ms")
+                  if metadata else None))
         if order is None:
             if is_exit and position is not None:
                 position.exit_started = False
                 strategy.position_side = "LONG" if position.is_long else "SHORT"
                 strategy.state = (StrategyState.LONG_POSITION if position.is_long
                                   else StrategyState.SHORT_POSITION)
-                strategy.stop_exit_submitted = False
-                # The exit never reached the broker: re-arm the position-owned
-                # SL so a later tick can still protect this position.
-                self._release_sl_after_failed_exit(env, position,
-                                                  reason="exit_not_submitted")
                 if reversal_sig:
                     strategy.pending_entry = None
                     registry = getattr(env, "pending_triggers", None)
@@ -951,12 +694,9 @@ class SignalFlowMixin:
         if is_exit and position is not None and order.state.value in (
                 "submitted", "acknowledged", "partially_filled", "filled"):
             position.exit_started = True
-            self._mark_sl_exiting(env, position, order.order_id,
-                                  getattr(order, "_broker_order_id", None))
         elif is_exit and position is not None:
             # Order exists but was rejected/cancelled by the engine or broker.
-            self._release_sl_after_failed_exit(env, position,
-                                              reason=(order.reason or "exit_rejected"))
+            position.exit_started = False
         order_role = resolve_order_role(signal)
         lifecycle.register_order(trade.trade_id, order.order_id,
                                  order_role or ("EXIT" if is_exit else "ENTRY"))
@@ -964,8 +704,8 @@ class SignalFlowMixin:
         # opens a durable reversal lifecycle record (old trade/position + the
         # old exit order); the OPPOSITE REVERSAL_ENTRY order later merges the
         # new trade/order onto the SAME record via the shared signal id.  The
-        # record is never marked COMPLETE until the old position is flat AND
-        # the new entry fill is broker-confirmed AND the new SL is placed.
+        # record is complete only after the old exit and new entry are
+        # broker-confirmed.
         if env.mode == "LIVE" and env.persistence is not None:
             if order_role == "REVERSAL_EXIT":
                 self._record_reversal_open(env, signal, trade, position, order)

@@ -854,6 +854,79 @@ class DhanRestTransport(LiveBrokerClient):
                 })
         return results
 
+    def instrument_orders_clear(self, instrument: str,
+                                security_id: Optional[str] = None) -> bool:
+        """Confirm Dhan has no working order for the exact expiring contract.
+
+        The local transport book cannot see manual orders or orders submitted
+        before this process started. Rollover therefore reads today's broker
+        order book and treats malformed/unavailable data as unknown (raise),
+        never as an empty book. PART_TRADED remains working until its remainder
+        is settled.
+        """
+        target = str(security_id or
+                     (self.instruments.get(instrument) or {}).get("security_id")
+                     or "")
+        if not target:
+            raise ValueError(f"missing security ID for {instrument} order check")
+        try:
+            rows = self._http._get("/orders")
+        except Exception as exc:
+            self._audit("ROLLOVER_ORDER_CHECK", "/orders", "GET", error=exc)
+            raise RuntimeError("Dhan order book query failed") from exc
+        self._audit("ROLLOVER_ORDER_CHECK", "/orders", "GET",
+                    response=rows, http_status=200)
+        if not isinstance(rows, list):
+            raise ValueError("Dhan order book response is not a list")
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Dhan order book contains a malformed row")
+            row_security_id = str(row.get("securityId")
+                                  or row.get("security_id") or "")
+            raw_status = row.get("orderStatus") or row.get("order_status")
+            if not row_security_id or not raw_status:
+                raise ValueError("Dhan order row missing security ID or status")
+            if row_security_id == target and not _is_raw_terminal(raw_status):
+                return False
+        return True
+
+    def update_instrument_contract(self, instrument: str, config: dict) -> None:
+        """Promote a warmed contract mapping after the old one is broker-flat."""
+        security_id = str((config or {}).get("security_id") or "")
+        if not security_id:
+            raise ValueError(f"missing security_id for {instrument}")
+        with self._lock:
+            self.instruments[instrument] = {
+                "security_id": security_id,
+                "exchange_segment": (config or {}).get(
+                    "exchange_segment", "MCX_COMM"),
+                "symbol": (config or {}).get("symbol", ""),
+            }
+
+    def instrument_flat(self, instrument: str, security_id: str) -> bool:
+        """Verify an exact contract has zero net quantity at Dhan.
+
+        The ordinary ``positions()`` projection omits zero rows and expands
+        contract rows to strategy labels. This direct check keeps the security
+        ID explicit and treats API errors or malformed responses as unknown.
+        """
+        try:
+            rows = self._http._get("/positions")
+        except Exception as exc:
+            self._audit("POSITIONS", "/positions", "GET", error=exc)
+            raise RuntimeError("Dhan positions query failed") from exc
+        if not isinstance(rows, list):
+            raise ValueError("Dhan positions response is not a list")
+        target = str(security_id)
+        for row in rows:
+            if str(row.get("securityId") or "") != target:
+                continue
+            qty = row.get("netQty", row.get("netQuantity"))
+            if qty is None:
+                raise ValueError(f"Dhan position missing net quantity for {target}")
+            return int(qty) == 0
+        return True
+
     def _own_net_positions(self) -> list[dict]:
         """Net exposure per instrument from OUR OWN fills only.
 

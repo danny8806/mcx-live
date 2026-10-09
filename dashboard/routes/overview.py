@@ -33,8 +33,6 @@ def _watch_failure_states(env):
 
     PENDING ENTRY AGE  - a LIVE entry order resting at the broker past the
                          configured max age (missed / aging limit).
-    UNPROTECTED POSITION - an open position with no placed/verified protective
-                         SL (broker SL missing -> local stop is the safety net).
     PENDING EXIT       - an EXIT / REVERSAL_EXIT / EMERGENCY_EXIT order still
                          resting at the broker.
     UNKNOWN BROKER STATE - a tracked order the broker has not confirmed via
@@ -58,7 +56,7 @@ def _watch_failure_states(env):
                 if status in ("FILLED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"):
                     continue
                 if role and role not in ("ENTRY",):
-                    if "EXIT" in role or role == "STOP_LOSS":
+                    if "EXIT" in role:
                         states.append({
                             "state": "PENDING EXIT",
                             "order_id": oid,
@@ -97,28 +95,6 @@ def _watch_failure_states(env):
                         "detail": "entry locked behind a higher-priority leg"})
         except Exception as exc:
             states.append({"state": "WATCHER_UNAVAILABLE", "detail": str(exc)})
-    # SL coverage from the position book.  There is no broker-side protective
-    # stop: "armed" means THIS PROCESS is watching position.stop_price, and it
-    # is only ever shown for an open position.
-    try:
-        pm = getattr(env, "position_manager", None)
-        if pm is not None:
-            snap = pm.snapshot() or {}
-            for pos in (snap.get("open_positions") or {}).values():
-                if not (pos or {}).get("is_open", False):
-                    continue
-                sl_state = (pos or {}).get("sl_state") or "NONE"
-                if sl_state != "ARMED":
-                    states.append({
-                        "state": "POSITION WITHOUT ACTIVE LOCAL SL",
-                        "position_id": pos.get("position_id"),
-                        "strategy_id": pos.get("strategy_id"),
-                        "instrument": pos.get("instrument"),
-                        "stop_price": pos.get("stop_price"),
-                        "detail": (f"sl_state={sl_state} "
-                                   f"(local position-owned stop monitor)")})
-    except Exception:
-        pass
     return states
 
 
@@ -306,8 +282,8 @@ def _get_instrument_overview_sync(instrument: str):
             strat_summaries.append({
                 "strategy_id": name,
                 "status": snap.get("state", "unknown"),
-                "fast_timeframe": getattr(strat, "fast_timeframe", ""),
-                "htf_timeframe": getattr(strat, "htf_timeframe", ""),
+                "strategy_type": getattr(strat, "strategy_type", "supertrend"),
+                "signal_timeframe": "15m",
                 "position_side": snap.get("position_side"),
                 "stop_price": snap.get("stop_price"),
                 "bars_processed": snap.get("bars_processed", 0),

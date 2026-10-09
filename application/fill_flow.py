@@ -104,7 +104,7 @@ class FillFlowMixin:
             source_order = (env.execution_engine.get_order(fill.order_id)
                             if env.execution_engine is not None else None)
             source_role = str(getattr(source_order, "order_role", "") or "").upper()
-            if source_role in ("EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"):
+            if source_role in ("EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"):
                 owner_pos = getattr(source_order, "parent_position_id", None)
                 owner_trade = getattr(source_order, "lifecycle_id", None) or getattr(source_order, "trade_id", None)
                 owner_gen = getattr(source_order, "position_generation", None)
@@ -184,12 +184,10 @@ class FillFlowMixin:
             if not (account_blocked and global_blocked):
                 if account_blocked:
                     account.release_margin(margin)
-                # The broker has ALREADY executed this entry (LIVE): refusing
-                # the fill orphans a REAL position with no tracking and no
-                # protective stop.  Over-allocate the margin (the position
-                # already exists at the broker) and surface a margin-breach
-                # alert, then let the normal booking below proceed so the
-                # entry is tracked and _guard_live_position arms its stop.
+                # Dhan has ALREADY executed this entry (LIVE): refusing the
+                # fill would orphan a real broker position. Track it, record
+                # the margin breach, and clearly alert that this strategy has
+                # no automatic stop-loss.
                 # Paper has no broker side, so a reset + drop stays correct.
                 if env.mode == "LIVE":
                     account.block_margin(margin, force=True)
@@ -208,8 +206,9 @@ class FillFlowMixin:
                                 f"MARGIN BREACH: broker-confirmed entry "
                                 f"{fill.fill_id} {fill.instrument} "
                                 f"x{fill.quantity} @ {fill.price} — margin "
-                                f"{margin:.2f} over limit; position tracked "
-                                f"and will be protected."),
+                                f"{margin:.2f} over limit. Position is tracked, "
+                                f"but this strategy has no automatic stop-loss; "
+                                f"operator review is required."),
                         })
                     except Exception:
                         pass
@@ -256,12 +255,6 @@ class FillFlowMixin:
                     "instrument": fill.instrument,
                     "quantity": new_qty, "average_entry": current.average_entry,
                     "execution_mode": env.mode}, env_name=env.name)
-                # Do not arm protection on a partial resting LIMIT fill. The
-                # user's contract is full entry confirmation first; once the
-                # LIMIT is canceled and MARKET fallback starts, protect actual
-                # MARKET fills immediately (including a partial fill).
-                self._protect_entry_fill_if_ready(
-                    env, current, entry_order, source="entry_fill_augment")
                 if str(getattr(entry_order, "order_role", "")).upper() in (
                         "REVERSAL_ENTRY", "FALLBACK_MARKET"):
                     reversal_parent = self._reversal_parent_signal_id(
@@ -273,48 +266,11 @@ class FillFlowMixin:
                     env, fill.strategy_id, "LONG" if current.is_long else "SHORT",
                     current)
             else:
-                # stop_price: prefer the entry order's own execution plan
-                # (planned_sl).  For a REVERSAL_ENTRY that is the NEW opposite
-                # side's stop computed from the entry signal (instance.py
-                # plan_for/create_order), never the stale pre-reversal stop
-                # still held by strategy.state / the shared signals row.
                 entry_order = (env.execution_engine.get_order(fill.order_id)
                                if env.execution_engine is not None else None)
-                _stop = (getattr(entry_order, "planned_sl", None)
-                         if entry_order is not None else None)
-                if _stop is None:
-                    _stop = getattr(env.strategies.get(fill.strategy_id),
-                                    "stop_price", None)
-                if _stop is None and signal_id and env.persistence is not None:
-                    try:
-                        _sig = env.persistence.query_one(
-                            "SELECT stop_price FROM signals WHERE signal_id=?",
-                            (signal_id,))
-                        if _sig and _sig.get("stop_price") is not None:
-                            _stop = float(_sig["stop_price"])
-                            # Restore strategy stop_price for future use
-                            env.strategies[fill.strategy_id].stop_price = _stop
-                    except Exception:
-                        log.error("[Engine] SL recovery failed for signal %s: %s",
-                                  signal_id, exc_info=True)
-                if _stop is None and signal_id:
-                    # A broker-confirmed entry fill with no recoverable stop is
-                    # an UNPROTECTED live position: the local tick stop monitor
-                    # has no stop level, so the exit-on-stop path is dead.
-                    # Never let that pass silently.
-                    log.error("[Engine] entry fill %s has NO stop price "
-                              "(planned_sl/strategy/signal all empty) - "
-                              "position will be UNPROTECTED",
-                              fill.fill_id)
-                    self.publish_event("entry_stop_missing", {
-                        "fill_id": fill.fill_id, "signal_id": signal_id,
-                        "strategy_id": fill.strategy_id,
-                        "instrument": fill.instrument,
-                        "reason": "no_stop_price_recoverable",
-                        "execution_mode": env.mode}, env_name=env.name)
                 position = position_manager.open_position(
                     fill, multiplier=fill.multiplier, margin=margin,
-                    stop_price=_stop,
+                    stop_price=None,
                     entry_signal_id=signal_id, trade_id=trade.trade_id,
                     position_generation=(getattr(entry_order, "position_generation", None)
                                          if entry_order is not None else None),
@@ -366,13 +322,7 @@ class FillFlowMixin:
                     "position_id": position.position_id, "fill_id": fill.fill_id,
                     "strategy_id": fill.strategy_id, "instrument": fill.instrument,
                     "execution_mode": env.mode}, env_name=env.name)
-                # The initial fill may be only part of a still-working LIMIT.
-                # Keep it unarmed until full quantity, or a confirmed MARKET
-                # fallback fill, as requested.
-                self._protect_entry_fill_if_ready(
-                    env, position, entry_order, source="entry_fill")
-                # REVERSAL — the broker-confirmed NEW opposite entry creates
-                # the NEW position; record its fill + SL on the reversal.
+                # A reversal entry is complete only after this Dhan fill.
                 if str(getattr(entry_order, "order_role", "")).upper() in (
                         "REVERSAL_ENTRY", "FALLBACK_MARKET"):
                     reversal_parent = self._reversal_parent_signal_id(
@@ -395,32 +345,19 @@ class FillFlowMixin:
             close_manager = env.trade_close_manager or self._trade_close_manager
             if close_manager is None:
                 raise RuntimeError("trade close manager is not initialized")
-            # §27 — stop-loss closes carry NO strategy signal: exit_signal_id
-            # must stay NULL and exit_reason must be the canonical STOP_LOSS.
-            # Reversal/signal exits keep their explicit exit signal id.
             raw_reason = (env.strategies[fill.strategy_id].last_exit_reason
                           or "signal_exit")
-            is_stop_loss = (raw_reason or "").lower() in ("stop_loss_hit", "stop_loss")
-            # Defensive: a STOP_LOSS-role order can no longer be created (the
-            # live engine rejects it outright), but if one ever appeared its
-            # fill is still a stop-loss regardless of stale strategy state.
-            sl_order = env.execution_engine.get_order(fill.order_id) \
-                if env.execution_engine is not None else None
-            sl_role = getattr(sl_order, "order_role", None)
-            if sl_role == "STOP_LOSS":
-                is_stop_loss = True
-            exit_reason = "STOP_LOSS" if is_stop_loss else raw_reason
-            exit_signal_id = "" if is_stop_loss else (signal_id or "")
-            if sl_role == "EMERGENCY_EXIT":
-                # Emergency market close: canonical EMERGENCY_EXIT reason, no
-                # strategy signal is ever attached.
+            exit_order = (env.execution_engine.get_order(fill.order_id)
+                          if env.execution_engine is not None else None)
+            exit_role = str(getattr(exit_order, "order_role", "") or "").upper()
+            exit_reason = ("EMERGENCY_EXIT" if exit_role == "EMERGENCY_EXIT"
+                           else raw_reason)
+            exit_signal_id = signal_id or ""
+            if exit_role == "EMERGENCY_EXIT":
                 exit_reason = "EMERGENCY_EXIT"
                 exit_signal_id = ""
             current.exit_order_id = fill.order_id
-            # A PARTIAL exit leaves the position OPEN on the remaining
-            # quantity; the local SL and strategy position state must stay
-            # armed (at the new, smaller quantity) until the position is
-            # fully gone (§12).
+            # A partial exit leaves the broker-owned remaining quantity open.
             exit_qty = int(fill.quantity or 0)
             pos_qty = int(current.quantity or 0)
             if 0 < exit_qty < pos_qty:
@@ -440,7 +377,6 @@ class FillFlowMixin:
                                                   "exit fill exceeds local position")
                 env.fill_dedup.mark_processed(fill.fill_id)
                 return
-            self._release_live_sl(env, current, fill.order_id, sl_role)
             close_multiplier = self._position_pnl_multiplier(current, fill)
             if not math.isclose(float(getattr(current, "multiplier", 1.0) or 1.0),
                                 close_multiplier):
@@ -475,7 +411,7 @@ class FillFlowMixin:
             # REVERSAL — the broker-confirmed old-position exit is the
             # transition point: record the exit fill on the reversal record.
             # Only when it is provably flat does the new opposite entry flow.
-            if sl_role == "REVERSAL_EXIT" or (exit_reason
+            if exit_role == "REVERSAL_EXIT" or (exit_reason
                                               and "reversal" in exit_reason.lower()):
                 self._update_reversal_exit_fill(env, signal_id, fill)
             # Reversal exits arm an OPPOSITE pending breakout entry which must
@@ -494,7 +430,7 @@ class FillFlowMixin:
             self._reset_strategy_state(fill.strategy_id, keep_pending=pending_armed,
                                        env_name=env.name)
             if (pending_armed and
-                    (sl_role == "REVERSAL_EXIT"
+                    (exit_role == "REVERSAL_EXIT"
                      or (exit_reason and "reversal" in exit_reason.lower()))):
                 self._activate_reversal_entry_after_flat(
                     env, fill.strategy_id)
@@ -565,7 +501,7 @@ class FillFlowMixin:
                 if (owner_row.get("trade_id") != owner_trade_id
                         or int(owner_row.get("position_generation") or 0)
                         != int(owner_generation or 0)
-                        or role not in {"EXIT", "STOP_LOSS", "REVERSAL_EXIT",
+                        or role not in {"EXIT", "REVERSAL_EXIT",
                                         "EMERGENCY_EXIT"}):
                     return False
 
@@ -592,7 +528,7 @@ class FillFlowMixin:
                             and int(getattr(parent, "position_generation", 0) or 0)
                                 == int(owner_generation or 0)
                             and str(getattr(parent, "order_role", "") or "").upper()
-                                in {"EXIT", "STOP_LOSS", "REVERSAL_EXIT",
+                                in {"EXIT", "REVERSAL_EXIT",
                                     "EMERGENCY_EXIT"}
                         )
                         if (parent_id == str(root_exit_id) and same_owner
@@ -656,9 +592,6 @@ class FillFlowMixin:
                     trade_id=owner_row.get("trade_id"),
                     entry_signal_id=trade_row.get("entry_signal_id"),
                     status=PositionStatus.OPEN,
-                    sl_state="EXITING",
-                    sl_protected_at=(float(owner_row["sl_protected_at"])
-                                     if owner_row.get("sl_protected_at") else None),
                     entry_order_id=owner_row.get("entry_order_id"),
                     exit_order_id=fill.order_id,
                     position_generation=int(owner_row.get("position_generation") or 0),
@@ -671,7 +604,7 @@ class FillFlowMixin:
                         or (not current.is_long and fill.side != "BUY")):
                     return False
                 pm.restore_open_position(current)
-            if str(getattr(current, "sl_state", "")).upper() != "EXITING":
+            if not getattr(current, "exit_started", False):
                 return False
             if (getattr(order, "parent_position_id", None)
                     and getattr(order, "parent_position_id") != current.position_id):
@@ -694,25 +627,6 @@ class FillFlowMixin:
         except Exception:
             log.exception("[Engine] stale exit fill recovery validation failed")
             return False
-    def _exit_order_still_working(self, env, position) -> bool:
-        """True when a live exit order still has unfilled quantity for this
-        position.  Used to decide between "SL stays EXITING" and "SL re-arms"
-        after a partial fill (§12 / §10)."""
-        engine = getattr(env, "execution_engine", None)
-        if engine is None or position is None:
-            return False
-        oid = getattr(position, "exit_order_id", None)
-        if not oid:
-            return False
-        order = engine.get_order(oid)
-        if order is None:
-            return False
-        if str(getattr(order.state, "value", order.state)).lower() in (
-                "filled", "canceled", "cancelled", "rejected"):
-            return False
-        filled = sum(int(getattr(f, "quantity", 0) or 0)
-                     for f in (getattr(order, "fills", None) or []))
-        return filled < int(getattr(order, "quantity", 0) or 0)
 
     def _handle_partial_exit(self, env, fill, position, trade, signal_id: Optional[str],
                              exit_reason: str, exit_signal_id: str) -> None:
@@ -841,12 +755,6 @@ class FillFlowMixin:
             "remaining_quantity": int(remaining),
             "gross_pnl": gross_pnl, "charges": charges, "net_pnl": net_pnl,
             "execution_mode": env.mode}, env_name=env.name)
-        # §12 — the position stays OPEN on the remainder.  If the exit order
-        # still has working quantity the SL stays EXITING (one authoritative
-        # exit state); otherwise the local SL re-arms at the REMAINING quantity.
-        self._rearm_sl_after_partial_exit(
-            env, position,
-            exit_still_working=self._exit_order_still_working(env, position))
     def _live_account_snapshot(self, env) -> dict:
         """Best-effort REAL Dhan account snapshot for LIVE notifications.
 
@@ -905,12 +813,9 @@ class FillFlowMixin:
         strat.current_trade_id = position.trade_id
         strat.state = (StrategyState.LONG_POSITION if side == "LONG"
                        else StrategyState.SHORT_POSITION)
-        if getattr(position, "stop_price", None) is not None:
-            strat.stop_price = position.stop_price
         strat.just_entered = True
         strat.pending_entry = None
         strat.pending_exit_trigger = None
-        setattr(strat, "stop_exit_submitted", False)
         registry = getattr(env, "pending_triggers", None)
         if registry is not None:
             registry.sync_strategy(strat)
@@ -1055,109 +960,21 @@ class FillFlowMixin:
         self._process_signal(signal, getattr(env, "name", None))
         return True
 
-    def _protect_entry_fill_if_ready(self, env, position, fill_order,
-                                     *, source: str) -> bool:
-        """Arm the position-owned SL only after entry completion is known.
-
-        A partial MARKET fallback is protected at its actual filled quantity;
-        the order watcher reports the underfill separately and does not retry.
-        """
-        if fill_order is None:
-            # Cannot prove the order chain; fail safe and surface missing
-            # ownership instead of silently treating a partial fill as final.
-            position.sl_state = "ENTRY_FILL_INCOMPLETE"
-            try:
-                self._persist_position(position, getattr(env, "name", None))
-            except Exception as e:
-                log.warning("[Engine] unknown entry position persist failed: %s", e)
-            self.publish_event("entry_fill_completion_unknown", {
-                "position_id": position.position_id,
-                "entry_order_id": getattr(position, "entry_order_id", None),
-                "quantity": int(position.quantity),
-                "execution_mode": getattr(env, "mode", None),
-            }, env_name=getattr(env, "name", None))
-            return False
-        role = str(getattr(fill_order, "order_role", "") or "").upper()
-        if role == "FALLBACK_MARKET":
-            root_id = getattr(fill_order, "original_order_id", None)
-            root_order = (env.execution_engine.get_order(root_id)
-                          if root_id and env.execution_engine is not None else None)
-            requested = int(getattr(root_order, "quantity", 0)
-                             or getattr(fill_order, "quantity", 0) or 0)
-            if int(position.quantity) < requested:
-                self.publish_event("entry_quantity_underfilled", {
-                    "position_id": position.position_id,
-                    "entry_order_id": root_id,
-                    "market_order_id": getattr(fill_order, "order_id", None),
-                    "requested_quantity": requested,
-                    "filled_position_quantity": int(position.quantity),
-                    "execution_mode": getattr(env, "mode", None),
-                }, env_name=getattr(env, "name", None))
-            return self._arm_position_sl(env, position,
-                                         source="market_fallback_fill")
-
-        engine = getattr(env, "execution_engine", None)
-        root_id = (getattr(fill_order, "original_order_id", None)
-                   or getattr(fill_order, "order_id", None))
-        chain = []
-        for candidate in (getattr(engine, "_orders", {}) or {}).values():
-            candidate_role = str(getattr(candidate, "order_role", "") or "").upper()
-            if candidate_role not in {"ENTRY", "REVERSAL_ENTRY", "FALLBACK_MARKET"}:
-                continue
-            oid = getattr(candidate, "order_id", None)
-            original = getattr(candidate, "original_order_id", None)
-            if oid == root_id or original == root_id:
-                chain.append(candidate)
-        root = next((o for o in chain if getattr(o, "order_id", None) == root_id),
-                    fill_order)
-        target = max(0, int(getattr(root, "quantity", 0) or 0))
-        fallback_filled = any(
-            str(getattr(o, "order_role", "") or "").upper() == "FALLBACK_MARKET"
-            and int(getattr(o, "filled_quantity", 0) or 0) > 0
-            for o in chain)
-        working = any(
-            str(getattr(getattr(o, "state", None), "value", getattr(o, "state", "")))
-            .lower() not in {"filled", "canceled", "cancelled", "rejected", "expired"}
-            for o in chain)
-        if target and int(position.quantity) >= target:
-            return self._arm_position_sl(env, position, source=source)
-        if fallback_filled:
-            return self._arm_position_sl(env, position,
-                                         source="market_fallback_partial_fill")
-        if not working:
-            # Terminal LIMIT without a fallback: protect only what Dhan filled
-            # and alert that the intended quantity was not completed.
-            self.publish_event("entry_quantity_underfilled", {
-                "position_id": position.position_id,
-                "entry_order_id": root_id,
-                "requested_quantity": target,
-                "filled_quantity": int(position.quantity),
-                "execution_mode": getattr(env, "mode", None),
-            }, env_name=getattr(env, "name", None))
-            return self._arm_position_sl(env, position,
-                                         source="confirmed_terminal_partial_entry")
-        position.sl_state = "ENTRY_FILL_INCOMPLETE"
-        position.sl_protected_at = None
-        try:
-            self._persist_position(position, getattr(env, "name", None))
-        except Exception as e:
-            log.warning("[Engine] pending entry position persist failed: %s", e)
-        self.publish_event("entry_fill_waiting_for_completion", {
-            "position_id": position.position_id,
-            "entry_order_id": root_id,
-            "requested_quantity": target,
-            "filled_quantity": int(position.quantity),
-            "execution_mode": getattr(env, "mode", None),
-        }, env_name=getattr(env, "name", None))
-        return False
     def _notify_entry_fill(self, fill, position, env, signal_id: Optional[str]) -> None:
         try:
             strat_obj = env.strategies.get(fill.strategy_id)
             account = env.account_engines.get(fill.strategy_id)
+            supertrend = getattr(strat_obj, "supertrend", None)
+            supertrend_value = (getattr(supertrend, "value", None)
+                                if supertrend is not None else None)
             strategy_dict = {
                 "entry_value": fill.price * fill.quantity * fill.multiplier,
-                "stop_price": getattr(position, "stop_price", None) or 0.0,
-                "htf_dema_atr": getattr(strat_obj, 'htf_dema_atr', 0) if strat_obj else 0,
+                "strategy_type": getattr(strat_obj, "strategy_type", "supertrend"),
+                "timeframe": "15m",
+                "separate_stop_loss": False,
+                "supertrend_atr": getattr(supertrend_value, "atr", None),
+                "supertrend_upper": getattr(supertrend_value, "upper", None),
+                "supertrend_lower": getattr(supertrend_value, "lower", None),
             }
             account_dict = {
                 "equity": account.equity if account else 0.0,

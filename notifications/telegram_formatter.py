@@ -29,8 +29,10 @@ def format_new_trade(fill: dict, strategy: dict, account: dict) -> str:
     multiplier = fill.get("multiplier", 1)
     value = price * qty * multiplier
     entry_value = strategy.get("entry_value", value)
-    stop = strategy.get("stop_price", 0)
-    htf_val = strategy.get("htf_dema_atr", 0)
+    is_supertrend = strategy.get("strategy_type", "supertrend") == "supertrend"
+    st_atr = strategy.get("supertrend_atr")
+    st_upper = strategy.get("supertrend_upper")
+    st_lower = strategy.get("supertrend_lower")
     equity = account.get("equity", 0)
     margin = account.get("used_margin", 0)
     mode = fill.get("execution_mode", "PAPER")
@@ -55,22 +57,29 @@ def format_new_trade(fill: dict, strategy: dict, account: dict) -> str:
         account_lines.append(f"<b>Account Equity:</b> {_inr(equity)}")
         account_lines.append(f"<b>Margin Used:</b> {_inr(margin)}")
 
-    return (
-        f"{emoji} <b>NEW TRADE</b>\n\n"
-        f"<b>Instrument:</b> {instrument}\n"
-        f"<b>Strategy:</b> {strategy_id}\n"
-        f"<b>Direction:</b> {direction}\n\n"
-        f"<b>Signal Time:</b> {_ist()}\n"
-        f"<b>Entry Fill:</b> {price:,.0f}\n"
-        f"<b>Quantity:</b> {qty}\n"
-        f"<b>Stop:</b> {stop:,.0f}\n\n"
-        f"<b>Entry Value:</b> {_inr(entry_value)}\n"
-        f"<b>HTF DEMA-ATR:</b> {htf_val:,.0f}\n\n"
-        f"{chr(10).join(account_lines)}\n\n"
-        f"<b>Order ID:</b> {fill.get('order_id', '?')}\n"
-        f"<b>Mode:</b> {mode}\n"
-        f"<b>Timestamp:</b> {_ist()}"
-    )
+    lines = [
+        f"{emoji} <b>NEW TRADE</b>", "",
+        f"<b>Instrument:</b> {instrument}",
+        f"<b>Strategy:</b> {strategy_id}",
+        f"<b>Direction:</b> {direction}", "",
+        f"<b>Signal Time:</b> {_ist()}",
+        f"<b>Entry Fill:</b> {price:,.0f}",
+        f"<b>Quantity:</b> {qty}",
+        f"<b>Entry Value:</b> {_inr(entry_value)}",
+        f"<b>Execution:</b> {strategy.get('timeframe', '15m')} SuperTrend market after candle close",
+        f"<b>Separate SL:</b> {'No' if is_supertrend else 'Not configured'}",
+    ]
+    if st_atr is not None:
+        lines.append(f"<b>SuperTrend ATR:</b> {float(st_atr):,.2f}")
+    if st_upper is not None:
+        lines.append(f"<b>Upper band:</b> {float(st_upper):,.2f}")
+    if st_lower is not None:
+        lines.append(f"<b>Lower band:</b> {float(st_lower):,.2f}")
+    lines.extend(["", *account_lines, "",
+                  f"<b>Order ID:</b> {fill.get('order_id', '?')}",
+                  f"<b>Mode:</b> {mode}",
+                  f"<b>Timestamp:</b> {_ist()}"])
+    return "\n".join(lines)
 
 
 def _account_block(account: dict) -> str:
@@ -117,11 +126,10 @@ def format_signal_alert(signal_data: dict) -> str:
     sig_close = _fmt("signal_candle_close")
     sig_high = _fmt("signal_candle_high")
     sig_low = _fmt("signal_candle_low")
-    sig_htf = _fmt("signal_htf_dema_atr")
-    sig_mid = _fmt("signal_mid_dema_atr")
-    sig_fast = _fmt("signal_fast_dema_atr")
+    st_atr = _fmt("supertrend_atr")
+    st_upper = _fmt("supertrend_upper")
+    st_lower = _fmt("supertrend_lower")
     sig_trigger = _fmt("signal_trigger_price")
-    sig_stop = _fmt("stop_price")
     sig_qty = signal_data.get("quantity")
     sig_mode = signal_data.get("mode")
     signal_ts = signal_data.get("signal_time")
@@ -150,16 +158,14 @@ def format_signal_alert(signal_data: dict) -> str:
         lines.append(f"<b>Low:</b> {sig_low}")
     if sig_trigger is not None:
         lines.append(f"<b>Trigger Level:</b> {sig_trigger}")
-    if sig_stop is not None:
-        lines.append(f"<b>Stop Level:</b> {sig_stop}")
     if sig_qty is not None:
         lines.append(f"<b>Quantity:</b> {sig_qty}")
-    if sig_fast is not None:
-        lines.append(f"<b>Fast DEMA-ATR:</b> {sig_fast}")
-    if sig_htf is not None:
-        lines.append(f"<b>1H DEMA-ATR:</b> {sig_htf}")
-    if sig_mid is not None:
-        lines.append(f"<b>15m DEMA-ATR:</b> {sig_mid}")
+    if st_atr is not None:
+        lines.append(f"<b>SuperTrend ATR:</b> {st_atr}")
+    if st_upper is not None:
+        lines.append(f"<b>SuperTrend upper band:</b> {st_upper}")
+    if st_lower is not None:
+        lines.append(f"<b>SuperTrend lower band:</b> {st_lower}")
 
     lines.append("")
     lines.append(f"<b>— Trade Placement —</b>")
@@ -205,7 +211,7 @@ def format_trade_exit(close_data: dict) -> str:
 
 
 def format_reversal_complete(data: dict) -> str:
-    """Format a broker-confirmed reversal whose new local stop is armed."""
+    """Format a broker-confirmed reversal entry fill."""
     old_side = data.get("old_side", "?")
     new_side = data.get("new_side", data.get("side", "?"))
     instrument = data.get("instrument", "?")
@@ -213,7 +219,6 @@ def format_reversal_complete(data: dict) -> str:
     quantity = data.get("quantity", 0)
     exit_price = data.get("old_exit_fill_price")
     entry_price = data.get("new_entry_fill_price")
-    stop_price = data.get("stop_price")
     lines = [
         "🔄 <b>REVERSAL COMPLETE</b>",
         "",
@@ -226,8 +231,6 @@ def format_reversal_complete(data: dict) -> str:
         lines.append(f"<b>Old Exit Fill:</b> {float(exit_price):,.2f}")
     if entry_price is not None:
         lines.append(f"<b>New Entry Fill:</b> {float(entry_price):,.2f}")
-    if stop_price is not None:
-        lines.append(f"<b>New Local Stop:</b> {float(stop_price):,.2f} (ARMED)")
     if data.get("old_exit_order_id"):
         lines.append(f"<b>Exit Order:</b> {data['old_exit_order_id']}")
     if data.get("new_broker_order_id"):
@@ -245,7 +248,7 @@ def format_risk_alert(alert_data: dict) -> str:
         f"<b>Message:</b> {alert_data.get('message', '')}",
     ]
     # Add extra details if present
-    for field in ['strategy_id', 'instrument', 'side', 'trigger_price', 'stop_price',
+    for field in ['strategy_id', 'instrument', 'side', 'trigger_price',
                   'quantity', 'value', 'limit', 'equity', 'available_margin']:
         val = alert_data.get(field)
         if val is not None and val != '':

@@ -18,6 +18,12 @@ node_modules
 _*.py
 tests
 audit_reports
+backtest_results*/
+backtest_sniper_720m/
+backtest_tv_15m_strategies/
+final_reports/
+output/
+outputs/
 *.log
 *.tmp
 *.bak
@@ -37,9 +43,16 @@ desktop.ini
 # diagnostics contain credentials, so never copy them into a build context.
 /tools/
 /scripts/
+/indicators/dema.py
+/indicators/atr.py
+/indicators/dema_atr.py
+/indicators/shared.py
+/strategies/htf_state.py
+/htf/backtest_style_htf.py
 /p6_*.py
 /live_verify*.py
 /vps_*.py
 /verify_*.py
 /check_*.py
+/verify_live_signals.py
 /deploy_restart.py

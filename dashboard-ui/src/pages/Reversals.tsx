@@ -18,8 +18,6 @@ interface Reversal {
   old_exit_status: string | null;
   old_exit_fill_price: number | null;
   old_exit_filled_quantity: number | null;
-  old_sl_order_id: string | null;
-  old_sl_status: string | null;
   new_trade_id: string | null;
   new_position_id: string | null;
   new_entry_order_id: string | null;
@@ -27,8 +25,6 @@ interface Reversal {
   new_entry_status: string | null;
   new_entry_fill_price: number | null;
   new_entry_filled_quantity: number | null;
-  new_sl_order_id: string | null;
-  new_sl_status: string | null;
   exit_verified_at: string | null;
   entry_fill_confirmed_at: string | null;
   fallback_used: boolean;
@@ -107,7 +103,7 @@ export default function Reversals() {
             LIVE REVERSALS — {data?.execution_mode?.toUpperCase() ?? "LIVE"}
           </div>
           <div style={{ fontSize: "9px", color: "var(--text-muted)", marginTop: "2px" }}>
-            Full 9-step lifecycle: SIGNAL → TRIGGER → OLD EXIT → OLD POSITION FLAT → OLD LOCAL SL CLEARED → NEW ENTRY → NEW FILL → NEW POSITION → NEW LOCAL SL. Broker-linked IDs only; never collapsed into one status.
+            SuperTrend reversal lifecycle: completed opposite flip → Dhan exit → broker confirms flat → opposite market entry → fill and position confirmed. Each broker-linked step is shown separately.
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -168,11 +164,10 @@ export default function Reversals() {
             SOURCE: DATABASE (reversals) · broker IDs: DHAN
           </div>
           {rev.new_entry_order_id?.startsWith("IMPORT-") && <div style={{ marginTop: 6, color: "var(--amber)", fontSize: 11 }}>The opposite entry was placed manually and later imported. This record does not prove automatic reversal entry succeeded.</div>}
-          <div style={{ marginTop: 4, color: "var(--text-muted)", fontSize: 10 }}>Stops are monitored locally; an empty SL order ID means no resting Dhan stop order.</div>
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: "8px", marginTop: "10px" }}>
             <div>
-              <div style={{ fontSize: "8px", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Trigger price</div>
+              <div style={{ fontSize: "8px", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Signal candle close</div>
               <div className="tabular-nums" style={{ fontSize: "14px", fontWeight: 600, color: "var(--amber)" }}>{rev.trigger_price ?? "—"}</div>
             </div>
             <div>
@@ -195,8 +190,6 @@ export default function Reversals() {
                 ["Dhan order ID", rev.old_broker_order_id],
                 ["Exit status", rev.old_exit_status],
                 ["Exit fill", rev.old_exit_fill_price != null ? `${rev.old_exit_fill_price} @ ${rev.old_exit_filled_quantity ?? "—"} qty` : "—"],
-                ["SL order ID", rev.old_sl_order_id],
-                ["SL status", rev.old_sl_status],
                 ["Flat verified", rev.exit_verified_at ? fmtTs(rev.exit_verified_at) : "pending"],
               ].map(([k, v]) => (
                 <div key={String(k)} style={{ display: "flex", justifyContent: "space-between", gap: "8px", fontSize: "9px", padding: "2px 0" }}>
@@ -214,8 +207,6 @@ export default function Reversals() {
                 ["Dhan order ID", rev.new_broker_order_id],
                 ["Entry status", rev.new_entry_status],
                 ["Entry fill", rev.new_entry_fill_price != null ? `${rev.new_entry_fill_price} @ ${rev.new_entry_filled_quantity ?? "—"} qty` : "—"],
-                ["SL order ID", rev.new_sl_order_id],
-                ["SL status", rev.new_sl_status],
                 ["Fill confirmed", rev.entry_fill_confirmed_at ? fmtTs(rev.entry_fill_confirmed_at) : "pending"],
               ].map(([k, v]) => (
                 <div key={String(k)} style={{ display: "flex", justifyContent: "space-between", gap: "8px", fontSize: "9px", padding: "2px 0" }}>

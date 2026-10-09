@@ -59,6 +59,7 @@ class DhanWebSocketClient:
         self._watchdog_interval = 15.0  # how often the stale watchdog fires
 
         self._instruments: dict[str, dict[str, str]] = {}
+        self._instrument_lock = threading.RLock()
         self._stats = {"recv": 0, "parse_err": 0, "sub": 0, "tick": 0}
 
         # Duplicate tick prevention: key = (security_id, ltt, price)
@@ -79,12 +80,46 @@ class DhanWebSocketClient:
 
     def add_instrument(self, symbol: str, security_id: str,
                        exchange_segment: str, instrument: str) -> None:
-        """Register instrument for subscription."""
-        self._instruments[symbol] = {
+        """Register and subscribe an instrument, including on a live socket."""
+        info = {
             "sid": security_id,
             "exch": exchange_segment,
             "inst": instrument,
         }
+        with self._instrument_lock:
+            already_present = any(
+                row.get("sid") == str(security_id)
+                and row.get("exch") == exchange_segment
+                for row in self._instruments.values())
+            self._instruments[symbol] = info
+            ws = self._ws if self._connected else None
+        if ws is not None and not already_present:
+            self._send_instrument_request(ws, 17, [info])
+
+    def remove_instrument(self, symbol: str) -> None:
+        """Unsubscribe an instrument from a live socket and registry."""
+        with self._instrument_lock:
+            info = self._instruments.pop(symbol, None)
+            still_subscribed = bool(info) and any(
+                row.get("sid") == info.get("sid")
+                and row.get("exch") == info.get("exch")
+                for row in self._instruments.values())
+            ws = self._ws if self._connected else None
+        if info and ws is not None and not still_subscribed:
+            self._send_instrument_request(ws, 18, [info])
+
+    @staticmethod
+    def _send_instrument_request(ws: Any, request_code: int,
+                                 instruments: list[dict]) -> None:
+        for i in range(0, len(instruments), 100):
+            batch = instruments[i:i + 100]
+            ws.send(json.dumps({
+                "RequestCode": request_code,
+                "InstrumentCount": len(batch),
+                "InstrumentList": [
+                    {"ExchangeSegment": row["exch"],
+                     "SecurityId": row["sid"]} for row in batch],
+            }))
 
     def connect(self) -> None:
         """Start WebSocket connection in background thread."""
@@ -201,20 +236,18 @@ class DhanWebSocketClient:
         # The cache remains bounded in _on_message.
         if self.on_status:
             self.on_status("connected")
+        with self._instrument_lock:
+            instruments = list(self._instruments.values())
         subs = [
             {"ExchangeSegment": info["exch"], "SecurityId": info["sid"]}
-            for info in self._instruments.values()
+            for info in instruments
         ]
-        for i in range(0, len(subs), 100):
-            batch = subs[i:i + 100]
-            ws.send(json.dumps({
-                "RequestCode": 17,
-                "InstrumentCount": len(batch),
-                "InstrumentList": batch,
-            }))
+        self._send_instrument_request(ws, 17, instruments)
         self._stats["sub"] += 1
         # DEBUG: log which instruments were subscribed
-        sub_details = [(info["sid"], sym) for sym, info in self._instruments.items()]
+        with self._instrument_lock:
+            sub_details = [(info["sid"], sym)
+                           for sym, info in self._instruments.items()]
         print(f"[dhan_ws] subscribed {len(subs)} instruments: {sub_details}", flush=True)
 
     def _on_message(self, ws: Any, message: str | bytes) -> None:

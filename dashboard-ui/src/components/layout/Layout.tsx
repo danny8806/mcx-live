@@ -5,12 +5,12 @@ import TopBar from "./TopBar";
 import { useDataSelector } from "../../store/DataProvider";
 
 const titles: Record<string, [string, string]> = {
-  "/": ["Live desk", "A real-time view of positions, triggers, broker orders, and protection."],
+  "/": ["Live desk", "GOLDM and SILVERM SuperTrend signals, orders, positions, and account state."],
   "/live": ["Live trading", "Instrument prices and active trade lifecycle."], "/live-ops": ["Operations", "Broker connectivity, market data, engine state, and reconciliation."],
-  "/strategies": ["Strategies", "Runtime state, strategy performance, and controls."], "/matrix": ["Strategy matrix", "Compare running strategies and their current state."],
+  "/strategies": ["Strategies", "Two 15-minute SuperTrend profiles and their live execution state."],
   "/positions": ["Positions", "Broker-linked open and closed position records."], "/orders": ["Orders", "Order requests and broker execution outcomes."], "/trades": ["Trade history", "Entry-to-exit trade lifecycle and realized results."],
   "/pnl": ["P&L analytics", "Realized, unrealized, costs, and equity history."], "/risk": ["Risk", "Capital, margin, limits, and current exposure."],
-  "/market-data": ["Market data", "Live instrument prices and feed status."], "/indicators": ["Indicators", "Strategy indicator values and higher-timeframe confirmation."],
+  "/market-data": ["Market data", "Live GOLDM and SILVERM prices and feed status."], "/indicators": ["Indicators", "15-minute SuperTrend bands and completed-candle state."],
   "/reconciliation": ["Reconciliation", "Compare persisted state, runtime state, and broker data."], "/reversals": ["Reversal lifecycle", "Trace old-position exit and opposite-entry processing."],
   "/alerts": ["Alerts", "Runtime events and actionable system warnings."], "/health": ["System health", "Engine, persistence, and service health checks."],
   "/settings": ["Settings", "Runtime strategy gates, quantity, and system configuration."], "/audit": ["Audit history", "Recent configuration and lifecycle events."],

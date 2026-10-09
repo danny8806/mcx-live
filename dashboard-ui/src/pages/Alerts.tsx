@@ -3,7 +3,7 @@ import { useDataSelector } from "../store/DataProvider";
 import { api } from "../lib/api";
 import { formatTimestamp } from "../lib/utils";
 
-const categories = ["ALL", "SIGNAL", "ORDER", "FILL", "POSITION", "SL", "EXIT", "REVERSAL", "RECONCILIATION", "WEBSOCKET", "LTP", "RISK", "SYSTEM", "TELEGRAM", "ERROR", "CRITICAL"];
+const categories = ["ALL", "SIGNAL", "ORDER", "FILL", "POSITION", "EXIT", "REVERSAL", "RECONCILIATION", "WEBSOCKET", "LTP", "RISK", "SYSTEM", "TELEGRAM", "ERROR", "CRITICAL"];
 const deliveries = ["ALL", "SENT", "FAILED", "QUEUED"];
 
 function detailText(row: any): string {

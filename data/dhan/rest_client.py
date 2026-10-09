@@ -667,16 +667,28 @@ class DhanRESTClient:
             with self._stats_lock:
                 self._stats["empty"] += 1
             return []
+        required = ("open", "high", "low", "close")
+        missing = [key for key in required if key not in j]
+        if missing:
+            raise ValueError(f"Dhan candle response missing arrays: {missing}")
+        arrays = [ts, *(j[key] for key in required)]
+        volume = j.get("volume")
+        if volume is None:
+            volume = [0] * len(ts)
+        arrays.append(volume)
+        lengths = {len(values) for values in arrays}
+        if len(lengths) != 1:
+            raise ValueError(
+                "Dhan candle response has mismatched array lengths: "
+                + ", ".join(f"{name}={len(values)}" for name, values in (
+                    ("timestamp", ts), ("open", j["open"]),
+                    ("high", j["high"]), ("low", j["low"]),
+                    ("close", j["close"]), ("volume", volume)))
+            )
         return [
             [t, o, h, l, c, v]
-            for t, o, h, l, c, v in zip(
-                j["timestamp"],
-                j["open"],
-                j["high"],
-                j["low"],
-                j["close"],
-                j.get("volume") or [0] * len(ts),
-            )
+            for t, o, h, l, c, v in zip(ts, j["open"], j["high"],
+                                         j["low"], j["close"], volume)
         ]
 
     def fetch_daily(

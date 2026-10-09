@@ -3,7 +3,7 @@
 The engine owns exactly four StrategyRuntime objects (one per strategy).
 Every piece of mutable per-strategy state lives on the runtime:
 
-    - strategy            StrategyInstance (indicators, HTF state, pending/SL)
+    - strategy            SuperTrend strategy state and indicator
     - lifecycle           TradeLifecycleManager (trade identity ONLY for this strategy)
     - order_manager       OrderManager (pending-signal dedup, active orders, fills slot)
     - position_manager    PositionManager (this strategy's positions)
@@ -25,7 +25,7 @@ class StrategyRuntime:
     """Owns every piece of one strategy's mutable runtime state."""
 
     strategy_id: str
-    strategy: Any = None                # StrategyInstance
+    strategy: Any = None                # SuperTrendStrategyInstance
     lifecycle: Any = None               # TradeLifecycleManager (per-strategy)
     order_manager: Any = None           # OrderManager (per-strategy)
     position_manager: Any = None        # PositionManager (per-strategy)

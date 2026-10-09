@@ -30,7 +30,6 @@ from execution.live.broker_client import (
 from execution.models import Fill, Order, OrderState
 from execution.price_model import (
     ExecutionPricePlan, PricePreset,
-    calculate_long_sl_price, calculate_short_sl_price,
 )
 from strategies.types import Signal, SignalType, resolve_order_role
 
@@ -66,17 +65,12 @@ class LiveExecutionEngine:
         # broker_fill_id -> engine fill_id (idempotency / reconcile map)
         self._broker_fill_map: dict[str, str] = {}
         self.broker_router: Optional[BrokerEventRouter] = None
-        # One LIVE execution plan is always active. No preset means zero
-        # offsets on the standard instrument tick grid, never a MARKET-mode
-        # fallback for ordinary entries.
+        # One completed-candle MARKET execution plan is always active.
         self._price_preset = price_preset or PricePreset()
         self._plans: dict[str, ExecutionPricePlan] = {}
         # §9.5 — price plans are IMMUTABLE PER SIGNAL: the plan computed for a
         # signal_id is stored once and every recompute must equal it exactly.
         self._plan_by_signal: dict[tuple[str, str, str], ExecutionPricePlan] = {}
-        # Tick grid used to round planned LIMIT prices; defaults to 1.0 and is
-        # refined by the PricePreset when one is configured.
-        self._tick_size = float(self._price_preset.tick_size)
         # Installed by TradingEngine. This is the single LIVE submission
         # boundary used by normal orders and recovery orders.
         self.submission_guard = None
@@ -152,14 +146,15 @@ class LiveExecutionEngine:
             trigger_generation=(signal.metadata or {}).get("trigger_generation"),
             trigger_source=(signal.metadata or {}).get("trigger_source"),
         )
+        if (signal.metadata or {}).get("market_on_signal_close"):
+            order.signal_execution_mode = "completed_candle_market"
         if (signal.metadata or {}).get("reversal_parent_signal_id"):
             order.reversal_parent_signal_id = signal.metadata["reversal_parent_signal_id"]
         # §9.4 — the correlation id is minted ONCE at order creation so the
         # signal -> order -> broker -> status -> fill carrier is stable and the
         # same id ends up in WS/REST records and the persisted order row.
         order.correlation_id = f"MCX-{uuid.uuid4().hex[:12]}"
-        # LIVE uses one local-triggered LIMIT entry plan plus system-triggered
-        # exits. PAPER is untouched: only this LIVE engine consults the preset.
+        # Every strategy signal uses the completed-candle MARKET execution plan.
         if self._price_preset is not None:
             plan = self._price_preset.plan_for(signal, order_side)
             # §9.5 — immutability: the first plan for a signal_id is canonical;
@@ -188,12 +183,6 @@ class LiveExecutionEngine:
             order.requested_price = plan.price
             order.planned_order_type = plan.order_type
             order.planned_entry_price = plan.price
-            if plan.kind == "long_entry":
-                order.planned_sl = calculate_long_sl_price(
-                    signal.stop_price, self._price_preset.sl_offset)
-            elif plan.kind == "short_entry":
-                order.planned_sl = calculate_short_sl_price(
-                    signal.stop_price, self._price_preset.sl_offset)
             self._plans[order.order_id] = plan
         self._orders[order.order_id] = order
         if self.broker_router is not None:
@@ -205,19 +194,6 @@ class LiveExecutionEngine:
         return self._plans.get(order_id)
 
     def submit_order(self, order: Order) -> Order:
-        # INVARIANT 10 — a broker-side protective SL no longer exists.  The
-        # only stop-loss is the local position-owned monitor, which mints an
-        # ordinary EXIT order when the tick crosses position.stop_price.  This
-        # check is FIRST and unconditional: no caller, state or plan can get a
-        # protective STOP_LOSS to the broker.
-        role = str(order.order_role or "").upper()
-        if role == "STOP_LOSS" or str(
-                getattr(order, "order_type", "") or "").upper() in (
-                    "STOP_LOSS", "STOP_LOSS_MARKET"):
-            order.state = OrderState.REJECTED
-            order.reason = "BROKER_SL_RETIRED_POSITION_OWNED_SL_ONLY"
-            order.updated_at = self._now()
-            return order
         if order.state != OrderState.CREATED:
             raise ValueError(f"Cannot submit order in state {order.state}")
 
@@ -237,8 +213,13 @@ class LiveExecutionEngine:
         # the originating fired LIMIT has been broker-confirmed cancelled.
         # The watcher preserves the original trigger and order lineage; this
         # gateway still rejects direct/unowned market entry attempts below.
-        if role in {"ENTRY", "REVERSAL_ENTRY"} and str(
-                getattr(order, "order_type", "") or "").upper() != "LIMIT":
+        direct_signal_market = (
+            str(getattr(order, "order_type", "") or "").upper() == "MARKET"
+            and getattr(order, "signal_execution_mode", None)
+                == "completed_candle_market")
+        if (role in {"ENTRY", "REVERSAL_ENTRY"}
+                and str(getattr(order, "order_type", "") or "").upper() != "LIMIT"
+                and not direct_signal_market):
             order.state = OrderState.REJECTED
             order.reason = "LIVE_ENTRY_MUST_BE_LIMIT"
             order.updated_at = self._now()

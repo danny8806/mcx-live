@@ -269,20 +269,18 @@ export default function LiveOps() {
       </Panel>
 
       {/* ── Row 3: Signals ── */}
-      <Panel title="SIGNALS (LIVE)" right={data?.signals && <Age ts={data.signals.latest_at} />}>
-        <div style={{ display: "grid", gridTemplateColumns: "150px 70px 60px 70px 70px 50px 1fr", gap: "8px", ...thStyle }}>
-          <span>Strategy</span><span>Side</span><span>Time</span><span>Trigger</span><span>SL</span><span>Qty</span><span>Reason · Candle</span>
+      <Panel title="COMPLETED-CANDLE SIGNALS" right={data?.signals && <Age ts={data.signals.latest_at} />}>
+        <div style={{ display: "grid", gridTemplateColumns: "140px 65px 75px 60px 1fr", gap: "8px", ...thStyle }}>
+          <span>Strategy</span><span>Side</span><span>Time</span><span>Qty</span><span>Signal candle · execution</span>
         </div>
         {(data?.signals?.signals ?? []).map((s: any) => (
-          <div key={s.signal_id} className="hover-row" style={{ display: "grid", gridTemplateColumns: "150px 70px 60px 70px 70px 50px 1fr", gap: "8px", ...cell, alignItems: "center" }}>
+          <div key={s.signal_id} className="hover-row" style={{ display: "grid", gridTemplateColumns: "140px 65px 75px 60px 1fr", gap: "8px", ...cell, alignItems: "center" }}>
             <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{s.strategy_id}</span>
             <Side side={s.side} />
             <span className="tabular-nums" style={{ color: "var(--text-muted)" }}>{formatTimestamp(secs(s.signal_timestamp) as number)}</span>
-            <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{fmt(s.trigger_price)}</span>
-            <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{fmt(s.stop_price)}</span>
             <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{s.quantity ?? "—"}</span>
             <span style={{ color: "var(--text-muted)", fontSize: "9px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-              {s.signal_reason || ""} · TF {s.timeframe || ""} · candle {s.open != null ? `${fmt(s.open)} ${fmt(s.high)} ${fmt(s.low)} ${fmt(s.close)}` : "—"}
+              {s.signal_reason || "SuperTrend flip"} · 15m candle {s.open != null ? `${fmt(s.open)} / ${fmt(s.high)} / ${fmt(s.low)} / ${fmt(s.close)}` : "—"} · market after close
             </span>
           </div>
         ))}
@@ -331,9 +329,8 @@ export default function LiveOps() {
               <div key={`${r.strategy_id}:${r.instrument}`} className="hover-row" style={{ display: "grid", gridTemplateColumns: "120px 60px 90px 90px 60px", gap: "8px", ...cell, alignItems: "center" }}>
                 <span style={{ color: "var(--text-primary)", fontWeight: 500 }} title={r.instrument}>{r.strategy_id}<span style={{ display: "block", fontSize: "8px", color: "var(--text-disabled)" }}>{r.instrument}</span></span>
                 <span style={{ color: col, fontWeight: 600, fontSize: "9px" }}>{r.status}</span>
-                <span className="tabular-nums" style={{ color: "var(--text-secondary)", fontSize: "9px" }}>
+                  <span className="tabular-nums" style={{ color: "var(--text-secondary)", fontSize: "9px" }}>
                   {r.local ? `${r.local.side || ""} ${r.local.quantity} @${fmt(r.local.average_entry_price)}` : "—"}
-                  <span style={{ color: "var(--text-disabled)" }}>{r.local?.sl_state ? ` · sl ${r.local.sl_state}` : ""}</span>
                 </span>
                 <span className="tabular-nums" style={{ color: "var(--amber)", fontSize: "9px" }}>
                   {r.dhan ? `${r.dhan.side || ""} ${r.dhan.quantity} @${fmt(r.dhan.average_entry_price)}` : "—"}

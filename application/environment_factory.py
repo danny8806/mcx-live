@@ -14,9 +14,8 @@ from core.environments import Environment
 from events.bus import EventBus
 from data.native_streams import NativeCandleDistributor
 from data.native_router import NativeCandleRouter
-from strategies.gold import create_gold_5m, create_gold_15m
-from strategies.silver import create_silver_5m, create_silver_15m
-from indicators.shared import SharedNativeIndicatorEngine
+from strategies.gold import create_gold_15m
+from strategies.silver import create_silver_15m
 from execution.broker_router import BrokerEventRouter
 from execution.fee_model import MCXFeeModel
 from execution.order_manager import OrderManager, OrderManagerFacade
@@ -32,22 +31,136 @@ from execution.live.ownership import validate_live_order_ownership
 log = logging.getLogger(__name__)
 
 STRATEGY_FACTORIES = {
-    "gold_01": create_gold_5m,
     "gold_02": create_gold_15m,
-    "gold_03": lambda **kw: create_gold_5m(strategy_id="gold_03", **kw),
-    "gold_04": lambda **kw: create_gold_5m(strategy_id="gold_04", **kw),
     "silver_01": create_silver_15m,
-    "silver_02": create_silver_5m,
-    "silver_03": lambda **kw: create_silver_5m(strategy_id="silver_03", **kw),
-    "silver_04": lambda **kw: create_silver_5m(strategy_id="silver_04", **kw),
+}
+
+# This application has exactly two production profiles. Configuration can tune
+# their SuperTrend parameters and quantities, but cannot add a profile or feed.
+EXCLUSIVE_STRATEGY_CONTRACT = {
+    "gold_02": {"strategy_type": "supertrend", "instrument": "GOLDM",
+                "timeframe": "15m"},
+    "silver_01": {"strategy_type": "supertrend", "instrument": "SILVERM",
+                  "timeframe": "15m"},
 }
 
 class EnvironmentFactoryMixin:
     """Build isolated environment infrastructure and wire dependencies."""
 
+    def _runtime_instrument_configs(self) -> dict:
+        """Resolve the only instruments the exclusive runtime may subscribe to."""
+        configured = self.config.get("instruments", {}) or {}
+        policy = self.config.get("strategy_runtime", {}) or {}
+        if not policy.get("exclusive"):
+            return dict(configured)
+        allowlist = policy.get("allowlist", {}) or {}
+        if set(allowlist) != set(EXCLUSIVE_STRATEGY_CONTRACT):
+            raise RuntimeError(
+                "STRATEGY_RUNTIME_ALLOWLIST_MISMATCH: exclusive LIVE must allow "
+                "exactly gold_02 and silver_01")
+        instruments = {}
+        for strategy_id, expected in EXCLUSIVE_STRATEGY_CONTRACT.items():
+            allowed = allowlist.get(strategy_id) or {}
+            cfg = (self.config.get("strategies", {}) or {}).get(strategy_id) or {}
+            timeframe = cfg.get("signal_timeframe", "15m")
+            if any(allowed.get(key) != value for key, value in expected.items()):
+                raise RuntimeError(
+                    f"STRATEGY_RUNTIME_ALLOWLIST_MISMATCH: {strategy_id} must be "
+                    f"{expected}")
+            if (cfg.get("instrument") != expected["instrument"]
+                    or cfg.get("strategy_type") != expected["strategy_type"]
+                    or timeframe != expected["timeframe"]):
+                raise RuntimeError(
+                    f"STRATEGY_RUNTIME_POLICY_MISMATCH: {strategy_id} config must "
+                    f"match {expected}")
+            if cfg.get("strategy_type") == "disabled":
+                raise RuntimeError(
+                    f"STRATEGY_RUNTIME_DISABLED: required profile {strategy_id} "
+                    "cannot be removed from the exclusive runtime")
+            if not cfg.get("enabled", True):
+                raise RuntimeError(
+                    f"STRATEGY_RUNTIME_DISABLED: {strategy_id} must remain "
+                    "constructed; pause entries with its strategy gate")
+            instrument = expected["instrument"]
+            if instrument not in configured:
+                raise RuntimeError(
+                    f"STRATEGY_RUNTIME_INSTRUMENT_MISSING: {instrument}")
+            instruments[instrument] = configured[instrument]
+        return instruments
+
+    def _scope_live_candles_to_runtime(self, env: Environment) -> None:
+        """Fetch strategy candles only for active profiles, plus open positions.
+
+        Keeping open-position instruments in scope preserves candle-based
+        protection/reconciliation data for positions that predate a strategy
+        profile change. Idle instruments without a strategy or position do not
+        consume Dhan candle requests.
+        """
+        fetcher = getattr(env, "candle_fetcher", None)
+        policy = self.config.get("strategy_runtime", {}) or {}
+        if fetcher is None or not policy.get("exclusive"):
+            return
+
+        needed = {
+            str(strategy.instrument)
+            for strategy in (getattr(env, "strategies", {}) or {}).values()
+            if getattr(strategy, "enabled", True)
+        }
+        for candidate in getattr(self, "_envs", {}).values():
+            manager = getattr(candidate, "position_manager", None)
+            for position in getattr(manager, "open_positions", ()):
+                if getattr(position, "is_open", False):
+                    instrument = getattr(position, "instrument", None)
+                    if instrument:
+                        needed.add(str(instrument))
+
+        # The live feed itself is restricted to the two approved instruments.
+        # Historical orphan positions remain visible in account reconciliation,
+        # but cannot silently add a third candle/tick subscription.
+        adapter = getattr(env, "data_adapter", None)
+        registered = set(getattr(adapter, "_instruments", {}) or {})
+        if registered:
+            needed.intersection_update(registered)
+
+        configured = self.config.get("instruments", {}) or {}
+        fetcher.instruments = {name: cfg for name, cfg in configured.items()
+                               if name in needed}
+        log.info("[Engine] exclusive live candle scope: %s (%s)",
+                 env.name, sorted(fetcher.instruments))
+
+    def _configured_candle_timeframes(self, env_name: str) -> list[str]:
+        """This application consumes completed native 15-minute candles only."""
+        configured = self.config.get("strategies", {}) or {}
+        runtime_policy = self.config.get("strategy_runtime", {}) or {}
+        allowlist = runtime_policy.get("allowlist", {}) or {}
+        exclusive = bool(runtime_policy.get("exclusive", False))
+        env_overrides = ((self.config.get(env_name, {}) or {}).get("strategies")
+                         or {})
+        result = []
+        for strategy_id, cfg in configured.items():
+            if exclusive and strategy_id not in allowlist:
+                continue
+            if not isinstance(cfg, dict) or not cfg.get("enabled", True):
+                continue
+            override = env_overrides.get(strategy_id)
+            if isinstance(override, dict) and not override.get("enabled", True):
+                continue
+            if cfg.get("strategy_type") == "disabled":
+                continue
+            if cfg.get("strategy_type") == "supertrend":
+                result.append("15m")
+        return ["15m"]
+
     def _init_market_status(self) -> None:
         self.market_status = MarketStatus()
     def _init_data_adapter(self) -> None:
+        # A LIVE-only engine builds its Dhan adapter inside the LIVE
+        # environment below. Creating the shared/PAPER adapter here would
+        # start a second token-renewal scheduler which is never connected or
+        # shut down by that runtime.
+        if getattr(self, "_live_only", False):
+            self.data_adapter = None
+            return
         dhan_config = self.config.get("dhan")
         self.data_adapter = DhanDataAdapter(
             client_id=dhan_config["client_id"],
@@ -57,36 +170,26 @@ class EnvironmentFactoryMixin:
             on_tick=self._on_tick,
             on_status=self._on_status,
         )
-        instruments = self.config.get("instruments", {})
+        instruments = self._runtime_instrument_configs()
         self.data_adapter.register_instruments(instruments)
     def _init_indicator_engines(self) -> None:
-        """Backward-compat: build the shared EventBus + candle distributor +
-        indicator engine surface for legacy ``__new__``-constructed engines.
-
-        The full ``__init__`` path already builds these before reaching here
-        (guards are therefore no-ops there); the guards purely re-create them
-        for the crash-replay harness that wires the engine via `__new__` +
-        _init_* calls and never runs __init__."""
+        """Create candle infrastructure; each profile owns SuperTrend state."""
         if not hasattr(self, "event_bus") or self.event_bus is None:
             self.event_bus = EventBus()
         if not hasattr(self, "candle_distributor") or self.candle_distributor is None:
             self.candle_distributor = NativeCandleDistributor(self.event_bus)
-        if not hasattr(self, "indicator_engine") or self.indicator_engine is None:
-            indicator_cfg = self.config.get("indicators", {})
-            self.indicator_engine = SharedNativeIndicatorEngine(
-                dema_period=indicator_cfg.get("dema_period", 3),
-                atr_period=indicator_cfg.get("atr_period", 6),
-                atr_factor=indicator_cfg.get("atr_factor", 1.0),
-            )
+        self.indicator_engine = None
         self.indicators: dict[str, Any] = {}
-    def _init_htf_engine(self) -> None:
-        """No longer needed — HTF state is per-strategy. Kept as no-op for compat."""
-        self.htf_engine: Any = type("_FakeHTF", (), {"_engines": {}, "on_htf_bar_closed": lambda s, b: None, "map_to_fast_bar": lambda s, b, t: None, "map_mid_to_fast_bar": lambda s, b, t: None})()
     def _init_candle_fetcher(self) -> None:
         """Initialize CandleFetcher and wire to EventBus via NativeCandleRouter
         -> NativeCandleDistributor."""
+        # LIVE-only builds its candle fetcher with the environment-owned
+        # adapter in _build_env_data_infra; don't create an unused shared one.
+        if getattr(self, "_live_only", False):
+            self.candle_fetcher = None
+            return
         from core.candle_fetcher import CandleFetcher
-        instruments = self.config.get("instruments", {})
+        instruments = self._runtime_instrument_configs()
         first_inst = list(instruments.values())[0] if instruments else {}
         session_open = first_inst.get("session_open", "09:00")
         session_close = first_inst.get("session_close", "23:30")
@@ -102,6 +205,7 @@ class EnvironmentFactoryMixin:
             session_open=session_open,
             session_close=session_close,
             market_status=self.market_status,
+            timeframes=self._configured_candle_timeframes("paper"),
         )
     def _init_timeframe_engine(self) -> None:
         """Initialize the REST CandleFetcher as the strategy candle source.
@@ -113,9 +217,9 @@ class EnvironmentFactoryMixin:
     def _build_env_data_infra(self, env: Environment) -> None:
         """Create fully independent data infrastructure for a LIVE environment.
 
-        Each LIVE env gets its own: DhanDataAdapter, EventBus,
+        Each LIVE env gets its own DhanDataAdapter, EventBus,
         NativeCandleDistributor, NativeCandleRouter, CandleFetcher,
-        SharedNativeIndicatorEngine, MarketStatus, and SafeModeManager.
+        MarketStatus, and SafeModeManager.
 
         PAPER environments use the shared engine-level instances (no-op here).
         """
@@ -129,8 +233,7 @@ class EnvironmentFactoryMixin:
         # Resolve LIVE data config — fall back to global dhan config
         live_cfg = self.config.get("live", {})
         dhan_cfg = live_cfg.get("dhan") or self.config.get("dhan", {})
-        instruments = self.config.get("instruments", {})
-        indicator_cfg = self.config.get("indicators", {})
+        instruments = self._runtime_instrument_configs()
 
         # Per-env EventBus
         env.event_bus = EventBus()
@@ -145,11 +248,7 @@ class EnvironmentFactoryMixin:
         )
 
         # Per-env IndicatorEngine
-        env.indicator_engine = SharedNativeIndicatorEngine(
-            dema_period=indicator_cfg.get("dema_period", 3),
-            atr_period=indicator_cfg.get("atr_period", 6),
-            atr_factor=indicator_cfg.get("atr_factor", 1.0),
-        )
+        env.indicator_engine = None
 
         # Per-env MarketStatus + SafeMode
         env.market_status = EnvMarketStatus(self.market_status)
@@ -178,21 +277,7 @@ class EnvironmentFactoryMixin:
             session_open = first_inst.get("session_open", "09:00")
             session_close = first_inst.get("session_close", "23:30")
 
-            # A completed REST candle is the stop's safety net. Dhan's MCX tick
-            # feed is allowed to go silent while REST keeps flowing, and the
-            # local stop is invisible in the order book — so without this a dead
-            # tick feed silently strips every position of its protection. This
-            # runs BEFORE the candle reaches any strategy, so a stop breach
-            # always wins over a signal from the same candle.
             def on_candle_closed(bar, _router=env.candle_router):
-                try:
-                    self._evaluate_positions_from_candle(None, bar)
-                except Exception as e:
-                    log.error("[Engine] candle SL evaluation failed: %s", e)
-                try:
-                    self._report_sl_protection_gaps()
-                except Exception as e:
-                    log.error("[Engine] SL protection gap report failed: %s", e)
                 _router.on_candle_closed(bar)
 
             env.candle_fetcher = CandleFetcher(
@@ -202,6 +287,7 @@ class EnvironmentFactoryMixin:
                 session_open=session_open,
                 session_close=session_close,
                 market_status=env.market_status,
+                timeframes=self._configured_candle_timeframes(env.name),
             )
             log.info("[Engine] LIVE env data infra: separate Dhan adapter + "
                      "EventBus + candle pipeline + indicators + market status")
@@ -244,10 +330,8 @@ class EnvironmentFactoryMixin:
                 last_tick_time=(ws._last_tick_time if ws else 0.0),
             )
 
-            # Per-instrument tick freshness. The local stop-loss is evaluated ONLY
-            # on a live tick and Dhan places no broker-side protective order, so a
-            # silent feed leaves every open position UNPROTECTED. Record freshness
-            # here, then refuse to let an untrusted price drive the stop.
+            # Track feed freshness and refuse stale prices for marks and order
+            # recovery. SuperTrend decisions themselves use completed 15m bars.
             health = getattr(self, "market_data_health", None)
             if health is not None:
                 if valid_ltp and (ws is None or ws_connected):
@@ -268,40 +352,6 @@ class EnvironmentFactoryMixin:
                                 pos.update_mark(ltp)
                     except Exception:
                         pass
-
-                    # Resting LIMIT entries need continuous LTP to evaluate
-                    # skip/cancel/fallback; without it the watcher's
-                    # trigger_crossed latch can never set.
-                    watcher = getattr(env, "order_watcher", None)
-                    if watcher is not None:
-                        try:
-                            watcher.feed_market(instrument, ltp)
-                        except Exception as e:
-                            log.warning("[SL] order watcher feed_market failed for %s: %s",
-                                        instrument, e)
-
-                # ── Position-owned SL evaluation ──────────────────────────
-                # The ONLY stop-loss path. Each position is evaluated against
-                # ITS OWN stop by THIS env's monitor; no strategy and no other
-                # strategy's position can influence the decision. The stop is
-                # local — Dhan carries no protective order for it.
-                try:
-                    positions = env.position_manager.get_positions_by_instrument(
-                        instrument)
-                except Exception:
-                    positions = []
-                for pos in positions:
-                    if not getattr(pos, "is_open", False):
-                        continue
-                    if not valid_ltp:
-                        continue
-                    try:
-                        self._evaluate_position_sl(
-                            env, pos, ltp, env_name=getattr(env, "name", None))
-                    except Exception as e:
-                        log.error("[Engine] SL evaluation failed for %s/%s: %s",
-                                  getattr(pos, "strategy_id", "?"),
-                                  getattr(pos, "position_id", "?"), e)
 
                 event = TickEvent(
                     instrument=instrument, ltp=float(ltp) if valid_ltp else 0.0,
@@ -343,8 +393,7 @@ class EnvironmentFactoryMixin:
             self._build_strategies_for_env(env)
             self.strategies = env.strategies
     def _build_strategies_for_env(self, env: Environment) -> None:
-        """Create one isolated StrategyInstance set per environment and wire
-        the indicator streams + event topics.
+        """Create the two isolated SuperTrend profiles and wire candle events.
 
         Each environment uses its OWN event_bus and indicator engine:
         - PAPER: the engine-level shared instances (backward-compatible)
@@ -357,19 +406,31 @@ class EnvironmentFactoryMixin:
         env.strategies = {}
         strategies_config = self.config.get("strategies", {})
         instruments_config = self.config.get("instruments", {})
+        runtime_policy = self.config.get("strategy_runtime", {}) or {}
+        if env.is_live and not runtime_policy.get("exclusive"):
+            raise RuntimeError(
+                "STRATEGY_RUNTIME_POLICY_REQUIRED: LIVE requires the exclusive "
+                "GOLDM/SILVERM 15m SuperTrend policy")
         env_cfg = self.config.get(env.name) or {}
         env_strats_cfg = env_cfg.get("strategies", {}) or {}
 
-        # Resolve the event_bus and indicator_engine to use for this env.
-        # PAPER uses the engine-level shared instances; LIVE uses its own.
+        # SuperTrend owns its indicator state; the event bus only transports
+        # completed native candles and lifecycle events.
         event_bus = env.event_bus if env.event_bus is not None else getattr(
             self, "event_bus", None)
-        indicator_engine = env.indicator_engine if env.indicator_engine is not None else getattr(
-            self, "indicator_engine", None)
+        indicator_engine = None
 
         for strat_name, strat_config in strategies_config.items():
+            allowlist = runtime_policy.get("allowlist", {}) or {}
+            if runtime_policy.get("exclusive") and strat_name not in allowlist:
+                log.info("[Engine] strategy excluded by exclusive runtime policy: %s",
+                         strat_name)
+                continue
             if not strat_config.get("enabled", True):
                 continue
+            if strat_config.get("strategy_type") != "supertrend":
+                raise RuntimeError(
+                    f"STRATEGY_TYPE_RETIRED: {strat_name} must use SuperTrend")
             # Optional per-env override: env.<name>.strategies.<id>.enabled
             over = env_strats_cfg.get(strat_name)
             if isinstance(over, dict) and over.get("enabled", True) is False:
@@ -380,8 +441,28 @@ class EnvironmentFactoryMixin:
                 continue
 
             instrument = strat_config.get("instrument", "GOLDM")
+            expected_profile = EXCLUSIVE_STRATEGY_CONTRACT.get(strat_name)
+            if expected_profile is None:
+                raise RuntimeError(
+                    f"STRATEGY_ID_RETIRED: {strat_name} is not an active profile")
+            configured_timeframe = strat_config.get("signal_timeframe", "15m")
+            if (instrument != expected_profile["instrument"]
+                    or strat_config.get("strategy_type") != "supertrend"
+                    or configured_timeframe != "15m"):
+                raise RuntimeError(
+                    f"STRATEGY_RUNTIME_POLICY_MISMATCH: {strat_name} must match "
+                    f"{expected_profile}")
+            if runtime_policy.get("exclusive"):
+                allowed = allowlist[strat_name]
+                if (strat_config.get("instrument") != allowed.get("instrument")
+                        or strat_config.get("strategy_type") != allowed.get("strategy_type")
+                        or configured_timeframe != allowed.get("timeframe")):
+                    raise RuntimeError(
+                        "STRATEGY_RUNTIME_POLICY_MISMATCH: "
+                        f"{strat_name} config must match its exclusive runtime "
+                        f"allowlist ({allowed})")
             inst_cfg = instruments_config.get(instrument, {})
-            strategy = factory(
+            strategy_kwargs = dict(
                 strategy_id=strat_name,
                 instrument=instrument,
                 quantity=strat_config.get("quantity", 1),
@@ -389,32 +470,26 @@ class EnvironmentFactoryMixin:
                 multiplier=inst_cfg.get("multiplier", 10.0),
                 security_id=str(inst_cfg.get("security_id", "") or ""),
             )
-            strategy.reversal_entry_gap_points = int(
-                ((self.config.get("live") or {}).get("reversal") or {}).get("entry_gap_points", 0))
-            # Fail FAST at startup, not mid-reversal: a non-positive gap makes
-            # the opposite entry trigger land at or behind the exit trigger, so
-            # the new position could open before the old one is flat.
-            if strategy.reversal_entry_gap_points <= 0:
-                raise ValueError(
-                    f"REVERSAL_GAP_INVALID: strategy {strat_name!r} has "
-                    f"live.reversal.entry_gap_points="
-                    f"{strategy.reversal_entry_gap_points}; it must be >= 1 so "
-                    f"the reversal entry trigger sits strictly beyond the exit")
+            strategy_kwargs["strategy_type"] = strat_config.get("strategy_type", "supertrend")
+            if strategy_kwargs["strategy_type"] == "supertrend":
+                strategy_kwargs["supertrend"] = strat_config.get("supertrend", {})
+            strategy = factory(**strategy_kwargs)
             env.strategies[strat_name] = strategy
 
-            # Bind this strategy's indicator slots to the environment's
-            # indicator engine so each (security_id, timeframe) DEMA-ATR
-            # is computed once within this env.
+            # Each SuperTrend profile calculates its own ATR and bands.
             strategy.bind_shared_indicators(indicator_engine)
 
             # Subscribe to candle events (env-aware handler -> env signal path)
+            strategy_handlers = []
             for sub in strategy.subscriptions:
+                topic = f"candle:{sub}"
+                callback = self._make_candle_handler(strategy, env.name)
                 event_bus.subscribe(
-                    f"candle:{sub}", self._make_candle_handler(strategy, env.name))
-            # Subscribe to tick events for pending/SL
-            tick_topic = f"tick:{instrument}"
-            event_bus.subscribe(
-                tick_topic, self._make_tick_handler(strategy, env.name))
+                    topic, callback)
+                strategy_handlers.append((topic, callback))
+            if not hasattr(env, "strategy_handlers"):
+                env.strategy_handlers = {}
+            env.strategy_handlers[strat_name] = strategy_handlers
     def _init_execution(self) -> None:
         """Backward-compat: rebuild the PAPER environment's execution."""
         env = self._legacy_paper_env()
@@ -465,22 +540,17 @@ class EnvironmentFactoryMixin:
         env.broker_router = BrokerEventRouter(persistence=None)
         env.execution_engine.broker_router = env.broker_router
     def _build_price_preset(self, live_cfg: dict):
-        """Build the one LIVE limit plan, using zero offsets by default."""
-        pm = live_cfg.get("price_model") or {}
+        """Build the fixed SuperTrend market-at-close execution plan."""
         from execution.price_model import PricePreset
-        tick_size = float(pm.get("tick_size") or 1.0)
-        if tick_size <= 0:
-            tick_size = 1.0
-        return PricePreset(
-            entry_offset=float(pm.get("entry_offset", 0.0)),
-            sl_offset=float(pm.get("sl_offset", 0.0)),
-            tick_size=tick_size,
-        )
+        return PricePreset()
     def _validate_live_order_ownership(self, env, order) -> Optional[str]:
-        """Fail-closed strategy, trigger, and position checks at Dhan boundary."""
+        """Fail-closed strategy, execution-model, and position checks at Dhan."""
         reason = validate_live_order_ownership(env, order)
         if reason:
             return reason
+        order_type = str(getattr(order, "order_type", "") or "").upper()
+        if order_type != "MARKET":
+            return "SUPERTREND_MARKET_ONLY"
         role = str(getattr(order, "order_role", "") or "").upper()
         if role in {"EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"}:
             reason = self._validate_broker_position_for_exit(env, order)
@@ -499,9 +569,7 @@ class EnvironmentFactoryMixin:
             gate = self._gate_for(order.strategy_id)
             if not gate.entries_allowed:
                 return "STRATEGY_ENTRY_GATE_CLOSED"
-            # A reversal-entry LIMIT is relabeled FALLBACK_MARKET only after
-            # its own broker-confirmed cancel. Preserve its reversal intent so
-            # the recovery MARKET cannot bypass a reversal-gate shutdown.
+            # Preserve reversal intent when applying its entry gate.
             is_reversal_intent = (
                 role == "REVERSAL_ENTRY"
                 or (role == "FALLBACK_MARKET" and bool(
@@ -623,13 +691,17 @@ class EnvironmentFactoryMixin:
         from execution.live.dhan_transport import DhanRestTransport
         instruments: dict = {}
         instrument_strategies: dict[str, list] = {}
-        for name, inst_cfg in self.config.get("instruments", {}).items():
+        for name, inst_cfg in self._runtime_instrument_configs().items():
             instruments[name] = {
                 "security_id": inst_cfg.get("security_id", ""),
                 "exchange_segment": inst_cfg.get("exchange_segment", "MCX_COMM"),
                 "symbol": inst_cfg.get("symbol", ""),
             }
         for sid, strat_cfg in self.config.get("strategies", {}).items():
+            runtime_policy = self.config.get("strategy_runtime", {}) or {}
+            allowlist = runtime_policy.get("allowlist", {}) or {}
+            if runtime_policy.get("exclusive") and sid not in allowlist:
+                continue
             inst = strat_cfg.get("instrument")
             if inst:
                 instrument_strategies.setdefault(inst, []).append(sid)
@@ -741,7 +813,9 @@ class EnvironmentFactoryMixin:
             from persistence.alert_ledger import AlertEventLedger
             from config import Config
             ledger_path = Config.resolve_path(self.config.get(
-                "system", {}).get("live_db_path", "live/data/db/live_trading.db"))
+                "system", {}).get(
+                    "live_db_path",
+                    "live/data/db/supertrend/supertrend_live.sqlite3"))
             ledger = AlertEventLedger(db_path=str(ledger_path))
         except Exception as e:
             log.warning("Telegram alert ledger disabled: %s", e)
@@ -794,7 +868,7 @@ class EnvironmentFactoryMixin:
                     log.error(
                         "[Engine] %s strategy %s trade-restore FAILED — the "
                         "engine stands READY over un-restored open state; "
-                        "the broker-authoritative SL sync is the safety net",
+                        "broker-authoritative position reconciliation is required",
                         env.name, sid)
             order_manager = OrderManager(execution_engine=env.execution_engine)
             position_manager = PositionManager()
@@ -815,10 +889,8 @@ class EnvironmentFactoryMixin:
         # them so boot audits / dashboards still find 'engine.indicators'.
         env.indicators = {}
         for sid, strategy in env.strategies.items():
-            env.indicators[f"{sid}_fast"] = strategy.fast_indicator
-            env.indicators[f"{sid}_mid"] = getattr(
-                strategy, "mid_indicator", strategy.mid_htf_state)
-            env.indicators[f"{sid}_slow"] = strategy.slow_htf_state
+            if getattr(strategy, "strategy_type", None) == "supertrend":
+                env.indicators[f"{sid}_supertrend"] = strategy.supertrend
     def _runtime(self, strategy_id: str) -> StrategyRuntime:
         """Resolve the isolated runtime (PAPER env) for a strategy (authoritative)."""
         return self.runtimes.require(strategy_id)

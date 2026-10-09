@@ -2,214 +2,96 @@ import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { useDataSelector } from "../store/DataProvider";
 
-type StrategyDraft = {
-  quantity: number;
-  live_gate: string;
-  entry_enabled: boolean;
-  exit_enabled: boolean;
-  reversal_enabled: boolean;
-  sl_enabled: boolean;
-  close_only: boolean;
-};
+type Params = { atr_period: number; multiplier: number; source: string; atr_method: string };
+type Draft = { quantity: number; live_gate: string; entry_enabled: boolean; reversal_enabled: boolean; supertrend: Params };
 
-const gateLabels: Record<string, string> = {
-  ON: "ON — entries and exits allowed",
-  OFF: "OFF — entries blocked",
-  CLOSE_ONLY: "CLOSE ONLY — manage exits, block new entries",
-  EMERGENCY_STOP: "EMERGENCY STOP — block entries, keep risk exits",
-  LOCKED: "LOCKED — block all strategy actions",
-};
-
-const rowStyle: React.CSSProperties = {
-  display: "flex", alignItems: "center", justifyContent: "space-between",
-  gap: "10px", padding: "7px 0", borderBottom: "1px solid var(--border-subtle)",
-  fontSize: "10px",
-};
-
-const hiddenSetting = /token|secret|password|credential|api.?key|db.?path|state.?path|file.?path/i;
-function settingLabel(value: string) {
-  return value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-function displaySetting(value: unknown): string {
-  if (typeof value === "boolean") return value ? "Enabled" : "Disabled";
-  if (value === null || value === undefined || value === "") return "Not set";
-  if (typeof value === "object") return "See details";
-  return String(value);
-}
-
-function initialDrafts(settings: any): Record<string, StrategyDraft> {
-  const result: Record<string, StrategyDraft> = {};
-  for (const [id, cfg] of Object.entries<any>(settings?.strategies ?? {})) {
-    const gate = settings?.strategy_gates?.[id] ?? cfg;
-    result[id] = {
-      quantity: Number(cfg.quantity ?? 1),
-      live_gate: String(gate.live_gate ?? "ON").toUpperCase(),
-      entry_enabled: Boolean(gate.entry_enabled ?? true),
-      exit_enabled: Boolean(gate.exit_enabled ?? true),
-      reversal_enabled: Boolean(gate.reversal_enabled ?? true),
-      sl_enabled: Boolean(gate.sl_enabled ?? true),
-      close_only: Boolean(gate.close_only ?? false),
-    };
-  }
-  return result;
-}
+const defaults = (cfg: any, gate: any): Draft => ({
+  quantity: Number(cfg.quantity ?? 1),
+  live_gate: String(gate.live_gate ?? "ON").toUpperCase(),
+  entry_enabled: Boolean(gate.entry_enabled ?? true),
+  reversal_enabled: Boolean(gate.reversal_enabled ?? true),
+  supertrend: {
+    atr_period: Number(cfg.supertrend?.atr_period ?? 10),
+    multiplier: Number(cfg.supertrend?.multiplier ?? 3),
+    source: String(cfg.supertrend?.source ?? "hl2"),
+    atr_method: String(cfg.supertrend?.atr_method ?? "sma_tr"),
+  },
+});
 
 export default function Settings() {
-  const settings = useDataSelector<any>((s) => s.settings);
-  const runtimeStrategies = useDataSelector<any[]>((s) => s.strategies);
-  const runtimeConfirmed = runtimeStrategies.length > 0;
-  const refresh = useDataSelector<(key?: string) => void>((s) => s.refresh);
-  const [drafts, setDrafts] = useState<Record<string, StrategyDraft>>({});
+  const settings = useDataSelector<any>((state) => state.settings);
+  const strategies = useDataSelector<any[]>((state) => state.strategies);
+  const refresh = useDataSelector<(key?: string) => void>((state) => state.refresh);
+  const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [saving, setSaving] = useState<string | null>(null);
   const [messages, setMessages] = useState<Record<string, { ok: boolean; text: string }>>({});
 
-  useEffect(() => setDrafts(initialDrafts(settings)), [settings]);
+  useEffect(() => {
+    const next: Record<string, Draft> = {};
+    for (const [id, cfg] of Object.entries<any>(settings?.strategies ?? {})) {
+      if (cfg.strategy_type !== "supertrend") continue;
+      next[id] = defaults(cfg, settings?.strategy_gates?.[id] ?? cfg);
+    }
+    setDrafts(next);
+  }, [settings]);
 
-  if (!settings || Object.keys(settings).length === 0) return (
-    <div style={{ padding: "20px", color: "var(--text-muted)" }}>
-      <div className="skeleton" style={{ width: "300px", height: "140px", marginBottom: "10px" }} />
-      <div className="skeleton" style={{ width: "300px", height: "140px" }} />
-      <div style={{ fontSize: "11px", marginTop: "8px" }}>Loading settings...</div>
-    </div>
-  );
+  if (!settings) return <div className="settings-empty">Loading strategy settings…</div>;
+  const isLive = Boolean(settings.system?.live_enabled);
+  const profiles = Object.entries<any>(settings.strategies ?? {}).filter(([, config]) => config.strategy_type === "supertrend");
+  const runtimeIds = new Set(strategies.map((strategy: any) => strategy.strategy_id));
 
-  const isLive = !!settings?.system?.live_enabled;
-  const sections = [
-    { key: "system", label: "System" },
-    { key: "instruments", label: "Instruments" },
-    { key: "indicators", label: "Indicators" },
-    { key: "risk", label: "Risk" },
-    { key: "account", label: "Account" },
-    ...(!isLive ? [{ key: "paper_execution", label: "Paper Execution" }] : []),
-  ];
-
-  const updateDraft = (id: string, patch: Partial<StrategyDraft>) => {
-    setDrafts((previous) => ({
-      ...previous,
-      [id]: { ...previous[id], ...patch },
-    }));
-    setMessages((previous) => ({ ...previous, [id]: { ok: true, text: "" } }));
-  };
-
-  const saveStrategy = async (id: string) => {
+  const save = async (id: string) => {
     const draft = drafts[id];
-    const configured = settings.strategies?.[id] ?? {};
-    const currentGate = settings.strategy_gates?.[id] ?? configured;
-    const isOpeningEntries = draft.live_gate === "ON" && draft.entry_enabled
-      && !(currentGate.live_gate === "ON" && currentGate.entry_enabled);
-    const isIncreasingQuantity = draft.quantity > Number(configured.quantity ?? 1);
-    if (isLive && (isOpeningEntries || isIncreasingQuantity)
-        && !window.confirm("This change can increase or enable future LIVE orders sent to Dhan. Save it?")) {
-      return;
-    }
-    setSaving(id);
-    setMessages((previous) => ({ ...previous, [id]: { ok: true, text: "Saving…" } }));
+    const config = settings.strategies[id];
+    if (!draft) return;
+    const configuredParams = config.supertrend ?? {};
+    const paramsChanged = (Object.keys(draft.supertrend) as (keyof Params)[]).some(
+      (key) => draft.supertrend[key] !== configuredParams[key],
+    );
+    const openingEntries = draft.live_gate === "ON" && draft.entry_enabled && !settings.strategy_gates?.[id]?.entry_enabled;
+    const increasingQuantity = draft.quantity > Number(config.quantity ?? 1);
+    if (isLive && (openingEntries || increasingQuantity) && !window.confirm("This change can enable or increase future live orders sent to Dhan. Save it?")) return;
+    setSaving(id); setMessages((current) => ({ ...current, [id]: { ok: true, text: "Saving…" } }));
     try {
-      await api.updateStrategySettings(id, draft);
-      setMessages((previous) => ({ ...previous, [id]: { ok: true, text: "Applied now for subsequent trades." } }));
-      refresh("settings");
-      refresh("strategies");
+      const { supertrend, ...controls } = draft;
+      await api.updateStrategySettings(id, {
+        ...controls,
+        exit_enabled: true,
+        close_only: draft.live_gate === "CLOSE_ONLY",
+        ...(paramsChanged ? { supertrend } : {}),
+      });
+      setMessages((current) => ({ ...current, [id]: { ok: true, text: "Applied for subsequent candles. No order was sent." } }));
+      refresh("settings"); refresh("strategies");
     } catch (error: any) {
-      setMessages((previous) => ({ ...previous, [id]: { ok: false, text: error?.message || "Save failed." } }));
-    } finally {
-      setSaving(null);
-    }
+      setMessages((current) => ({ ...current, [id]: { ok: false, text: error?.message || "Save failed." } }));
+    } finally { setSaving(null); }
   };
 
-  return (
-    <div className="settings-page" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
-      <div style={{ gridColumn: "1 / -1", padding: "8px 12px", borderRadius: "8px", fontSize: "10px", fontWeight: 600, letterSpacing: "0.5px", background: isLive ? "var(--green)" : "var(--amber)", color: "#fff" }}>
-        EXECUTION MODE: {isLive ? "LIVE — real orders go to Dhan" : "PAPER — simulated execution"}
-      </div>
-
-      {isLive && (
-        <section className="lift animate-fade-in-up" style={{ gridColumn: "1 / -1", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", padding: "12px" }}>
-          <div style={{ fontSize: "10px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", marginBottom: "6px" }}>LIVE Strategy Settings</div>
-          <div style={{ fontSize: "10px", color: "var(--text-secondary)", marginBottom: "8px" }}>
-            Saving sends no order. Quantity changes require a flat strategy with no pending orders. An open position cannot have exits or stop-loss disabled.
-          </div>
-          <div style={{ fontSize: "10px", color: "var(--text-secondary)", marginBottom: "10px" }}>
-            Saved changes apply to the running strategy immediately and affect subsequent eligible trades. They do not alter an open position.
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "10px" }}>
-            {Object.entries<any>(settings.strategies ?? {}).map(([id, cfg]) => {
-              const draft = drafts[id] ?? initialDrafts({ strategies: { [id]: cfg } })[id];
-              const message = messages[id];
-              const runtimeActive = runtimeStrategies.some((strategy: any) => strategy.strategy_id === id);
-              return (
-                <div key={id} style={{ background: "var(--bg-input)", border: "1px solid var(--border-subtle)", borderRadius: "6px", padding: "10px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                    <strong style={{ fontSize: "11px", color: "var(--text-primary)" }}>{id} · {cfg.instrument}</strong>
-                    <span style={{ color: "var(--text-muted)", fontSize: "9px" }}>{cfg.fast_timeframe} / {cfg.htf_timeframe}</span>
-                  </div>
-                  <div className={`settings-runtime-state ${runtimeActive ? "active" : "inactive"}`}><i/>{runtimeActive ? "Attached to running strategy" : runtimeConfirmed ? "Not present in running strategy state; edits disabled" : "Runtime not confirmed; edits disabled"}</div>
-                  <div style={rowStyle}>
-                    <label htmlFor={`qty-${id}`}>Quantity</label>
-                    <input id={`qty-${id}`} type="number" min={1} step={1} disabled={!runtimeActive || saving !== null} value={draft.quantity} onChange={(event) => updateDraft(id, { quantity: Number(event.target.value) })} style={{ width: "90px", background: "var(--bg-panel)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "4px", padding: "5px 7px" }} />
-                  </div>
-                  <div style={rowStyle}>
-                    <label htmlFor={`gate-${id}`}>Live gate</label>
-                    <select id={`gate-${id}`} disabled={!runtimeActive || saving !== null} value={draft.live_gate} onChange={(event) => {
-                      const value = event.target.value;
-                      const restrictive = value === "CLOSE_ONLY" || value === "EMERGENCY_STOP" || value === "LOCKED";
-                      updateDraft(id, {
-                        live_gate: value,
-                        close_only: restrictive,
-                        entry_enabled: value === "ON",
-                        ...(restrictive ? { reversal_enabled: false }
-                          : value === "ON" ? { reversal_enabled: true } : {}),
-                      });
-                    }} style={{ maxWidth: "235px", background: "var(--bg-panel)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "4px", padding: "5px 7px" }}>
-                      {Object.entries(gateLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-                    </select>
-                  </div>
-                  {([
-                    ["entry_enabled", "New entries"],
-                    ["exit_enabled", "Strategy exits"],
-                    ["reversal_enabled", "Reversals"],
-                    ["sl_enabled", "Stop monitoring"],
-                  ] as const).map(([key, label]) => (
-                    <label key={key} style={{ ...rowStyle, justifyContent: "flex-start", cursor: "pointer" }}>
-                      <input type="checkbox" disabled={!runtimeActive || saving !== null} checked={draft[key]} onChange={(event) => updateDraft(id, { [key]: event.target.checked })} />
-                      {label}
-                    </label>
-                  ))}
-                  <div style={{ display: "flex", alignItems: "center", gap: "8px", marginTop: "8px" }}>
-                    <button disabled={saving !== null || !runtimeActive} onClick={() => saveStrategy(id)} style={{ background: "var(--blue-muted)", color: "var(--text-primary)", border: "1px solid var(--border)", borderRadius: "4px", padding: "5px 10px", fontSize: "9px", fontWeight: 600, cursor: saving ? "wait" : "pointer", opacity: saving !== null || !runtimeActive ? 0.5 : 1 }}>
-                      {saving === id ? "SAVING…" : runtimeActive ? "SAVE SETTINGS" : "NOT AVAILABLE"}
-                    </button>
-                    {message?.text && <span role="status" style={{ color: message.ok ? "var(--green)" : "var(--red)", fontSize: "9px" }}>{message.text}</span>}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
-
-      {sections.map(({ key, label }) => {
-        const data = settings[key];
-        if (!data) return null;
-        const entries = Object.entries(data).filter(([name]) => !hiddenSetting.test(name));
-        return (
-          <section key={key} className="settings-summary-card">
-            <div className="settings-summary-heading"><span>{label}</span><small>{entries.length} configured items</small></div>
-            <div className="settings-summary-grid">
-              {entries.map(([name, value]) => {
-                const nested = value && typeof value === "object" && !Array.isArray(value)
-                  ? Object.entries(value as Record<string, unknown>).filter(([child]) => !hiddenSetting.test(child))
-                  : null;
-                return <article className="settings-summary-item" key={name}>
-                  <strong>{settingLabel(name)}</strong>
-                  {nested?.length ? <div className="settings-summary-details">{nested.map(([child, childValue]) => <span key={child}><small>{settingLabel(child)}</small><b>{displaySetting(childValue)}</b></span>)}</div>
-                    : <span>{displaySetting(value)}</span>}
-                </article>;
-              })}
-              {entries.length === 0 && <div className="settings-empty">No displayable settings in this section.</div>}
+  return <div className="settings-workspace">
+    <section className="settings-mode-banner"><span className="eyebrow">EXECUTION MODE</span><strong>{isLive ? "LIVE · Dhan orders" : "PAPER · simulated orders"}</strong><p>Only the GOLDM and SILVERM 15-minute SuperTrend profiles are configurable here. Completed signal candles submit market orders after close; there is no separate strategy stop-loss.</p></section>
+    <section className="settings-summary-card"><div className="settings-summary-heading"><span>Strategy profiles</span><small>Parameters apply to future candles; change only while flat</small></div>
+      {profiles.length === 0 ? <div className="settings-empty">No SuperTrend profiles are exposed by the active runtime.</div> : <div className="settings-profile-grid">
+        {profiles.map(([id, config]) => {
+          const draft = drafts[id] ?? defaults(config, settings.strategy_gates?.[id] ?? config);
+          const available = runtimeIds.has(id);
+          const message = messages[id];
+          const updateParams = (patch: Partial<Params>) => setDrafts((current) => ({ ...current, [id]: { ...draft, supertrend: { ...draft.supertrend, ...patch } } }));
+          const update = (patch: Partial<Draft>) => setDrafts((current) => ({ ...current, [id]: { ...draft, ...patch } }));
+          return <article className="settings-profile" key={id}>
+            <header><div><strong>{config.instrument}</strong><small>{id} · 15m SuperTrend</small></div><span className={`runtime-chip ${available ? "ready" : "missing"}`}>{available ? "Runtime attached" : "Runtime unavailable"}</span></header>
+            <div className="settings-input-grid">
+              <label>Quantity<input type="number" min={1} step={1} disabled={!available || saving !== null} value={draft.quantity} onChange={(event) => update({ quantity: Number(event.target.value) })}/><small>Updates while flat with no pending order.</small></label>
+              <label>ATR period<input type="number" min={1} step={1} disabled={!available || saving !== null} value={draft.supertrend.atr_period} onChange={(event) => updateParams({ atr_period: Number(event.target.value) })}/></label>
+              <label>ATR multiplier<input type="number" min={0.1} step={0.1} disabled={!available || saving !== null} value={draft.supertrend.multiplier} onChange={(event) => updateParams({ multiplier: Number(event.target.value) })}/></label>
+              <label>Price source<select disabled={!available || saving !== null} value={draft.supertrend.source} onChange={(event) => updateParams({ source: event.target.value })}>{["open", "high", "low", "close", "hl2", "hlc3", "ohlc4"].map((source) => <option key={source}>{source}</option>)}</select></label>
+              <label>ATR calculation<select disabled={!available || saving !== null} value={draft.supertrend.atr_method} onChange={(event) => updateParams({ atr_method: event.target.value })}><option value="sma_tr">SMA of True Range</option><option value="wilder">Wilder ATR</option></select></label>
+              <label>Entry gate<select disabled={!available || saving !== null} value={draft.live_gate} onChange={(event) => update({ live_gate: event.target.value, entry_enabled: event.target.value === "ON", reversal_enabled: event.target.value === "ON" })}><option value="ON">ON · entries and reversals enabled</option><option value="CLOSE_ONLY">CLOSE ONLY · manage current position</option><option value="OFF">OFF · block entries and reversals</option></select></label>
             </div>
-          </section>
-        );
-      })}
-    </div>
-  );
+            <div className="settings-fixed-execution"><b>Fixed execution</b><span>Market after completed 15m signal candle</span><span>Opposite flip: exit, confirm flat, then enter</span><span>No separate SL or target</span></div>
+            <footer><span role="status" className={message ? message.ok ? "text-good" : "text-bad" : "settings-hint"}>{message?.text ?? "Changes take effect on subsequent strategy processing."}</span><button className="primary-button" disabled={!available || saving !== null} onClick={() => void save(id)}>{saving === id ? "Saving…" : "Save profile"}</button></footer>
+          </article>;
+        })}
+      </div>}
+    </section>
+  </div>;
 }

@@ -7,14 +7,14 @@ import time
 from typing import Optional
 
 from monitoring.health import SystemStatus
-from strategies.instance import StrategyInstance
+from strategies.base import StrategyBase
 
 log = logging.getLogger(__name__)
 
 class MarketEventFlowMixin:
     """Translate external feed callbacks into the engine event flow."""
 
-    def _make_candle_handler(self, strategy: StrategyInstance, env_name: str = "paper"):
+    def _make_candle_handler(self, strategy: StrategyBase, env_name: str = "paper"):
         def handler(event):
             if not self._running:
                 return
@@ -23,46 +23,52 @@ class MarketEventFlowMixin:
                 self.market_status.mark_rest_data_fresh()
                 self._maybe_enable_trading()
 
-                is_fast = (event.timeframe == strategy.fast_timeframe)
-                signal = strategy.on_candle(event)
                 env = self._env_for(env_name)
+                # REST recovery can return several already-closed bars at
+                # once. Keep SuperTrend's indicator state current by warming
+                # through old bars, but never turn a stale historical flip
+                # into a late live market order. Only fresh completed REST
+                # candles are actionable in the live strategy.
+                if (getattr(env, "is_live", False)
+                        and getattr(event, "source", None) == "rest"):
+                    live_cfg = self.config.get("live", {}) or {}
+                    market_data_cfg = live_cfg.get("market_data", {}) or {}
+                    max_age = float(market_data_cfg.get(
+                        "max_signal_age_seconds", 60.0))
+                    age_seconds = max(0.0, time.time() - float(event.end_ts))
+                    if age_seconds > max_age:
+                        if event.timeframe == strategy.signal_timeframe:
+                            from core.timeframe_engine import Bar
+                            strategy.warmup_indicator(Bar(
+                                instrument=event.instrument,
+                                timeframe=event.timeframe,
+                                start_ts=event.start_ts,
+                                end_ts=event.end_ts,
+                                open=event.open, high=event.high,
+                                low=event.low, close=event.close,
+                                volume=int(event.volume), source="rest_catchup",
+                            ))
+                        self.publish_event("stale_signal_candle_skipped", {
+                            "strategy_id": strategy.strategy_id,
+                            "instrument": event.instrument,
+                            "timeframe": event.timeframe,
+                            "candle_start": event.start_ts,
+                            "candle_end": event.end_ts,
+                            "age_seconds": round(age_seconds, 3),
+                            "max_actionable_age_seconds": max_age,
+                            "action": "indicator_warmed_no_order",
+                            "execution_mode": env.mode,
+                        }, env_name=env.name)
+                        return
+
+                is_signal_bar = (event.timeframe == strategy.signal_timeframe)
+                signal = strategy.on_candle(event)
                 registry = getattr(env, "pending_triggers", None)
                 if registry is not None:
                     registry.sync_strategy(strategy)
-                if signal and is_fast:
+                if signal and is_signal_bar:
                     self._bind_signal_position(signal, strategy, env_name)
                     self._process_signal(signal, env_name)
-        return handler
-    def _make_tick_handler(self, strategy: StrategyInstance, env_name: str = "paper"):
-        def handler(event):
-            if not self._running:
-                return
-            if strategy.instrument != event.instrument:
-                return
-            env = self._env_for(env_name)
-            registry = getattr(env, "pending_triggers", None)
-            with self._lock:
-                # Restore a missing strategy reference from the O(1) hot-path
-                # registry. Tick handling never queries SQLite. Keep recovery,
-                # crossing and one-shot removal under the engine lock so two
-                # concurrent ticks cannot race the same trigger.
-                if registry is not None:
-                    if strategy.pending_entry is None:
-                        strategy.pending_entry = registry.entry_for(strategy.strategy_id)
-                    if strategy.pending_exit_trigger is None:
-                        strategy.pending_exit_trigger = registry.exit_for(strategy.strategy_id)
-                if not (strategy.pending_entry is not None or strategy.position_side is not None):
-                    return
-                try:
-                    tick_signal = strategy.on_tick(event.ltp, event.timestamp)
-                    if registry is not None:
-                        registry.sync_strategy(strategy)
-                    if tick_signal:
-                        self._bind_signal_position(tick_signal, strategy, env_name)
-                        self._process_signal(tick_signal, env_name)
-                except Exception as e:
-                    log.warning("[Engine] tick handler error for %s: %s",
-                                strategy.strategy_id, e)
         return handler
     def _bind_signal_position(self, signal, strategy, env_name: str) -> None:
         """Freeze current position ownership on exit/reversal signals at birth."""
@@ -168,35 +174,8 @@ class MarketEventFlowMixin:
                         for pos in env.position_manager.get_positions_by_instrument(instrument):
                             if pos.is_open:
                                 pos.update_mark(ltp)
-                        # Appendix I (I3/I4) — continuous fast LTP into the
-                        # order watcher so resting LIMIT entries are evaluated
-                        # for skip/cancel/fallback on every tick.
-                        watcher = getattr(env, "order_watcher", None)
-                        if watcher is not None:
-                            watcher.feed_market(instrument, ltp)
                     except Exception:
                         pass
-
-                # ── Position-owned SL evaluation ──────────────────────────
-                # The ONLY stop-loss path.  Each environment's own open
-                # positions are evaluated against THEIR stop_price by their own
-                # SL monitor; no strategy and no other strategy's position can
-                # influence the decision (§18 strategy isolation).
-                for env in self._envs.values():
-                    try:
-                        positions = env.position_manager.get_positions_by_instrument(instrument)
-                    except Exception:
-                        continue
-                    for pos in positions:
-                        if not pos.is_open:
-                            continue
-                        try:
-                            self._evaluate_position_sl(
-                                env, pos, ltp, env_name=getattr(env, "name", None))
-                        except Exception as e:
-                            log.error("[Engine] SL evaluation failed for %s/%s: %s",
-                                      getattr(pos, "strategy_id", "?"),
-                                      getattr(pos, "position_id", "?"), e)
 
             # Always publish the tick — strategies guard on ltp <= 0/sentinels.
             event = TickEvent(
@@ -216,18 +195,6 @@ class MarketEventFlowMixin:
         self.health.record_bar()
         self.market_status.mark_rest_data_fresh()
 
-        # The stop is evaluated on EVERY completed candle as well as on every
-        # tick.  The MCX tick feed is allowed to go silent while REST keeps
-        # flowing, and nothing in the order book represents a local stop - so
-        # without this a dead tick feed silently strips every position of its
-        # protection.  This runs BEFORE the candle reaches any strategy, so a
-        # stop breach always wins over a signal from the same candle.
-        try:
-            self._evaluate_positions_from_candle(None, bar)
-        except Exception as e:
-            log.error("[Engine] candle SL evaluation failed: %s", e)
-        self._report_sl_protection_gaps()
-
         router = getattr(self, "candle_router", None)
         if router is not None:
             router.on_candle(bar, is_complete=True)
@@ -242,58 +209,6 @@ class MarketEventFlowMixin:
             source="rest",
         )
         self.event_bus.publish(f"candle:{bar.instrument}:{bar.timeframe}", event)
-    def _report_sl_protection_gaps(self) -> None:
-        """Raise an explicit alarm for any position whose stop cannot be checked.
-
-        A local stop is invisible in the order book, so a position whose feed
-        has gone quiet is UNPROTECTED and nothing else in the system would say
-        so.  Each blind position is reported once per outage (not once per
-        candle) so a persistent outage cannot flood the event log.
-        """
-        health = getattr(self, "market_data_health", None)
-        if health is None:
-            return
-        reported = getattr(self, "_sl_blind_reported", None)
-        if reported is None:
-            reported = set()
-            self._sl_blind_reported = reported
-
-        blind = []
-        for env in self._envs.values():
-            try:
-                blind.extend(health.blind_positions(
-                    env.position_manager.open_positions))
-            except Exception:
-                continue
-
-        current = {getattr(p, "position_id", None) for p in blind}
-        for position in blind:
-            pid = getattr(position, "position_id", None)
-            if pid in reported:
-                continue
-            reported.add(pid)
-            log.error("[Engine] SL PROTECTION GAP: position %s (%s %s) cannot be "
-                      "evaluated - market data for %s is stale. The position is "
-                      "UNPROTECTED until the feed recovers.",
-                      pid, getattr(position, "strategy_id", "?"),
-                      getattr(position, "instrument", "?"),
-                      getattr(position, "instrument", "?"))
-            try:
-                self.publish_event("sl_protection_gap", {
-                    "position_id": pid,
-                    "strategy_id": getattr(position, "strategy_id", None),
-                    "instrument": getattr(position, "instrument", None),
-                    "stop_price": getattr(position, "stop_price", None),
-                    "last_tick_age_seconds": health.age(
-                        getattr(position, "instrument", "")),
-                    "severity": "CRITICAL",
-                })
-            except Exception:
-                pass
-        # Forget positions that closed or recovered so a NEW outage re-alarms.
-        for pid in list(reported):
-            if pid not in current:
-                reported.discard(pid)
 
     def _on_status(self, status) -> None:
         pass

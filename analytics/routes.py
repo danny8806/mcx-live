@@ -3,12 +3,31 @@ from __future__ import annotations
 import json
 import time
 from typing import Optional
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.routing import APIRoute
 from pathlib import Path
 
 from persistence.database import Database
 
-router = APIRouter()
+_SUPPORTED_STRATEGY_IDS = frozenset({"gold_02", "silver_01"})
+
+
+class ActiveStrategyRoute(APIRoute):
+    """Reject retired strategy identifiers on every strategy-scoped endpoint."""
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request):
+            strategy_id = request.path_params.get("strategy_id")
+            if strategy_id is not None and strategy_id not in _SUPPORTED_STRATEGY_IDS:
+                raise HTTPException(status_code=404, detail="strategy not found")
+            return await original(request)
+
+        return handler
+
+
+router = APIRouter(route_class=ActiveStrategyRoute)
 
 # Module-level state (initialized by init())
 _event_store = None
@@ -18,19 +37,19 @@ _db_path = None
 _default_starting_equity = 1_000_000
 _STRATEGY_IDS = None
 
-_STRATEGY_FALLBACK = ["gold_01", "gold_02", "silver_01", "silver_02"]
+_STRATEGY_FALLBACK = ["gold_02", "silver_01"]
 
 
 def _strategy_ids() -> list[str]:
     """Live strategy ids: explicit engine list first, then config file, then
     distinct ids present in the analytics DB, then defaults."""
-    if _STRATEGY_IDS:
-        return list(_STRATEGY_IDS)
+    if _STRATEGY_IDS is not None:
+        return [sid for sid in _STRATEGY_IDS if sid in _SUPPORTED_STRATEGY_IDS]
     try:
         cfg_path = Path(__file__).resolve().parent.parent / "config" / "settings.json"
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         strat = cfg.get("strategies") or {}
-        ids = [k for k in strat if strat.get(k)]
+        ids = [k for k in strat if strat.get(k) and k in _SUPPORTED_STRATEGY_IDS]
         if ids:
             return ids
     except Exception:
@@ -41,6 +60,7 @@ def _strategy_ids() -> list[str]:
             ids = [r["strategy_id"] for r in db.query(
                 "SELECT DISTINCT strategy_id FROM trades_analytics "
                 "ORDER BY strategy_id")]
+            ids = [sid for sid in ids if sid in _SUPPORTED_STRATEGY_IDS]
             if ids:
                 return ids
     except Exception:
@@ -57,12 +77,15 @@ def set_default_starting_equity(value: Optional[float] = None):
         _default_starting_equity = float(value)
 
 
-def init(db_path: str = "trading.db", strategy_ids: Optional[list[str]] = None,
+def init(db_path: str = "live/data/db/supertrend/supertrend_live.sqlite3",
+         strategy_ids: Optional[list[str]] = None,
          starting_equity: Optional[float] = None):
     """Initialize analytics routes with database path and optional strategy list."""
     global _event_store, _trade_ledger, _performance_engine, _db_path, _STRATEGY_IDS, _default_starting_equity
     _db_path = db_path
-    _STRATEGY_IDS = list(strategy_ids) if strategy_ids else None
+    _STRATEGY_IDS = ([sid for sid in strategy_ids
+                      if sid in _SUPPORTED_STRATEGY_IDS]
+                     if strategy_ids is not None else None)
     if starting_equity is not None:
         _default_starting_equity = float(starting_equity)
     try:
@@ -431,7 +454,7 @@ async def get_portfolio_analytics():
     total_trades = sum(c["trade_count"] for c in contributions)
     
     # Monte Carlo on portfolio
-    mc = _performance_engine.calculate_monte_carlo("gold_01", simulations=500)
+    mc = _performance_engine.calculate_monte_carlo("gold_02", simulations=500)
     
     return {
         "portfolio": {

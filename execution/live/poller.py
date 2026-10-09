@@ -210,12 +210,11 @@ class LiveBrokerPoller:
         self._next_run: dict[str, float] = {t: self._clock() for t in _TASKS}
         self._last_run: dict[str, float] = {}
         self._errors: dict[str, int] = {t: 0 for t in _TASKS}
-        self._errors.setdefault("sl_verify", 0)
         self._stats: dict[str, int] = {
             "orders_polled": 0, "positions_polled": 0, "accounts_polled": 0,
             "reconciles_run": 0, "tradebook_polls": 0,
             "fills_created": 0, "fills_routed": 0,
-            "order_persist_errors": 0, "sl_reconciled": 0,
+            "order_persist_errors": 0,
             "pending_terminalized": 0,
         }
         self._last_broker_positions: list[dict] = []
@@ -387,12 +386,6 @@ class LiveBrokerPoller:
         # and the sweep actively probes each stranded row's broker order.
         engine_orders = self._engine_order_snapshot(engine)
         self._terminalize_pending_from_broker(statuses)
-        # F3 — an exit the broker ended WITHOUT closing the position must
-        # re-arm the local SL.  Runs BEFORE the empty-statuses guard for the
-        # same reason as above: right after a restart the broker status map is
-        # empty, yet a DAY-expired exit from the previous session is exactly the
-        # order that left a position unprotected.
-        self._release_terminal_exits()
         if not statuses:
             return []
         applied: list = []
@@ -446,7 +439,7 @@ class LiveBrokerPoller:
                     # cancel-confirm-MARKET fallback. It no longer owns the
                     # strategy reset while its MARKET child is still active.
                     continue
-                if role in ("EXIT", "STOP_LOSS", "REVERSAL_EXIT", "EMERGENCY_EXIT"):
+                if role in ("EXIT", "REVERSAL_EXIT", "EMERGENCY_EXIT"):
                     if _has_market_fallback_child(engine_orders, order):
                         # The watcher canceled this LIMIT as the first half of
                         # cancel-confirm-MARKET. Do not release the SL or cancel
@@ -463,9 +456,6 @@ class LiveBrokerPoller:
                                 order, "position_generation", None)), None)
                         if position is not None:
                             position.exit_started = False
-                            strat = strategies.get(order.strategy_id)
-                            if strat is not None:
-                                strat.stop_exit_submitted = False
                     if position is not None:
                         try:
                             persistence = getattr(self.env, "persistence", None)
@@ -511,7 +501,6 @@ class LiveBrokerPoller:
                                 strat._last_fired_trigger_signal_id = None
                                 if hasattr(strat, "_fired_trigger_signal_ids"):
                                     strat._fired_trigger_signal_ids.clear()
-                                strat.stop_exit_submitted = False
                 if role.startswith("ENTRY") or role in ("REVERSAL_ENTRY", "FALLBACK_MARKET"):
                     # The POST may have been accepted as PENDING and rejected
                     # only on a later broker status poll. Settle the canonical
@@ -764,110 +753,7 @@ class LiveBrokerPoller:
             self._stats["pending_terminalized"] += changed
         return changed
 
-    def _release_terminal_exits(self) -> int:
-        # Recovery mutates the same position stop/exit latches as live ticks.
-        # The routine only performs local reads and persistence writes, so keep
-        # its ownership check and re-arm atomic with tick/exit callbacks.
-        with getattr(self, "_state_lock", nullcontext()):
-            worker = getattr(self, "_release_terminal_exits_locked", None)
-            if callable(worker):
-                return worker()
-            # A few unit fixtures bind this method directly to a SimpleNamespace
-            # rather than constructing LiveBrokerPoller; retain that supported
-            # test seam while production instances use the bound method above.
-            return LiveBrokerPoller._release_terminal_exits_locked(self)
 
-    def _release_terminal_exits_locked(self) -> int:
-        """Re-arm the position-owned SL for exits the broker ended unclosed.
-
-        An exit order that reaches REJECTED / CANCELLED / EXPIRED while its
-        position is still open is the dangerous case: there is no broker-side
-        stop backing the position any more, and the local monitor is latched in
-        EXITING, so ``evaluate`` can never fire it again.  The position would
-        sit open and unprotected until the next restart.
-
-        Releasing the latch makes the very next tick re-evaluate that
-        position's OWN stop and mint a FRESH exit, which is the only correct
-        recovery now that no resting stop exists at the broker.
-
-        Safety properties:
-
-        * one-shot per latch — a position is only touched while its SL is
-          actually latched, so the 2 s poll cannot churn the book;
-        * scoped to ``open_positions`` and requires the SAME ``trade_id`` and
-          ``position_generation`` as the order, so a position that really did
-          close — or that a reversal already superseded — can never be
-          resurrected here;
-        * a position whose SL is NONE / SL_UNAVAILABLE (never armed) is left
-          alone rather than being falsely reported as ARMED.
-        """
-        engine = getattr(self.env, "execution_engine", None)
-        monitor = getattr(self.env, "sl_monitor", None)
-        if engine is None or monitor is None:
-            return 0
-        if not hasattr(monitor, "release_exit") or not hasattr(monitor, "state_of"):
-            return 0
-        strategies = getattr(self.env, "strategies", {}) or {}
-        open_positions = list(getattr(
-            getattr(self.env, "position_manager", None), "open_positions", []) or [])
-        if not open_positions:
-            return 0
-        persistence = getattr(self.env, "persistence", None)
-        released = 0
-        for order in list((getattr(engine, "_orders", {}) or {}).values()):
-            state_v = str(getattr(order.state, "value", order.state) or "").lower()
-            if state_v not in _TERMINAL_ORDER_STATES:
-                continue
-            role = str(getattr(order, "order_role", "") or "").upper()
-            if role not in _EXIT_ROLES:
-                continue
-            if _has_market_fallback_child(
-                    getattr(engine, "_orders", {}) or {}, order):
-                continue
-            position_id = getattr(order, "parent_position_id", None)
-            if not position_id:
-                continue
-            position = next((
-                p for p in open_positions
-                if str(getattr(p, "position_id", "") or "") == str(position_id)
-                and getattr(p, "trade_id", None) == (
-                    getattr(order, "lifecycle_id", None)
-                    or getattr(order, "trade_id", None))
-                and getattr(p, "position_generation", None) == getattr(
-                    order, "position_generation", None)), None)
-            if position is None:
-                continue
-            pid = str(getattr(position, "position_id", "") or "")
-            # One-shot: only act while the SL is genuinely latched on a dead
-            # exit.  Already-ARMED / NONE / SL_UNAVAILABLE positions are left
-            # exactly as they are.
-            if monitor.state_of(pid) not in ("EXITING", "TRIGGERED"):
-                continue
-            monitor.release_exit(pid)
-            if monitor.state_of(pid) != "ARMED":
-                continue
-            position.exit_started = False
-            position.exit_order_id = None
-            position.sl_state = "ARMED"
-            strat = strategies.get(getattr(order, "strategy_id", None))
-            if strat is not None:
-                strat.stop_exit_submitted = False
-            try:
-                if persistence is not None:
-                    persistence.save_position(position)
-            except Exception as e:
-                log.debug("[LivePoller:%s] SL re-arm persist failed %s: %s",
-                          self.env.name, pid, e)
-            released += 1
-            log.warning(
-                "[LivePoller:%s] SL RE-ARMED after %s exit %s (%s) ended %s "
-                "without closing — position %s still open, next tick "
-                "re-evaluates its own stop",
-                self.env.name, role, getattr(order, "order_id", "?"),
-                getattr(position, "instrument", "?"), state_v, pid)
-        if released:
-            self._stats["sl_rearmed"] = self._stats.get("sl_rearmed", 0) + released
-        return released
 
     def _terminalize_pending_from_broker(self, statuses: dict) -> int:
         """F2 — self-heal stale ENTRY_SENT pending rows against broker truth by

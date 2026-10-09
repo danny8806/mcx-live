@@ -38,7 +38,8 @@ def _db_path() -> Optional[str]:
     try:
         from config import Config
         return Config.resolve_path(_engine.config.get(
-            "system", {}).get("live_db_path", "live/data/db/live_trading.db"))
+            "system", {}).get("live_db_path",
+                              "live/data/db/supertrend/supertrend_live.sqlite3"))
     except Exception:
         return None
 

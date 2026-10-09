@@ -17,7 +17,6 @@ class _PositionManager:
                     "quantity": 1,
                     "average_entry_price": 227000.0,
                     "unrealized_pnl": -4250.0,
-                    "sl_state": "ARMED",
                     "is_open": True,
                 }
             }
@@ -53,7 +52,6 @@ def test_live_positions_path_returns_broker_comparison_not_local_book(monkeypatc
                 "quantity": 1,
                 "average_entry_price": 227000.0,
                 "unrealized_pnl": -4250.0,
-                "sl_state": "ARMED",
             },
             "dhan": None,
         }

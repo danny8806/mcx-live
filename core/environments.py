@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
-from strategies.instance import StrategyInstance
+from strategies.base import StrategyBase
 from core.pending_trigger_registry import PendingTriggerRegistry
 from strategies.runtime import StrategyRuntimeRegistry
 
@@ -144,7 +144,7 @@ class Environment:
     kind: EnvironmentKind = EnvironmentKind.PAPER
     gate_state: Optional[str] = None                 # live: master-gate initial state
     db_path: Optional[str] = None                    # canonical per-env DB file
-    strategies: dict[str, StrategyInstance] = field(default_factory=dict)
+    strategies: dict[str, StrategyBase] = field(default_factory=dict)
     runtimes: Optional[StrategyRuntimeRegistry] = None
     execution_engine: Any = None
     order_manager: Any = None

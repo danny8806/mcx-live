@@ -12,10 +12,6 @@ class _Flow(LivePositionFlowMixin):
     def _env_for(self, _env_name=None):
         return self.env
 
-    @staticmethod
-    def _sl_monitor(_env):
-        return SimpleNamespace(active_for=lambda _position_id: True)
-
 
 def _env(order):
     return SimpleNamespace(
@@ -71,20 +67,6 @@ def test_position_lookup_failure_fails_closed_with_diagnostic():
 
     assert flow._entry_priority_blocker("s1", rec=rec) == 0
     assert "position_lookup_failed" in rec.extra["priority_blocker_error"]
-
-
-def test_missing_stop_monitor_fails_closed_with_diagnostic():
-    position = SimpleNamespace(
-        is_open=True, sl_state="ARMED", position_id="P1")
-    env = _env(SimpleNamespace(order_id="old", strategy_id="s1"))
-    env.position_manager = SimpleNamespace(
-        get_positions_by_strategy=lambda _sid: [position])
-    flow = _Flow(env)
-    flow._sl_monitor = lambda _env: None
-    rec = SimpleNamespace(order_role="ENTRY", internal_order_id="new", extra={})
-
-    assert flow._entry_priority_blocker("s1", rec=rec) == 0
-    assert rec.extra["priority_blocker_error"] == "sl_monitor_unavailable"
 
 
 def test_reversal_entry_unlocks_to_market_fallback_after_exit_fill():

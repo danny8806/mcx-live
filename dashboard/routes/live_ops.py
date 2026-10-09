@@ -186,6 +186,15 @@ def _get_profile_sync():
         dhan_cfg.setdefault(k, v)
     instruments = (cfg.get("instruments", {}) or {}) if hasattr(cfg, "get") else {}
     strategies_cfg = (cfg.get("strategies", {}) or {}) if hasattr(cfg, "get") else {}
+    runtime_policy = (cfg.get("strategy_runtime", {}) or {}) if hasattr(cfg, "get") else {}
+    if runtime_policy.get("exclusive"):
+        allowed = runtime_policy.get("allowlist", {}) or {}
+        strategies_cfg = {sid: strategy for sid, strategy in strategies_cfg.items()
+                          if sid in allowed}
+        active_instruments = {strategy.get("instrument")
+                              for strategy in strategies_cfg.values()}
+        instruments = {name: item for name, item in instruments.items()
+                       if name in active_instruments}
     order_ws = live_cfg.get("order_ws", {}) or {}
     watcher_cfg = live_cfg.get("order_watcher", {}) or {}
     env = _live_env()
@@ -250,15 +259,16 @@ def _get_profile_sync():
         "strategies": {
             name: {
                 "instrument": (sc or {}).get("instrument"),
-                "fast_timeframe": (sc or {}).get("fast_timeframe"),
-                "htf_timeframe": (sc or {}).get("htf_timeframe"),
+                "strategy_type": "supertrend",
+                "timeframe": "15m",
+                "signal_timeframe": "15m",
+                "supertrend": (sc or {}).get("supertrend"),
                 "quantity": (sc or {}).get("quantity"),
                 "lots": (sc or {}).get("lots"),
                 "live_gate": (sc or {}).get("live_gate"),
                 "entry_enabled": bool((sc or {}).get("entry_enabled", True)),
                 "exit_enabled": bool((sc or {}).get("exit_enabled", True)),
                 "reversal_enabled": bool((sc or {}).get("reversal_enabled", True)),
-                "sl_enabled": bool((sc or {}).get("sl_enabled", True)),
             }
             for name, sc in strategies_cfg.items()
         },
@@ -420,7 +430,7 @@ async def get_live_sync():
 # 4. CANDLES — last CLOSED (Dhan REST) vs FORMING (LTP snapshot)
 # ═══════════════════════════════════════════════════════════════════════
 
-_TF_MINUTES = {"5m": "5", "15m": "15", "30m": "30", "1h": "60"}
+_TF_MINUTES = {"15m": "15"}
 # Tolerance for a CLOSED candle's end landing at/before now (REST clock skew).
 _CLOSED_TOL = 15.0
 # Dhan intraday timestamps are IST wall clock encoded as UTC epoch; +5h30m.
@@ -435,6 +445,15 @@ def _candles_sync(force: bool = False):
     cfg = _engine.config if _engine is not None else None
     instruments = (cfg.get("instruments", {}) or {}) if hasattr(cfg, "get") else {}
     strategies_cfg = (cfg.get("strategies", {}) or {}) if hasattr(cfg, "get") else {}
+    runtime_policy = (cfg.get("strategy_runtime", {}) or {}) if hasattr(cfg, "get") else {}
+    if runtime_policy.get("exclusive"):
+        allowed = runtime_policy.get("allowlist", {}) or {}
+        strategies_cfg = {sid: strategy for sid, strategy in strategies_cfg.items()
+                          if sid in allowed}
+        active_instruments = {strategy.get("instrument")
+                              for strategy in strategies_cfg.values()}
+        instruments = {name: item for name, item in instruments.items()
+                       if name in active_instruments}
     now = _ts()
     out: dict[str, Any] = {"instruments": {}, "generated_at": now, "errors": []}
     if adapter is None:
@@ -448,8 +467,7 @@ def _candles_sync(force: bool = False):
         inst = sc.get("instrument")
         if not inst:
             continue
-        subs = [sc.get("fast_timeframe"), sc.get("mid_timeframe"),
-                sc.get("htf_timeframe")]
+        subs = ["15m"]
         per_inst.setdefault(inst, [])
         for tf in subs:
             if tf and tf not in per_inst[inst]:
@@ -457,7 +475,7 @@ def _candles_sync(force: bool = False):
 
     for inst_name, inst_cfg in instruments.items():
         ix = inst_cfg or {}
-        tf_list = per_inst.get(inst_name) or ["5m", "15m", "1h"]
+        tf_list = per_inst.get(inst_name) or ["15m"]
         ltp_info = None
         if adapter is not None and hasattr(adapter, "_live_ltp"):
             try:
@@ -617,14 +635,24 @@ async def get_live_candles(force: bool = False):
 # ═══════════════════════════════════════════════════════════════════════
 
 def _get_signals_sync(limit: int = 30):
-    rows = _q(
-        "SELECT signal_id, strategy_id, instrument, security_id, timeframe, "
-        "side, signal_type, signal_timestamp, candle_timestamp, open, high, "
-        "low, close, volume, trigger_price, stop_price, quantity, signal_reason, "
-        "execution_mode, created_at FROM signals WHERE execution_mode='LIVE' "
-        "ORDER BY id DESC LIMIT ?",
-        (int(limit),),
-    )
+    cfg = _engine.config if _engine is not None else None
+    runtime_policy = (cfg.get("strategy_runtime", {}) or {}) if hasattr(cfg, "get") else {}
+    allowed_ids = (sorted((runtime_policy.get("allowlist", {}) or {}).keys())
+                   if runtime_policy.get("exclusive") else [])
+    if runtime_policy.get("exclusive") and not allowed_ids:
+        rows = []
+    else:
+        strategy_clause = (" AND strategy_id IN (" + ",".join("?" for _ in allowed_ids) + ")"
+                           if allowed_ids else "")
+        params = tuple(allowed_ids) + (int(limit),)
+        rows = _q(
+            "SELECT signal_id, strategy_id, instrument, security_id, timeframe, "
+            "side, signal_type, signal_timestamp, candle_timestamp, open, high, "
+            "low, close, volume, trigger_price, quantity, signal_reason, "
+            "execution_mode, created_at FROM signals WHERE execution_mode='LIVE'"
+            + strategy_clause + " ORDER BY id DESC LIMIT ?",
+            params,
+        )
     last_ts = None
     for r in rows:
         ts = _epoch(r.get("signal_timestamp"))
@@ -992,7 +1020,6 @@ def _get_positions_sync():
             if local_qty_weight else None
         )
         local_unrealized = sum(_num(p.get("unrealized_pnl")) for p in local_rows)
-        stop_states = {str(p.get("sl_state") or "") for p in local_rows}
         rows.append({
             "strategy_id": owner_ids[0] if len(owner_ids) == 1 else None,
             "local_owners": owner_ids,
@@ -1004,7 +1031,6 @@ def _get_positions_sync():
                 "quantity": local_qty,
                 "average_entry_price": local_avg,
                 "unrealized_pnl": local_unrealized,
-                "sl_state": next(iter(stop_states)) if len(stop_states) == 1 else "MULTIPLE",
             } if local_rows else None),
             "dhan": {
                 "side": d_side,

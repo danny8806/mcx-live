@@ -25,7 +25,10 @@ class FakeEngine:
     def __init__(self, config, positions=None, orders=None):
         self.config = FakeConfig(config)
         self.strategies = {
-            "gold_01": SimpleNamespace(quantity=1, pending_entry=None),
+            "gold_02": SimpleNamespace(quantity=1, pending_entry=None,
+                                       pending_exit_trigger=None,
+                                       strategy_type="supertrend",
+                                       supertrend=SimpleNamespace(snapshot=lambda: {})),
         }
         self.position_manager = SimpleNamespace(
             get_positions_by_strategy=lambda _sid: positions() if callable(positions) else (positions or [])
@@ -34,7 +37,7 @@ class FakeEngine:
         self._gate = {
             "live_gate": "OFF", "entry_enabled": False,
             "exit_enabled": True, "reversal_enabled": False,
-            "sl_enabled": True, "close_only": True,
+            "close_only": True,
         }
         self.gate_changes = []
 
@@ -58,10 +61,10 @@ def configured_engine(tmp_path: Path, *, positions=None, orders=None):
     resolved_path = tmp_path / "resolved.json"
     data = {
         "strategies": {
-            "gold_01": {
+            "gold_02": {
                 "quantity": 1, "live_gate": "OFF", "entry_enabled": False,
                 "exit_enabled": True, "reversal_enabled": False,
-                "sl_enabled": True, "close_only": True,
+                "supertrend": {}, "close_only": True,
             }
         }
     }
@@ -77,17 +80,17 @@ def test_settings_write_persists_and_applies_quantity_and_gate(tmp_path):
     engine, raw_path, resolved_path = configured_engine(tmp_path)
 
     result = settings._save_strategy_settings_sync(
-        "gold_01",
+        "gold_02",
         {"quantity": 2, "live_gate": "ON", "entry_enabled": True,
          "close_only": False},
     )
 
     assert result["status"] == "saved"
-    assert engine.strategies["gold_01"].quantity == 2
+    assert engine.strategies["gold_02"].quantity == 2
     assert engine._gate["live_gate"] == "ON"
     assert engine._gate["entry_enabled"] is True
     for path in (raw_path, resolved_path):
-        saved = json.loads(path.read_text(encoding="utf-8"))["strategies"]["gold_01"]
+        saved = json.loads(path.read_text(encoding="utf-8"))["strategies"]["gold_02"]
         assert saved["quantity"] == 2
         assert saved["live_gate"] == "ON"
 
@@ -102,7 +105,7 @@ def test_quantity_change_is_blocked_when_open_or_position_state_unknown(
     configured_engine(tmp_path, positions=positions)
     with pytest.raises(HTTPException) as exc:
         settings._save_strategy_settings_sync(
-            "gold_01", {"quantity": 2})
+            "gold_02", {"quantity": 2})
     assert exc.value.status_code == 409
 
 
@@ -111,19 +114,32 @@ def test_quantity_change_is_blocked_when_order_state_unknown(tmp_path):
     settings._engine.execution_engine._orders = None
     with pytest.raises(HTTPException) as exc:
         settings._save_strategy_settings_sync(
-            "gold_01", {"quantity": 2})
+            "gold_02", {"quantity": 2})
     assert exc.value.status_code == 409
+
+
+def test_open_supertrend_position_can_save_entry_gate(tmp_path):
+    engine, raw_path, _ = configured_engine(
+        tmp_path, positions=lambda: [SimpleNamespace(is_open=True)])
+    result = settings._save_strategy_settings_sync(
+        "gold_02", {"live_gate": "CLOSE_ONLY", "entry_enabled": False,
+                    "reversal_enabled": False, "close_only": True})
+
+    assert result["status"] == "saved"
+    saved = json.loads(raw_path.read_text(encoding="utf-8"))["strategies"]["gold_02"]
+    assert "sl_enabled" not in saved
+    assert engine._gate["exit_enabled"] is True
 
 
 @pytest.mark.parametrize("body", [
     {"quantity": 0}, {"quantity": True}, {"quantity": 1.5},
-    {"live_gate": "MAYBE"}, {"sl_enabled": "false"},
+    {"live_gate": "MAYBE"}, {"obsolete_stop_gate": False},
     {"unsupported": True},
 ])
 def test_invalid_settings_are_rejected(tmp_path, body):
     configured_engine(tmp_path)
     with pytest.raises(HTTPException) as exc:
         settings._save_strategy_settings_sync(
-            "gold_01", body)
+            "gold_02", body)
     assert exc.value.status_code == 422
 

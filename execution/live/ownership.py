@@ -3,9 +3,9 @@
 This module is intentionally independent of TradingEngine. Every live order
 must cross this check before the broker adapter is called.
 
-There is no broker-side protective SL: a stop-loss is the local,
-position-owned SL monitor minting an ordinary ``EXIT`` order bound to the open
-position.  ``STOP_LOSS`` is therefore NOT an exit role here.
+The active strategies submit market entries and exits from completed
+15-minute SuperTrend decisions. Position ownership is checked independently
+of strategy calculations before a broker request is sent.
 """
 from __future__ import annotations
 

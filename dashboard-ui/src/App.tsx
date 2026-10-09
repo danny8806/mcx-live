@@ -4,7 +4,6 @@ import Layout from "./components/layout/Layout";
 import LiveTrading from "./pages/LiveTrading";
 import LiveOps from "./pages/LiveOps";
 import Strategies from "./pages/Strategies";
-import StrategyMatrix from "./pages/StrategyMatrix";
 import Positions from "./pages/Positions";
 import Orders from "./pages/Orders";
 import Trades from "./pages/Trades";
@@ -29,7 +28,6 @@ export default function App() {
             <Route path="/live" element={<Navigate to="/" replace />} />
             <Route path="/live-ops" element={<LiveOps />} />
             <Route path="/strategies" element={<Strategies />} />
-            <Route path="/matrix" element={<StrategyMatrix />} />
             <Route path="/positions" element={<Positions />} />
             <Route path="/orders" element={<Orders />} />
             <Route path="/trades" element={<Trades />} />

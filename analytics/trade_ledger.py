@@ -57,10 +57,7 @@ class TradeRecord:
     exit_quantity: int = 0
     exit_reason: Optional[str] = None
     entry_reason: Optional[str] = None
-    entry_dema: Optional[float] = None
     entry_atr: Optional[float] = None
-    entry_dema_atr: Optional[float] = None
-    entry_htf_value: Optional[float] = None
     entry_bid: Optional[float] = None
     entry_ask: Optional[float] = None
     entry_spread: Optional[float] = None

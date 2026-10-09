@@ -29,10 +29,8 @@ def _env_for(env=None):
 def _chain_payload(rev: dict, signal: Optional[dict] = None) -> dict:
     """Render the reversal chain from one durable reversal record.
 
-    statuses (display only): REVERSAL SIGNAL -> TRIGGERED -> OLD EXIT
-    (order/status) -> OLD FLAT -> NEW ENTRY (order/status) -> NEW POSITION
-    -> NEW SL.  The persistent ``status`` field is the gate: the record goes
-    PENDING_EXIT -> EXIT_FILLED -> ENTRY_SUBMITTED -> COMPLETE.
+    The chain is complete when the old position is broker-confirmed flat and
+    the opposite market entry has a broker-confirmed fill and local position.
 
     The optional ``signal`` row (persistence.get_signal by signal_id)
     enriches the payload with the signal-candle fields (security_id,
@@ -45,7 +43,6 @@ def _chain_payload(rev: dict, signal: Optional[dict] = None) -> dict:
     old_flat = bool(rev.get("exit_verified_at"))
     entry_confirmed = bool(rev.get("entry_fill_confirmed_at"))
     signal = signal or {}
-    new_sl_state = (rev.get("new_sl_state") or "").upper()
     chain = [
         {"step": "REVERSAL SIGNAL", "value": rev.get("signal_id"),
          "ok": bool(rev.get("signal_id"))},
@@ -57,12 +54,6 @@ def _chain_payload(rev: dict, signal: Optional[dict] = None) -> dict:
         {"step": "OLD POSITION FLAT",
          "value": rev.get("old_position_id"),
          "detail": "flat" if old_flat else "open",
-         "ok": bool(old_flat)},
-        # The stop is LOCAL and position-owned: there is no broker order to
-        # cancel, so closing the position IS clearing the stop.
-        {"step": "OLD LOCAL SL CLEARED",
-         "value": rev.get("old_position_id"),
-         "detail": (rev.get("old_sl_state") or "closed") if old_flat else "pending",
          "ok": bool(old_flat)},
         {"step": "NEW ENTRY",
          "value": rev.get("new_entry_order_id"),
@@ -78,16 +69,13 @@ def _chain_payload(rev: dict, signal: Optional[dict] = None) -> dict:
          "detail": ("qty %s" % rev.get("new_entry_filled_quantity"))
          if rev.get("new_entry_filled_quantity") else "",
          "ok": bool(rev.get("new_position_id"))},
-        {"step": "NEW LOCAL SL ARMED",
-         "value": new_sl_state or None,
-         "detail": new_sl_state,
-         "ok": new_sl_state == "ARMED"},
     ]
     complete = (
         status == "COMPLETE"
         and old_flat
         and entry_confirmed
-        and new_sl_state == "ARMED"
+        and new_entry_status == "FILLED"
+        and bool(rev.get("new_position_id"))
     )
     return {
         "reversal_id": rev.get("reversal_id"),
@@ -106,7 +94,6 @@ def _chain_payload(rev: dict, signal: Optional[dict] = None) -> dict:
         "old_exit_status": old_exit_status,
         "old_exit_fill_price": rev.get("old_exit_fill_price"),
         "old_exit_filled_quantity": rev.get("old_exit_filled_quantity"),
-        "old_sl_state": rev.get("old_sl_state"),
         "new_trade_id": rev.get("new_trade_id"),
         "new_position_id": rev.get("new_position_id"),
         "new_entry_order_id": rev.get("new_entry_order_id"),
@@ -114,7 +101,6 @@ def _chain_payload(rev: dict, signal: Optional[dict] = None) -> dict:
         "new_entry_status": new_entry_status,
         "new_entry_fill_price": rev.get("new_entry_fill_price"),
         "new_entry_filled_quantity": rev.get("new_entry_filled_quantity"),
-        "new_sl_state": rev.get("new_sl_state"),
         "exit_verified_at": rev.get("exit_verified_at"),
         "entry_fill_confirmed_at": rev.get("entry_fill_confirmed_at"),
         "fallback_used": bool(rev.get("fallback_used")),

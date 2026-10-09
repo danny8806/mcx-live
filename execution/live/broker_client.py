@@ -169,6 +169,14 @@ class LiveBrokerClient(ABC):
         no-op."""
         return []
 
+    def instrument_orders_clear(self, instrument: str,
+                                security_id: Optional[str] = None) -> bool:
+        """Whether this transport can confirm no system-owned order is still
+        working for an instrument. Transports without an authoritative order
+        book must fail closed during a contract switch.
+        """
+        return False
+
     def close_instrument(self, instrument: str) -> dict:
         """Square off the open position THIS SYSTEM opened for ONE instrument
         with opposite MARKET orders (contract-rollover final-session fallback).
@@ -349,6 +357,16 @@ class StubLiveBroker(LiveBrokerClient):
             except Exception as e:
                 results.append({"broker_order_id": bid, "ok": False, "error": str(e)})
         return results
+
+    def instrument_orders_clear(self, instrument: str,
+                                security_id: Optional[str] = None) -> bool:
+        with self._lock:
+            return not any(
+                rec.get("instrument") == instrument
+                and str(rec.get("status") or "").lower()
+                    in ("submitted", "partially_filled", "transit", "pending")
+                for rec in self._orders.values()
+            )
 
     def cancel_instrument_orders(self, instrument: str) -> list:
         """Cancel every resting (unfilled) order THIS stub placed for ONE

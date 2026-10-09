@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -48,25 +49,23 @@ class PersistenceFlowMixin:
                 "timestamp": ctx.timestamp, "open": ctx.open, "high": ctx.high,
                 "low": ctx.low, "close": ctx.close,
             }
+            indicator_blob = dict(ctx.indicator_values or {})
+        if indicator_blob is None:
             indicator_blob = {
-                "fast_dema": ctx.dema, "fast_atr": ctx.atr,
-                "htf_value": ctx.htf_value, "mid_value": ctx.mid_value,
+                key: value for key, value in metadata.items()
+                if key.startswith("supertrend_")
             }
         env.persistence.save_signal({
             "signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
             "instrument": signal.instrument, "side": signal.signal_type.value,
             "signal_type": signal_type, "timestamp": signal.timestamp,
-            "trigger_price": signal.trigger_price, "stop_price": signal.stop_price,
+            "trigger_price": signal.trigger_price, "stop_price": None,
             "quantity": signal.quantity,
             "candle_timestamp": ctx.timestamp if ctx is not None else None,
             "open": ctx.open if ctx is not None else None,
             "high": ctx.high if ctx is not None else None,
             "low": ctx.low if ctx is not None else None,
             "close": ctx.close if ctx is not None else None,
-            "htf_value": ctx.htf_value if ctx is not None else None,
-            "mid_value": ctx.mid_value if ctx is not None else None,
-            "fast_dema": ctx.dema if ctx is not None else None,
-            "fast_atr": ctx.atr if ctx is not None else None,
             "signal_reason": metadata.get("reason") or metadata.get("trigger_reason"),
             "candle_data": candle_blob,
             "indicator_data": indicator_blob,
@@ -205,7 +204,8 @@ class PersistenceFlowMixin:
             "instrument": signal.instrument,
             "side": (signal.side or getattr(signal.signal_type, "value", "LONG")).upper(),
             "direction": (signal.side or getattr(signal.signal_type, "value", "LONG")).upper(),
-            "order_type": "LIMIT",
+            "order_type": "MARKET" if (signal.metadata or {}).get(
+                "market_on_signal_close") else "LIMIT",
             "trigger_price": signal.trigger_price,
             "trigger_state": (signal.metadata or {}).get("trigger_state", "ARMED"),
             "trigger_generation": (signal.metadata or {}).get("trigger_generation"),
@@ -235,7 +235,8 @@ class PersistenceFlowMixin:
             registry = getattr(env, "pending_triggers", None)
             if registry is not None:
                 registry.cache_live_row(row)
-            self._sync_live_pending_strategy(signal, env, registry)
+            if not (signal.metadata or {}).get("market_on_signal_close"):
+                self._sync_live_pending_strategy(signal, env, registry)
             return
         row = dict(base)
         row["status"] = PendingOrderState.PENDING.value
@@ -252,7 +253,8 @@ class PersistenceFlowMixin:
         env.persistence.save_pending_order(row)
         if registry is not None:
             registry.cache_live_row(row)
-        self._sync_live_pending_strategy(signal, env, registry)
+        if not (signal.metadata or {}).get("market_on_signal_close"):
+            self._sync_live_pending_strategy(signal, env, registry)
         self.publish_event("pending_order_armed", {
             "pending_order_id": pend_id, "signal_id": pend_id,
             "state": row["status"], "execution_mode": env.mode}, env_name=env.name)
@@ -427,6 +429,42 @@ class PersistenceFlowMixin:
                 log.error("[Engine] armed pending %s cannot be restored; missing strategy/id/trigger",
                           signal_id or "?")
                 continue
+            if getattr(strategy, "strategy_type", None) == "supertrend":
+                try:
+                    saved_signal = persistence.get_signal(signal_id)
+                    stored_meta = json.loads(
+                        (saved_signal or {}).get("signal_metadata") or "{}")
+                except Exception as exc:
+                    saved_signal, stored_meta = None, {}
+                    log.error("[Engine] cannot validate restored SuperTrend trigger %s: %s",
+                              signal_id, exc)
+                valid_handoff = bool(
+                    stored_meta.get("strategy_type") == "supertrend"
+                    and stored_meta.get("market_on_signal_close")
+                    and stored_meta.get("no_separate_stop"))
+                if not valid_handoff:
+                    try:
+                        retired = persistence.terminalize_pending_order(
+                            signal_id,
+                            status=PendingOrderState.CANCELLED_BY_STRATEGY_CHANGE.value,
+                            reason="retired_strategy_trigger_before_supertrend_runtime")
+                    except Exception as exc:
+                        retired = False
+                        log.error("[Engine] could not retire old-format trigger %s: %s",
+                                  signal_id, exc)
+                    registry.remove_signal(signal_id)
+                    self._discard_unjournaled_live_pending(
+                        strategy, env,
+                        "pending signal was created by a retired strategy format",
+                        signal_id=signal_id)
+                    if not retired:
+                        if env.safe_mode is not None:
+                            env.safe_mode.enter_safe_mode(
+                                "legacy_strategy_trigger_unresolved",
+                                f"Could not retire pending trigger {signal_id}")
+                    log.warning("[Engine] retired legacy-format pending trigger %s "
+                                "for SuperTrend strategy %s", signal_id, sid)
+                    continue
             current = strategy.pending_entry
             if current is not None and getattr(current.signal, "signal_id", None) == signal_id:
                 registry.sync_strategy(strategy)
@@ -452,10 +490,12 @@ class PersistenceFlowMixin:
                     "signal_candle_high": saved.get("high"),
                     "signal_candle_low": saved.get("low"),
                     "signal_candle_close": saved.get("close"),
-                    "signal_htf_dema_atr": saved.get("htf_value"),
-                    "signal_mid_dema_atr": saved.get("mid_value"),
-                    "signal_fast_dema_atr": saved.get("fast_dema"),
                 }
+                try:
+                    indicator_data = json.loads(saved.get("indicator_data") or "{}")
+                except (TypeError, ValueError):
+                    indicator_data = {}
+                metadata.update(indicator_data)
                 pending_source = str(row.get("trigger_source") or "")
                 if pending_source.startswith("reversal_entry_wait:"):
                     metadata["pending_gate_wait_reason"] = pending_source.split(
@@ -480,9 +520,7 @@ class PersistenceFlowMixin:
                 freeze_signal_context(
                     signal, close=saved.get("close"), high=saved.get("high"),
                     low=saved.get("low"), timestamp=saved.get("candle_timestamp") or timestamp,
-                    open_=saved.get("open"), dema=saved.get("fast_dema"),
-                    atr=saved.get("fast_atr"), htf_value=saved.get("htf_value"),
-                    mid_value=saved.get("mid_value"),
+                    open_=saved.get("open"), indicator_values=indicator_data,
                 )
                 created_at = time.time()
                 try:
@@ -550,7 +588,6 @@ class PersistenceFlowMixin:
                     # parked until this exact order is confirmed terminal/flat.
                     pending.status = "waiting_for_flat"
                     strategy.pending_exit_trigger = None
-                    strategy.stop_exit_submitted = True
                     strategy.state = StrategyState.EXIT_ORDER_SUBMITTED
                     position = next((p for p in getattr(
                         getattr(env, "position_manager", None), "open_positions", [])
@@ -560,13 +597,6 @@ class PersistenceFlowMixin:
                     if position is not None:
                         position.exit_started = True
                         position.exit_order_id = active_reversal_exit.order_id
-                        position.sl_state = "EXITING"
-                        monitor_factory = getattr(self, "_sl_monitor", None)
-                        if callable(monitor_factory):
-                            monitor = monitor_factory(env)
-                            monitor.arm(position)
-                            monitor.mark_exiting(position.position_id,
-                                                 active_reversal_exit.order_id)
                         try:
                             persistence.save_position(position)
                         except Exception:
@@ -608,41 +638,6 @@ class PersistenceFlowMixin:
                           signal_id, exc)
         return restored
 
-    def _invalidate_warmed_pending_triggers(self, env) -> int:
-        """Retire restored triggers against the latest completed hourly line.
-
-        Startup restores SQLite rows before the REST warmup. Run this check
-        after warmup and before connecting the market feed, so a gap-open tick
-        cannot fire a trigger from an older hourly indicator context.
-        """
-        invalidated_count = 0
-        with getattr(self, "_lock", nullcontext()):
-            for strategy in (getattr(env, "strategies", {}) or {}).values():
-                pending = (getattr(strategy, "pending_entry", None)
-                           or getattr(strategy, "pending_exit_trigger", None))
-                old_signal = getattr(pending, "signal", None)
-                if old_signal is None:
-                    continue
-                slow_state = getattr(strategy, "slow_htf_state", None)
-                current_value = getattr(slow_state, "last_value", None)
-                invalidated = strategy._invalidate_changed_dema_triggers(
-                    current_value)
-                if not invalidated:
-                    continue
-                registry = getattr(env, "pending_triggers", None)
-                if registry is not None:
-                    registry.sync_strategy(strategy)
-                control = strategy._dema_cancel_control_signal(
-                    time.time(), float(old_signal.trigger_price), invalidated)
-                self._process_signal(control, env.name)
-                invalidated_count += 1
-                log.warning(
-                    "[Engine] retired restored trigger %s for %s: hourly "
-                    "DEMA-ATR %r -> %r",
-                    invalidated["old_pending_id"], strategy.strategy_id,
-                    invalidated["trigger_htf_dema_atr"],
-                    invalidated["current_htf_dema_atr"])
-        return invalidated_count
         self.publish_event("pending_order_entry_sent", {
             "pending_order_id": pend_id, "signal_id": pend_id,
             "trade_id": trade.trade_id, "order_id": order.order_id,
@@ -889,7 +884,6 @@ class PersistenceFlowMixin:
                 # The stop-out re-fire guard lifts once the position actually
                 # closes: the strategy is flat again, so later stop exits (new
                 # trades) are evaluated normally.
-                setattr(strategy, "stop_exit_submitted", False)
                 strategy._last_fired_trigger_signal_id = None
                 strategy._fired_trigger_signal_ids.clear()
                 if not keep:

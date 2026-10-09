@@ -9,7 +9,7 @@ next engine boot applies so trading continues in the next series.
 Policy (operator-chosen)
 ------------------------
 * ROLLOVER WINDOW opens at ``last_session - trigger_days`` trading days
-  (default 1).  From then on new entries in the EXPIRING series are blocked
+  (default 2).  From then on new entries in the EXPIRING series are blocked
   (resting entries are cancelled at window open) and the metal waits to go
   flat — the open trade exits naturally (SL/TP/reversal).
 * Once flat inside the window the system resolves the next series from the
@@ -101,7 +101,9 @@ class MetalRolloverRecord:
                  "prev_symbol", "prev_security_id", "switched_on",
                  "phase", "window_open", "last_session",
                  "expiry_date", "next_symbol", "next_security_id",
-                 "force_close_sent", "alerts")
+                 "force_close_sent", "alerts", "workflow_phase",
+                 "roll_id", "candidate", "carry_positions", "last_error",
+                 "verified_symbol", "verified_security_id")
 
     def __init__(self, metal: str):
         self.metal = metal
@@ -118,6 +120,13 @@ class MetalRolloverRecord:
         self.next_security_id: Optional[str] = None
         self.force_close_sent: bool = False
         self.alerts: dict[str, str] = {}  # kind -> ISO date last raised
+        self.workflow_phase: str = "IDLE"
+        self.roll_id: Optional[str] = None
+        self.candidate: Optional[dict] = None
+        self.carry_positions: list[dict] = []
+        self.last_error: Optional[str] = None
+        self.verified_symbol: Optional[str] = None
+        self.verified_security_id: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -135,6 +144,13 @@ class MetalRolloverRecord:
             "next_security_id": self.next_security_id,
             "force_close_sent": self.force_close_sent,
             "alerts": dict(self.alerts),
+            "workflow_phase": self.workflow_phase,
+            "roll_id": self.roll_id,
+            "candidate": dict(self.candidate or {}),
+            "carry_positions": [dict(row) for row in self.carry_positions],
+            "last_error": self.last_error,
+            "verified_symbol": self.verified_symbol,
+            "verified_security_id": self.verified_security_id,
         }
 
     @classmethod
@@ -153,6 +169,14 @@ class MetalRolloverRecord:
         rec.next_security_id = d.get("next_security_id")
         rec.force_close_sent = bool(d.get("force_close_sent"))
         rec.alerts = dict(d.get("alerts") or {})
+        rec.workflow_phase = str(d.get("workflow_phase") or "IDLE")
+        rec.roll_id = d.get("roll_id")
+        rec.candidate = dict(d.get("candidate") or {}) or None
+        rec.carry_positions = [dict(row) for row in d.get("carry_positions", [])
+                               if isinstance(row, dict)]
+        rec.last_error = d.get("last_error")
+        rec.verified_symbol = d.get("verified_symbol")
+        rec.verified_security_id = d.get("verified_security_id")
         return rec
 
 
@@ -176,14 +200,33 @@ class RolloverService:
     ):
         cfg = config or {}
         self.enabled = bool(cfg.get("enabled", False))
-        self.trigger_days = int(cfg.get("trigger_days_before_expiry", 1) or 1)
+        self.trigger_days = int(cfg.get("trigger_days_before_expiry", 2) or 2)
         self.block_on_window = bool(cfg.get("block_entries_on_window", True))
         self.cancel_on_window = bool(cfg.get("cancel_resting_on_window", True))
         self.force_close_on_last = bool(cfg.get("force_close_on_last_session", True))
         sm_cfg = cfg.get("scrip_master") or {}
-        self.holidays: frozenset[date] = frozenset()
+        # Use the same checked-in MCX calendar as MarketStatus. A second,
+        # empty rollover-only holiday list silently shifted expiry windows
+        # across full exchange closures.
+        calendar_path = Path(cfg.get("calendar_path") or
+                             (Path(__file__).resolve().parents[1]
+                              / "config/mcx_calendar.json"))
+        self.calendar_valid_through: Optional[str] = None
+        calendar_holidays: set[date] = set()
+        try:
+            calendar = json.loads(calendar_path.read_text(encoding="utf-8"))
+            self.calendar_valid_through = calendar.get("valid_through")
+            for day, session in (calendar.get("sessions") or {}).items():
+                if isinstance(session, dict) and session.get("closed") is True:
+                    try:
+                        calendar_holidays.add(date.fromisoformat(str(day)[:10]))
+                    except ValueError:
+                        continue
+        except (OSError, ValueError, TypeError) as e:
+            log.warning("[Rollover] MCX holiday calendar unavailable (%s); "
+                        "using configured holidays only", e)
         raw_holidays = cfg.get("holidays") or []
-        parsed_holidays = set()
+        parsed_holidays = set(calendar_holidays)
         for h in raw_holidays:
             try:
                 parsed_holidays.add(date.fromisoformat(str(h)[:10]))
@@ -217,7 +260,7 @@ class RolloverService:
             log.warning("[Rollover] state load failed (%s); starting fresh", e)
             self._records = {}
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.state_path.with_suffix(".json.tmp")
@@ -225,8 +268,10 @@ class RolloverService:
                 metal: rec.to_dict() for metal, rec in self._records.items()
             }, indent=2), encoding="utf-8")
             tmp.replace(self.state_path)
+            return True
         except OSError as e:
             log.warning("[Rollover] state save failed: %s", e)
+            return False
 
     def record(self, metal: str) -> MetalRolloverRecord:
         return self._records.setdefault(metal, MetalRolloverRecord(metal))
@@ -244,6 +289,140 @@ class RolloverService:
                     "switched_on": rec.switched_on,
                 }
         return out
+
+    def next_contract(self, metal: str, current_symbol: str,
+                      as_of: date) -> Optional[FutureContract]:
+        """Resolve the next contract through the same scrip-master source."""
+        current = self.scrip.find_symbol(metal, current_symbol)
+        if current is None:
+            return None
+        return self.scrip.next_contract(metal, current, as_of=as_of)
+
+    def requires_broker_confirmation(self, metal: str, current_symbol: str,
+                                     current_security_id: str,
+                                     today: date) -> bool:
+        """Whether this contract is inside its rollover window.
+
+        Position and order REST checks are only needed once the rollover
+        window opens. Unknown metadata is handled by ``evaluate`` as an
+        entry-blocking error and must not trigger repeated broker polling.
+        """
+        if not self.enabled:
+            return False
+        current = self.scrip.find_symbol(metal, current_symbol)
+        if current is not None:
+            if str(current.security_id) != str(current_security_id):
+                return False
+            expiry = current.expiry_date
+        else:
+            rec = self.record(metal)
+            if (rec.verified_symbol != current_symbol
+                    or str(rec.verified_security_id or "")
+                    != str(current_security_id) or not rec.expiry_date):
+                # Unknown current-contract metadata must be reconciled with
+                # the broker before the recovery path can switch to a fresh
+                # master-listed series.
+                return True
+            try:
+                expiry = date.fromisoformat(rec.expiry_date)
+            except ValueError:
+                return False
+        window_open, _last_session = resolve_window(
+            expiry, self.trigger_days, self.holidays)
+        return today >= window_open
+
+    def _verified_contract(self, rec: MetalRolloverRecord, metal: str,
+                           symbol: str, security_id: str) -> Optional[FutureContract]:
+        """Rebuild only a previously master-verified contract identity.
+
+        Dhan can remove an expired contract from the current master. Retaining
+        its exact symbol, security ID, and expiry lets the engine reconcile the
+        old contract and select a later master-listed series without guessing.
+        """
+        if (rec.verified_symbol != symbol
+                or str(rec.verified_security_id or "") != str(security_id)
+                or not rec.expiry_date):
+            return None
+        try:
+            expiry = datetime.fromisoformat(
+                f"{date.fromisoformat(rec.expiry_date).isoformat()}T23:30:00+05:30")
+        except ValueError:
+            return None
+        return FutureContract(metal, str(security_id), symbol, expiry)
+
+    def _persist_switch(self, rec: MetalRolloverRecord, metal: str,
+                        current_symbol: str, current_security_id: str,
+                        nxt: FutureContract, today: date) -> bool:
+        """Persist a verified flat rollover before allowing a new boot."""
+        with self._lock:
+            old = (rec.prev_symbol, rec.prev_security_id, rec.active_symbol,
+                   rec.active_security_id, rec.next_symbol, rec.next_security_id,
+                   rec.switched_on, rec.phase)
+            rec.prev_symbol = current_symbol
+            rec.prev_security_id = str(current_security_id)
+            rec.active_symbol = nxt.config_symbol()
+            rec.active_security_id = nxt.security_id
+            rec.next_symbol = nxt.config_symbol()
+            rec.next_security_id = nxt.security_id
+            rec.switched_on = today.isoformat()
+            rec.phase = PHASE_SWITCHED
+            if not self._save():
+                (rec.prev_symbol, rec.prev_security_id, rec.active_symbol,
+                 rec.active_security_id, rec.next_symbol, rec.next_security_id,
+                 rec.switched_on, rec.phase) = old
+                self._alert_once(
+                    rec, "state_persist_failed", today,
+                    f"{metal}: rollover state could not be durably saved; "
+                    "contract switch withheld")
+                return False
+        self._alert_once(
+            rec, "switched", today,
+            f"{metal}: flat — rolling {current_symbol} -> {nxt.config_symbol()} "
+            f"(sid {current_security_id} -> {nxt.security_id}); trading resumes "
+            "in the new series at the next engine boot. Entries stay blocked "
+            "until then.",
+            next_symbol=nxt.config_symbol(), next_security_id=nxt.security_id)
+        return True
+
+    def _refresh_contract_master(self) -> None:
+        """Request a rate-limited fresh ladder when rollover cannot resolve it."""
+        refresh = getattr(self.scrip, "refresh_if_due", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh()
+        except Exception as e:
+            log.warning("[Rollover] scrip-master refresh failed: %s", e)
+
+    def workflow(self, metal: str) -> dict:
+        """Return a detached snapshot of the persisted roll workflow."""
+        rec = self.record(metal)
+        return {
+            "phase": rec.workflow_phase,
+            "roll_id": rec.roll_id,
+            "candidate": dict(rec.candidate or {}),
+            "carry_positions": [dict(row) for row in rec.carry_positions],
+            "last_error": rec.last_error,
+        }
+
+    def update_workflow(self, metal: str, *, phase: Optional[str] = None,
+                        roll_id: Optional[str] = None,
+                        candidate: Optional[dict] = None,
+                        carry_positions: Optional[list[dict]] = None,
+                        last_error: Optional[str] = None) -> bool:
+        """Persist workflow state before broker actions; never ignore failure."""
+        with self._lock:
+            rec = self.record(metal)
+            if phase is not None:
+                rec.workflow_phase = str(phase)
+            if roll_id is not None:
+                rec.roll_id = str(roll_id)
+            if candidate is not None:
+                rec.candidate = dict(candidate)
+            if carry_positions is not None:
+                rec.carry_positions = [dict(row) for row in carry_positions]
+            rec.last_error = last_error
+            return self._save()
 
     # ── alert helpers ──────────────────────────────────────────────────
 
@@ -266,10 +445,17 @@ class RolloverService:
             log.warning("[Rollover] alert failed: %s", e)
         self.emit("contract_rollover_alert", alert)
 
+    def alert_once(self, metal: str, kind: str, today: date,
+                   message: str, **detail) -> None:
+        """Expose rate-limited rollover alerts for engine-side safety checks."""
+        with self._lock:
+            self._alert_once(self.record(metal), kind, today, message, **detail)
+
     # ── decider ────────────────────────────────────────────────────────
 
     def evaluate(self, metal: str, current_symbol: str, current_security_id: str,
-                 today: date, has_positions: bool) -> list[str]:
+                 today: date, has_positions: bool,
+                 resting_orders_clear: bool = False) -> list[str]:
         """Decide the actions the engine must take for one metal.
 
         Returns a list of action tokens:
@@ -277,8 +463,10 @@ class RolloverService:
           * ``cancel_resting``   — cancel resting broker orders (once, window open)
           * ``force_close``      — MARKET-close the expiring series now
           * ``persist_switch``   — next series resolved; override persisted
-          * ``unknown``          — scrip-master unavailable (alert; no blocking)
-        Never raises: an unresolved series degrades to alerts + blocking.
+          * ``unknown``          — contract metadata unavailable (alert)
+        Never raises: uncertain contract metadata blocks new entries. A flat
+        contract switch is withheld until resting orders have been verified
+        terminal by the broker.
         """
         if not self.enabled:
             return []
@@ -289,29 +477,111 @@ class RolloverService:
         # session (e.g. a boot without apply).
         contracts = self.scrip.futures(metal)
         if not contracts:
+            self._refresh_contract_master()
+            contracts = self.scrip.futures(metal)
+        if not contracts:
             self._alert_once(
                 rec, "cannot_resolve", today,
                 f"{metal}: Dhan scrip master unavailable — rollover cannot "
-                f"proceed; entries left untouched", security_id=current_security_id)
-            return ["unknown"]
+                f"proceed; new entries blocked", security_id=current_security_id)
+            return ["unknown", "block_entries"]
 
         current = self.scrip.find_symbol(metal, current_symbol)
         if current is None:
-            # Possible only with a stale/drifted config symbol; do not block
-            # blindly — surface loudly so an operator fixes the ladder.
+            self._refresh_contract_master()
+            current = self.scrip.find_symbol(metal, current_symbol)
+        if current is None:
+            current = self._verified_contract(
+                rec, metal, current_symbol, current_security_id)
+        if current is None:
+            # Recovery for an expired/stale config whose old row has already
+            # disappeared from Dhan's active master. We can safely advance to
+            # the nearest listed series only after the exact old SID is flat
+            # and its broker order book is clear. Open/unknown old exposure
+            # remains blocked for manual reconciliation; never guess its exit.
+            candidates = [
+                contract for contract in contracts
+                if contract.config_symbol().upper()
+                != str(current_symbol).strip().upper()
+                and contract.expiry_date >= today
+            ]
+            actions = ["unknown"]
+            if self.block_on_window:
+                actions.append("block_entries")
+            if self.cancel_on_window:
+                actions.append("cancel_resting")
+            if not candidates:
+                self._alert_once(
+                    rec, "current_unknown", today,
+                    f"{metal}: current contract {current_symbol} is absent "
+                    "from Dhan's active master and no later series is listed; "
+                    "new entries blocked",
+                    security_id=current_security_id)
+                return actions
+            if has_positions:
+                self._alert_once(
+                    rec, "unknown_contract_position", today,
+                    f"{metal}: the configured contract is absent from Dhan's "
+                    "active master while an old-contract position/order may "
+                    "exist; rollover is waiting for broker-flat and order-clear "
+                    "confirmation",
+                    security_id=current_security_id)
+                return actions
+            if self.cancel_on_window and not resting_orders_clear:
+                return actions
+            nxt = min(candidates, key=lambda contract: contract.expiry)
+            if self._persist_switch(
+                    rec, metal, current_symbol, current_security_id, nxt, today):
+                return actions + ["persist_switch"]
+            return actions
+
+        if str(current.security_id) != str(current_security_id):
+            self._refresh_contract_master()
+            current = self.scrip.find_symbol(metal, current_symbol)
+        if current is None:
+            current = self._verified_contract(
+                rec, metal, current_symbol, current_security_id)
+        if current is None:
             self._alert_once(
                 rec, "current_unknown", today,
                 f"{metal}: current contract {current_symbol} not found in the "
-                f"scrip master (sid={current_security_id})",
+                f"scrip master after refresh (sid={current_security_id}); "
+                "new entries blocked",
                 security_id=current_security_id)
-            return []
+            return ["unknown", "block_entries"]
+        if str(current.security_id) != str(current_security_id):
+            self._alert_once(
+                rec, "security_id_mismatch", today,
+                f"{metal}: configured security ID {current_security_id} does not "
+                f"match Dhan master ID {current.security_id} for {current_symbol}; "
+                "new entries blocked",
+                configured_security_id=str(current_security_id),
+                master_security_id=str(current.security_id),
+            )
+            return ["unknown", "block_entries"]
 
         expiry = current.expiry_date
         window_open, last_session = resolve_window(
             expiry, self.trigger_days, self.holidays)
+        metadata_changed = (
+            rec.verified_symbol != current_symbol
+            or str(rec.verified_security_id or "") != str(current_security_id)
+            or rec.expiry_date != expiry.isoformat()
+            or rec.window_open != window_open.isoformat()
+            or rec.last_session != last_session.isoformat())
+        rec.verified_symbol = current_symbol
+        rec.verified_security_id = str(current_security_id)
         rec.expiry_date = expiry.isoformat()
         rec.window_open = window_open.isoformat()
         rec.last_session = last_session.isoformat()
+        if metadata_changed and not self._save():
+            self._alert_once(
+                rec, "contract_metadata_persist_failed", today,
+                f"{metal}: verified contract expiry could not be saved; "
+                "automatic recovery after this contract leaves Dhan's master "
+                "may require operator reconciliation",
+                security_id=str(current_security_id),
+                expiry=expiry.isoformat())
 
         if today < window_open:
             rec.phase = PHASE_NORMAL
@@ -337,6 +607,12 @@ class RolloverService:
             actions.append("cancel_resting")
 
         if not has_positions:
+            # A successful DELETE acknowledgement is not enough to switch
+            # contracts: an order may have filled while cancellation was in
+            # flight. The caller must verify all old-contract orders terminal
+            # with the broker before asking the decider to persist a switch.
+            if self.cancel_on_window and not resting_orders_clear:
+                return actions
             # Flat within the window -> attempt the switch to the next series.
             if rec.switched_on is not None and rec.switched_on != today.isoformat():
                 # Already switched on a previous day but still evaluating the
@@ -349,37 +625,35 @@ class RolloverService:
                 return actions
             nxt = self.scrip.next_contract(metal, current, as_of=today)
             if nxt is None:
+                self._refresh_contract_master()
+                refreshed_current = self.scrip.find_symbol(metal, current_symbol)
+                if (refreshed_current is not None
+                        and str(refreshed_current.security_id)
+                        == str(current_security_id)):
+                    current = refreshed_current
+                    nxt = self.scrip.next_contract(metal, current, as_of=today)
+            if nxt is None:
                 self._alert_once(
                     rec, "no_next_series", today,
                     f"{metal}: flat in {current_symbol} but no NEXT series "
                     f"found — entries stay blocked")
                 return actions
-            # Persist the override (engine applies at next boot).
-            with self._lock:
-                rec.prev_symbol = current_symbol
-                rec.prev_security_id = current_security_id
-                rec.active_symbol = nxt.config_symbol()
-                rec.active_security_id = nxt.security_id
-                rec.next_symbol = nxt.config_symbol()
-                rec.next_security_id = nxt.security_id
-                rec.switched_on = today.isoformat()
-                rec.phase = PHASE_SWITCHED
-                self._save()
-            self._alert_once(
-                rec, "switched", today,
-                f"{metal}: flat — rolling {current_symbol} -> {nxt.config_symbol()} "
-                f"(sid {current_security_id} -> {nxt.security_id}); trading resumes "
-                f"in the new series at the next engine boot. Entries stay blocked "
-                f"until then.",
-                next_symbol=nxt.config_symbol(), next_security_id=nxt.security_id)
-            return actions + ["persist_switch"]
+            if self._persist_switch(
+                    rec, metal, current_symbol, current_security_id, nxt, today):
+                return actions + ["persist_switch"]
+            return actions
         else:
             # Still holding.
             if today >= last_session and self.force_close_on_last:
                 if not rec.force_close_sent:
                     rec.force_close_sent = True
-                    self._save()
-                    actions.append("force_close")
+                    if not self._save():
+                        rec.force_close_sent = False
+                        self._alert_once(
+                            rec, "state_persist_failed", today,
+                            f"{metal}: rollover close intent could not be "
+                            "durably saved; automatic close withheld")
+                        return actions
                     self._alert_once(
                         rec, "force_close", today,
                         f"{metal}: STILL HOLDING on the final session "
@@ -390,12 +664,18 @@ class RolloverService:
                         rec, "still_holding_last_day", today,
                         f"{metal}: STILL HOLDING on the final session "
                         f"{last_session} — repeated force-close in flight")
+                # Keep asking the lifecycle exit path to reconcile/retry. That
+                # path deduplicates an already-working exit; a prior rejection
+                # or unresolved response must not permanently consume rollover.
+                actions.append("force_close")
             return actions
 
     def status(self) -> dict:
         return {
             "enabled": self.enabled,
             "trigger_days": self.trigger_days,
+            "holiday_count": len(self.holidays),
+            "calendar_valid_through": self.calendar_valid_through,
             "state_path": str(self.state_path),
             "records": {m: r.to_dict() for m, r in self._records.items()},
         }

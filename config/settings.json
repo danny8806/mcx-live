@@ -5,10 +5,10 @@
     "environment": "paper",
     "environments": ["paper"],
     "log_level": "INFO",
-    "db_path": "data/db/trading.db",
-    "state_path": "data/db/system_state.json",
-    "live_db_path": "data/db/live_trading.db",
-    "live_state_path": "data/db/live_system_state.json",
+    "db_path": "data/db/supertrend_paper.sqlite3",
+    "state_path": "data/db/supertrend_paper_state.json",
+    "live_db_path": "live/data/db/supertrend/supertrend_live.sqlite3",
+    "live_state_path": "live/data/db/supertrend/supertrend_live_state.json",
     "live_enabled": false
   },
 "dhan": {
@@ -66,71 +66,34 @@
       }
     }
   },
-  "indicators": {
-    "dema_period": 3,
-    "atr_period": 6,
-    "atr_factor": 1.0
-  },
 "strategies": {
-    "gold_01": {
+    "gold_02": {
       "instrument": "GOLDM",
-      "fast_timeframe": "5m",
-      "mid_timeframe": "15m",
-      "htf_timeframe": "1h",
+      "strategy_type": "supertrend",
+      "signal_timeframe": "15m",
+      "supertrend": {"atr_period": 46, "multiplier": 3.9, "source": "ohlc4", "atr_method": "sma_tr", "first_tr": "na"},
       "quantity": 1,
       "capital": 300000,
       "enabled": true,
       "lots": 1,
-      "live_gate": "ON",
+      "live_gate": "OFF",
       "entry_enabled": true,
       "exit_enabled": true,
-      "reversal_enabled": true,
-      "sl_enabled": true
-    },
-    "gold_02": {
-      "instrument": "GOLDM",
-      "fast_timeframe": "15m",
-      "mid_timeframe": "15m",
-      "htf_timeframe": "1h",
-      "quantity": 100,
-      "capital": 300000,
-      "enabled": true,
-      "lots": 1,
-      "live_gate": "ON",
-      "entry_enabled": true,
-      "exit_enabled": true,
-      "reversal_enabled": true,
-      "sl_enabled": true
+      "reversal_enabled": true
     },
     "silver_01": {
       "instrument": "SILVERM",
-      "fast_timeframe": "15m",
-      "mid_timeframe": "15m",
-      "htf_timeframe": "1h",
-      "quantity": 100,
-      "capital": 300000,
-      "enabled": true,
-      "lots": 1,
-      "live_gate": "ON",
-      "entry_enabled": true,
-      "exit_enabled": true,
-      "reversal_enabled": true,
-      "sl_enabled": true
-    },
-    "silver_02": {
-      "instrument": "SILVERM",
-      "fast_timeframe": "5m",
-      "mid_timeframe": "15m",
-      "htf_timeframe": "1h",
+      "strategy_type": "supertrend",
+      "signal_timeframe": "15m",
+      "supertrend": {"atr_period": 36, "multiplier": 4.9, "source": "low", "atr_method": "sma_tr", "first_tr": "na"},
       "quantity": 1,
       "capital": 300000,
       "enabled": true,
       "lots": 1,
-      "live_gate": "ON",
+      "live_gate": "OFF",
       "entry_enabled": true,
       "exit_enabled": true,
-      "reversal_enabled": true,
-      "sl_enabled": true
+      "reversal_enabled": true
     }
   },
   "paper_execution": {
@@ -167,6 +130,10 @@
     "pnl_poll_interval_seconds": 0.5,
     "max_retries": 3,
     "retry_backoff_seconds": 1.0,
+    "market_data": {
+      "stale_after_seconds": 90.0,
+      "max_signal_age_seconds": 60.0
+    },
     "dhan": {
       "client_id": "${DHAN_CLIENT_ID}",
       "access_token": "${DHAN_ACCESS_TOKEN}",
@@ -176,11 +143,6 @@
       "pin": "${TRADING_PIN}",
       "totp_secret": "${TOTP_SECRET}",
       "product_type": "MARGIN"
-    },
-    "price_model": {
-      "enabled": false,
-      "entry_offset": 0.0,
-      "sl_offset": 0.0
     },
     "order_ws": {
       "enabled": false,

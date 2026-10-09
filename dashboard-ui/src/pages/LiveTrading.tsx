@@ -53,7 +53,7 @@ export default function LiveTrading() {
     const timer = window.setInterval(refresh, 3000);
     return () => { active = false; window.clearInterval(timer); };
   }, []);
-  if (!overview || snapshotStatus.overview !== "live") return <div className="desk-unavailable"><ShieldAlert size={21}/><div><strong>Current account snapshot unavailable</strong><p>The dashboard has not received a successful account snapshot, so positions, triggers, and P&amp;L cannot be confirmed.</p>{lastError && <small>{lastError}</small>}</div></div>;
+  if (!overview || snapshotStatus.overview !== "live") return <div className="desk-unavailable"><ShieldAlert size={21}/><div><strong>Current account snapshot unavailable</strong><p>The dashboard has not received a successful account snapshot, so position, order, and P&amp;L state cannot be confirmed.</p>{lastError && <small>{lastError}</small>}</div></div>;
 
   const open = positions.filter((position: any) => position.is_open);
   const overviewKnown = Boolean(overview.execution_mode && !["UNKNOWN", "UNAVAILABLE"].includes(String(overview.execution_mode).toUpperCase()));
@@ -63,28 +63,28 @@ export default function LiveTrading() {
   const fillsKnown = snapshotStatus.fills === "live";
   const getLtp = (instrument: string) => safeNum(marketData?.instruments?.[instrument]?.ltp ?? (instrument === "GOLDM" ? gold?.ltp : instrument === "SILVERM" ? silver?.ltp : undefined));
   const instruments = [...new Set([...Object.keys(marketData?.instruments ?? {}), ...strategies.map((s: any) => s.instrument), ...open.map((p: any) => p.instrument)].filter(Boolean))].sort();
-  const activeTriggers = strategiesKnown ? strategies.flatMap((strategy: any) => [
-    strategy.pending_exit_trigger ? { ...strategy.pending_exit_trigger, strategy, triggerKind: "REVERSAL EXIT" } : null,
-    strategy.pending_entry ? { ...strategy.pending_entry, strategy, triggerKind: strategy.pending_entry?.metadata?.is_reversal_entry ? "REVERSAL ENTRY" : "ENTRY" } : null,
-  ].filter(Boolean) as any[]) : [];
+  const reversalHandoffs = strategiesKnown ? strategies.flatMap((strategy: any) =>
+    strategy.pending_entry?.metadata?.is_reversal_entry
+      ? [{ ...strategy.pending_entry, strategy }]
+      : []) : [];
   const workingOrders = orders.filter((order: any) => activeOrderStates.has(orderState(order)));
   const unclassifiedOrders = orders.filter((order: any) => !activeOrderStates.has(orderState(order)) && !new Set(["created", "filled", "rejected", "cancelled", "canceled", "expired", "complete", "completed"]).has(orderState(order)));
   const unmatchedBrokerPositions = (brokerPositions?.positions ?? []).filter((position: any) => position.status !== "MATCHED");
 
   return <div className="live-floor">
     <section className="desk-hero">
-      <div><div className="eyebrow">REAL-TIME EXECUTION</div><h2>Live execution desk</h2><p>Runtime state, armed triggers, broker orders, open positions, and local stop monitoring.</p></div>
+      <div><div className="eyebrow">REAL-TIME EXECUTION</div><h2>Live SuperTrend desk</h2><p>GOLDM and SILVERM · completed 15-minute candles · market submission after candle close · no separate strategy SL.</p></div>
       <div className="desk-hero-status"><StateTag kind={connected ? "good" : "bad"}>{connected ? "Dashboard socket connected" : "Dashboard socket disconnected"}</StateTag><StateTag kind={marketData?.ws_connected ? "good" : "warn"}>{marketData?.ws_connected ? "Market feed connected" : "Market feed disconnected"}</StateTag><StateTag kind={overview.execution_mode === "LIVE" ? "bad" : "neutral"}>{overview.execution_mode || "MODE UNKNOWN"}</StateTag></div>
     </section>
 
     {overview.kill_switch && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Kill switch is active</b><small>Trading is halted according to the current runtime state.</small></div></div>}
     {reconciliation?.is_consistent === false && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Broker and local ledgers differ</b><small>{reconciliation.summary?.total_errors ?? reconciliation.errors?.length ?? "?"} reconciliation error(s). Check Reconciliation before relying on local fills or P&amp;L.</small></div></div>}
     {reconciliation?._fetch_error && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Reconciliation refresh failed</b><small>Last confirmed snapshot: {reconciliation._fetched_at ? formatTimestamp(reconciliation._fetched_at) : "unknown"}. Check Reconciliation.</small></div></div>}
-    {brokerPositionsError ? <div role="alert" className="desk-warning"><ShieldAlert size={20}/><div><b>Dhan position comparison unavailable</b><small>{brokerPositionsError}. Local flat state does not confirm the broker account is flat.</small></div></div> : unmatchedBrokerPositions.length > 0 && <div role="alert" className="desk-warning"><ShieldAlert size={20}/><div><b>Broker/local position mismatch — account is not confirmed flat</b><small>Local SL ownership may be unavailable. Do not rely on the local position count until this exposure is reconciled.</small><div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>{unmatchedBrokerPositions.map((position: any) => <span key={position.instrument} style={{ border: "1px solid var(--border-subtle)", borderRadius: 4, padding: "5px 8px" }}><b>{position.instrument}</b> · {position.status} · Dhan {position.dhan?.side} {position.dhan?.quantity} @ {safeINR(position.dhan?.average_entry_price)} · Local {position.local ? `${position.local.side} ${position.local.quantity}` : "none"}</span>)}</div></div></div>}
+      {brokerPositionsError ? <div role="alert" className="desk-warning"><ShieldAlert size={20}/><div><b>Dhan position comparison unavailable</b><small>{brokerPositionsError}. Local flat state does not confirm the broker account is flat.</small></div></div> : unmatchedBrokerPositions.length > 0 && <div role="alert" className="desk-warning"><ShieldAlert size={20}/><div><b>Broker/local position mismatch — account is not confirmed flat</b><small>Do not rely on the local position count until this exposure is reconciled.</small><div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>{unmatchedBrokerPositions.map((position: any) => <span key={position.instrument} style={{ border: "1px solid var(--border-subtle)", borderRadius: 4, padding: "5px 8px" }}><b>{position.instrument}</b> · {position.status} · Dhan {position.dhan?.side} {position.dhan?.quantity} @ {safeINR(position.dhan?.average_entry_price)} · Local {position.local ? `${position.local.side} ${position.local.quantity}` : "none"}</span>)}</div></div></div>}
 
     <section className="desk-metrics">
       <Value label="Open positions" value={positionsKnown ? open.length : "—"}/>
-      <Value label="Armed triggers" value={strategiesKnown ? activeTriggers.length : "—"}/>
+      <Value label="Reversal handoffs" value={strategiesKnown ? reversalHandoffs.length : "—"}/>
       <Value label="Working broker orders" value={ordersKnown ? workingOrders.length : "—"}/>
       <Value label="Local unrealized P&L" value={pnl ? formatINR(pnl.unrealized_pnl) : "—"} emphasis={pnlColor(pnl?.unrealized_pnl)}/>
       <Value label="Local realized P&L" value={pnl ? formatINR(pnl.realized_pnl) : "—"} emphasis={pnlColor(pnl?.realized_pnl)}/>
@@ -118,13 +118,9 @@ export default function LiveTrading() {
       {open.length === 0 ? <div className="empty-state">{positionsKnown ? <CircleCheck size={18}/> : <ShieldAlert size={18}/>}<div><b>{positionsKnown ? "No open local positions." : "Position state is not confirmed."}</b><small>{positionsKnown ? "No position records are open in the latest runtime snapshot." : "The positions source has not returned successfully. Do not treat this as a confirmed flat account."}</small></div></div> : <div className="position-list">
         {open.map((position: any) => {
           const ltp = getLtp(position.instrument);
-          const sl = position.stop_price;
-          const stopState = String(position.sl_state || position.stop_state || "").toUpperCase();
-          const protectedState = stopState.includes("ARM") || stopState === "ACTIVE" || stopState === "MONITORING";
           return <article className="position-card" key={position.position_id}>
             <div className="position-card-instrument"><span className={`side-mark ${position.side === "LONG" ? "long" : "short"}`}>{position.side === "LONG" ? <ArrowUpRight size={17}/> : <ArrowDownRight size={17}/>}</span><div><strong>{position.instrument}</strong><small>{position.strategy_id} · {String(position.position_id || "").slice(0, 8)}</small></div></div>
             <Value label="Quantity" value={position.quantity}/><Value label="Average entry" value={safeINR(position.average_entry)}/><Value label="Market price" value={ltp > 0 ? safeINR(ltp) : "—"}/>
-            <div className="desk-value stop-value"><small>Local stop monitor</small><strong>{sl ? safeINR(sl) : "No stop price"}</strong><StateTag kind={protectedState ? "good" : "warn"}>{protectedState ? stopState : stopState || "STATE NOT EXPOSED"}</StateTag></div>
             <div className="position-card-pnl"><small>Local unrealized P&amp;L</small><strong style={{ color: pnlColor(position.unrealized_pnl) }}>{formatINR(position.unrealized_pnl)}</strong></div>
           </article>;
         })}
@@ -132,17 +128,11 @@ export default function LiveTrading() {
     </section>
 
     <section className="desk-section">
-      <div className="desk-section-heading"><div><div className="eyebrow">SIGNAL TO EXECUTION</div><h3>Active trigger queue <span className="count-chip">{strategiesKnown ? activeTriggers.length : "—"}</span></h3></div><span className="source-note">Strategy runtime state · trigger queue is not a broker order</span></div>
-      {!activeTriggers.length ? <div className="empty-state">{strategiesKnown ? <CircleCheck size={18}/> : <ShieldAlert size={18}/>}<div><b>{strategiesKnown ? "No armed entry or reversal trigger." : "Trigger state is not confirmed."}</b><small>{strategiesKnown ? "Latest strategy state contains no pending trigger. Orders already sent to Dhan appear in the working orders panel below." : "No strategy snapshot has arrived, so the empty queue does not prove that no trigger is pending."}</small></div></div> : <div className="trigger-list">{activeTriggers.map((item: any, index: number) => {
-        const side = String(item.side || item.direction || item.strategy?.position_side || "").toUpperCase();
-        const ltp = getLtp(item.strategy.instrument);
-        const triggerPrice = safeNum(item.trigger_price ?? item.trigger);
-        const distance = ltp && triggerPrice ? Math.abs(triggerPrice - ltp) : null;
-        return <article className="trigger-card" key={`${item.strategy.strategy_id}-${item.triggerKind}-${index}`}>
-          <div className="trigger-card-head"><div><span className="trigger-badge">{item.triggerKind}</span><strong>{item.strategy.instrument} · {item.strategy.strategy_id}</strong></div><StateTag kind="warn">{item.trigger_state || "ARMED"}</StateTag></div>
-          <div className="trigger-values"><Value label="Direction" value={side || "—"}/><Value label="Trigger price" value={triggerPrice ? safeINR(triggerPrice) : "—"}/><Value label="Current price" value={ltp ? safeINR(ltp) : "—"}/><Value label="Distance" value={distance === null ? "—" : safeINR(distance)}/><Value label="Stop level" value={item.stop_price ? safeINR(item.stop_price) : "—"}/><Value label="Signal candle" value={item.signal_candle_start ? formatTimestamp(item.signal_candle_start) : "—"}/></div>
-          {(item.signal_candle_open || item.signal_candle_high || item.signal_candle_low || item.signal_candle_close) && <div className="candle-strip">{[["O",item.signal_candle_open],["H",item.signal_candle_high],["L",item.signal_candle_low],["C",item.signal_candle_close]].map(([label,value]: any)=><span key={label}><small>{label}</small><b>{value ? safeINR(value) : "—"}</b></span>)}</div>}
-        </article>;
+      <div className="desk-section-heading"><div><div className="eyebrow">SIGNAL TO EXECUTION</div><h3>Strategy state</h3></div><span className="source-note">No armed breakout trigger or strategy SL</span></div>
+      {!strategiesKnown ? <div className="empty-state"><ShieldAlert size={18}/><div><b>Strategy state is not confirmed.</b><small>The runtime snapshot has not arrived.</small></div></div> : <div className="signal-state-grid">{strategies.filter((strategy: any) => strategy.strategy_type === "supertrend").map((strategy: any) => {
+        const pendingReversal = strategy.pending_entry?.metadata?.is_reversal_entry;
+        const trendValue = strategy.supertrend?.value?.trend;
+        return <article className="signal-state-card" key={strategy.strategy_id}><header><strong>{strategy.instrument}</strong><span>{strategy.strategy_id} · 15m</span></header><div className="signal-state-main"><span className={`trend-pill ${trendValue === 1 ? "bullish" : trendValue === -1 ? "bearish" : "neutral"}`}>{trendValue === 1 ? "UPTREND" : trendValue === -1 ? "DOWNTREND" : "WARMING UP"}</span><b>{strategy.position_side ? `${strategy.position_side} position` : strategy.state ?? "FLAT"}</b></div><p>{pendingReversal ? "Opposite entry is waiting for Dhan to confirm the previous position is flat." : strategy.position_side ? "Position is open. A completed opposite SuperTrend flip starts the broker-confirmed exit and entry sequence." : "Waiting for the next completed 15-minute SuperTrend flip."}</p><small>Entry method: market after candle close · Separate SL: none</small></article>;
       })}</div>}
     </section>
 

@@ -23,8 +23,6 @@ interface DataContextType {
   pnl: any;
   pnlByInstrument: Record<string, any>;
   risk: any;
-  indicators: Record<string, any>;
-  htf: Record<string, any>;
   healthComponents: any[];
   overallHealth: string;
   reconciliation: any;
@@ -58,7 +56,7 @@ const DEFAULT_STATE: DataContextType = {
   overview: null, goldOverview: null, silverOverview: null,
   strategies: [], positions: [], orders: [], fills: [], trades: [],
   pnl: null, pnlByInstrument: {},
-  risk: null, indicators: {}, htf: {},
+  risk: null,
   healthComponents: [], overallHealth: "unknown",
   reconciliation: null, brokerPnl: null, settings: null, audit: [], alerts: [],
   equityCurve: [], marketData: null, wsEvents: [], wsState: null,
@@ -113,8 +111,6 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [pnl, setPnl] = useState<any>(null);
   const [pnlByInstrument, setPnlByInstrument] = useState<Record<string, any>>({});
   const [risk, setRisk] = useState<any>(null);
-  const [indicators, setIndicators] = useState<Record<string, any>>({});
-  const [htf, setHtf] = useState<Record<string, any>>({});
   const [healthComponents, setHealthComponents] = useState<any[]>([]);
   const [overallHealth, setOverallHealth] = useState("unknown");
   const [reconciliation, setReconciliation] = useState<any>(null);
@@ -249,20 +245,6 @@ export function DataProvider({ children }: { children: ReactNode }) {
     try { safe(setRisk)(await api.risk()); } catch (e: any) { setLastError(`risk: ${e?.message || e}`); }
   }, [safe]);
 
-  const fetchIndicators = useCallback(async () => {
-    try {
-      const d = await api.indicators() as any;
-      safe(setIndicators)(d?.indicators ?? d ?? {});
-    } catch (e: any) { setLastError(`indicators: ${e?.message || e}`); }
-  }, [safe]);
-
-  const fetchHtf = useCallback(async () => {
-    try {
-      const d = await api.htf() as any;
-      safe(setHtf)(d?.htf ?? d ?? {});
-    } catch (e: any) { setLastError(`htf: ${e?.message || e}`); }
-  }, [safe]);
-
   const fetchHealth = useCallback(async () => {
     try {
       const d = await api.healthSystem() as any;
@@ -337,21 +319,21 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const map: Record<string, () => void> = {
       overview: fetchOverview, goldOverview: fetchGoldOverview, silverOverview: fetchSilverOverview,
       strategies: fetchStrategies, positions: fetchPositions, orders: fetchOrders,
-      fills: fetchFills, trades: fetchTrades, pnl: fetchPnl, risk: fetchRisk, indicators: fetchIndicators,
-      htf: fetchHtf, health: fetchHealth, reconciliation: fetchReconciliation,
+      fills: fetchFills, trades: fetchTrades, pnl: fetchPnl, risk: fetchRisk,
+      health: fetchHealth, reconciliation: fetchReconciliation,
       brokerPnl: fetchBrokerPnl,
       settings: fetchSettings, audit: fetchAudit, alerts: fetchAlerts,
       equityCurve: fetchEquityCurve, marketData: fetchMarketData,
     };
     if (key && map[key]) map[key]();
     else Object.values(map).forEach(fn => fn());
-  }, [fetchOverview, fetchGoldOverview, fetchSilverOverview, fetchStrategies, fetchPositions, fetchOrders, fetchFills, fetchTrades, fetchPnl, fetchRisk, fetchIndicators, fetchHtf, fetchHealth, fetchReconciliation, fetchBrokerPnl, fetchSettings, fetchAudit, fetchAlerts, fetchEquityCurve, fetchMarketData]);
+  }, [fetchOverview, fetchGoldOverview, fetchSilverOverview, fetchStrategies, fetchPositions, fetchOrders, fetchFills, fetchTrades, fetchPnl, fetchRisk, fetchHealth, fetchReconciliation, fetchBrokerPnl, fetchSettings, fetchAudit, fetchAlerts, fetchEquityCurve, fetchMarketData]);
 
   useEffect(() => {
     fetchOverview(); fetchGoldOverview(); fetchSilverOverview();
     fetchStrategies(); fetchPositions(); fetchOrders(); fetchFills();
     fetchTrades();
-    fetchPnl(); fetchRisk(); fetchIndicators(); fetchHtf();
+    fetchPnl(); fetchRisk();
     fetchHealth(); fetchReconciliation(); fetchBrokerPnl(); fetchSettings();
     fetchAudit(); fetchAlerts(); fetchEquityCurve(); fetchMarketData();
   }, []);
@@ -368,8 +350,6 @@ export function DataProvider({ children }: { children: ReactNode }) {
       trades: window.setInterval(fetchTrades, 5000),
       pnl: window.setInterval(fetchPnl, 5000),
       risk: window.setInterval(fetchRisk, 3000),
-      indicators: window.setInterval(fetchIndicators, 5000),
-      htf: window.setInterval(fetchHtf, 5000),
       health: window.setInterval(fetchHealth, 10000),
       reconciliation: window.setInterval(fetchReconciliation, 15000),
       brokerPnl: window.setInterval(fetchBrokerPnl, 15000),
@@ -379,7 +359,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       marketData: window.setInterval(fetchMarketData, 2000),
     };
     return () => { Object.values(timersRef.current).forEach(clearInterval); timersRef.current = {}; };
-  }, [fetchOverview, fetchGoldOverview, fetchSilverOverview, fetchStrategies, fetchPositions, fetchOrders, fetchFills, fetchTrades, fetchPnl, fetchRisk, fetchIndicators, fetchHtf, fetchHealth, fetchReconciliation, fetchBrokerPnl, fetchAudit, fetchAlerts, fetchEquityCurve, fetchMarketData]);
+  }, [fetchOverview, fetchGoldOverview, fetchSilverOverview, fetchStrategies, fetchPositions, fetchOrders, fetchFills, fetchTrades, fetchPnl, fetchRisk, fetchHealth, fetchReconciliation, fetchBrokerPnl, fetchAudit, fetchAlerts, fetchEquityCurve, fetchMarketData]);
 
   useEffect(() => {
     return connectDashboardSocket((msg) => {
@@ -401,8 +381,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
               const list = Object.entries(s.strategies).map(([name, snap]: [string, any]) => ({
                 strategy_id: snap.strategy_id ?? name,
                 instrument: snap.instrument ?? "",
-                fast_timeframe: snap.fast_timeframe ?? "",
-                htf_timeframe: snap.htf_timeframe ?? "",
+                strategy_type: snap.strategy_type ?? "unknown",
+                signal_timeframe: snap.timeframe ?? "15m",
+                supertrend: snap.supertrend ?? null,
                 quantity: snap.quantity ?? null,
                 enabled: snap.enabled ?? true,
                 state: snap.state ?? "unknown",
@@ -445,12 +426,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
   const contextValue = useMemo<DataContextType>(() => ({
     connected, snapshotStatus, overview, goldOverview, silverOverview, strategies, positions,
-    orders, fills, trades, pnl, pnlByInstrument, risk, indicators, htf,
+    orders, fills, trades, pnl, pnlByInstrument, risk,
     healthComponents, overallHealth, reconciliation, brokerPnl, settings, audit,
     alerts, equityCurve, marketData, wsEvents, wsState, refresh, lastError,
   }), [
     connected, snapshotStatus, overview, goldOverview, silverOverview, strategies, positions,
-    orders, fills, trades, pnl, pnlByInstrument, risk, indicators, htf,
+    orders, fills, trades, pnl, pnlByInstrument, risk,
     healthComponents, overallHealth, reconciliation, brokerPnl, settings, audit,
     alerts, equityCurve, marketData, wsEvents, wsState, refresh, lastError,
   ]);

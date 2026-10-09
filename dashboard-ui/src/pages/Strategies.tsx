@@ -1,104 +1,59 @@
-import { useState, useCallback } from "react";
+import { useCallback, useState } from "react";
 import { useDataSelector } from "../store/DataProvider";
-import { formatINR, pnlColor, statusDot } from "../lib/utils";
 import { api } from "../lib/api";
-
-const panelStyle: React.CSSProperties = { background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", overflow: "hidden" };
+import { formatINR, pnlColor, statusDot } from "../lib/utils";
 
 export default function Strategies() {
-  const strategies = useDataSelector<any[]>((s) => s.strategies);
-  const refresh = useDataSelector<(key?: string) => void>((s) => s.refresh);
-  const settings = useDataSelector<any>((s) => s.settings);
+  const strategies = useDataSelector<any[]>((state) => state.strategies);
+  const settings = useDataSelector<any>((state) => state.settings);
+  const refresh = useDataSelector<(key?: string) => void>((state) => state.refresh);
   const [busy, setBusy] = useState<string | null>(null);
-  const [controlError, setControlError] = useState<Record<string, string>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
 
-  const toggleControl = useCallback(async (s: any) => {
-    const action = s.enabled ? "pause" : "resume";
-    setBusy(s.strategy_id);
+  const toggle = useCallback(async (strategy: any) => {
+    const action = strategy.enabled ? "pause" : "resume";
+    setBusy(strategy.strategy_id);
     try {
-      const r = await api.controlStrategy(s.strategy_id, action);
-      if (r?.error || r?.success === false) throw new Error(r?.error || "Control rejected");
-      setControlError((old) => ({ ...old, [s.strategy_id]: "" }));
-      refresh("strategies");
-      refresh("settings");
-    } catch (e: any) {
-      setControlError((old) => ({ ...old, [s.strategy_id]: e?.message || String(e) }));
-    } finally {
-      setBusy(null);
-    }
+      const result = await api.controlStrategy(strategy.strategy_id, action);
+      if (result?.error || result?.success === false) throw new Error(result?.error || "Strategy control was rejected");
+      setErrors((current) => ({ ...current, [strategy.strategy_id]: "" }));
+      refresh("strategies"); refresh("settings");
+    } catch (error: any) {
+      setErrors((current) => ({ ...current, [strategy.strategy_id]: error?.message || String(error) }));
+    } finally { setBusy(null); }
   }, [refresh]);
 
-  if (!strategies) return (
-    <div style={{ padding: "20px", color: "var(--text-muted)" }}>
-      <div className="skeleton" style={{ width: "300px", height: "120px", marginBottom: "10px" }} />
-      <div className="skeleton" style={{ width: "300px", height: "120px" }} />
-      <div style={{ fontSize: "11px", marginTop: "8px" }}>Loading strategies...</div>
-    </div>
-  );
+  if (!strategies) return <div className="settings-empty">Loading runtime strategies…</div>;
 
-  return (
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 265px), 1fr))", gap: "10px" }}>
-      {strategies.map((s: any) => {
-        const isLive = ["LONG", "SHORT"].includes(String(s.position_side || s.state || "").toUpperCase());
-        const gate = settings?.strategy_gates?.[s.strategy_id];
-        const pending = s.pending_entry || s.pending_exit_trigger;
-        const canPause = s.enabled && gate?.live_gate === "ON" && !isLive;
-        const canResume = !s.enabled && gate?.live_gate === "CLOSE_ONLY" && !isLive;
-        const canControl = canPause || canResume;
-        const controlLabel = isLive ? "POSITION OPEN" : canPause ? "PAUSE SIGNALS" : canResume ? "RESUME" : "USE SETTINGS";
-        return (
-          <div key={s.strategy_id} className="lift animate-fade-in-up" style={{ ...panelStyle, padding: "12px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                <span
-                  className={isLive ? "animate-pulse-dot" : ""}
-                  style={{ width: "6px", height: "6px", borderRadius: "50%", background: statusDot(s.state), ["--dot" as any]: statusDot(s.state) }}
-                />
-                <span style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-primary)" }}>{s.strategy_id}</span>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                <span style={{
-                  fontSize: "9px", padding: "2px 6px", borderRadius: "3px", fontWeight: 600,
-                  background: s.position_side === "LONG" ? "var(--green-muted)" : s.position_side === "SHORT" ? "var(--red-muted)" : "var(--bg-table-header)",
-                  color: s.position_side === "LONG" ? "var(--green)" : s.position_side === "SHORT" ? "var(--red)" : "var(--text-muted)",
-                }}>
-                  {s.position_side ?? s.state?.toUpperCase() ?? "UNKNOWN"}
-                </span>
-                <button
-                  onClick={() => toggleControl(s)}
-                  disabled={busy === s.strategy_id || !canControl}
-                  title={!canControl ? (isLive ? "An open position must remain managed" : "Change the strategy gate in Settings") : undefined}
-                  style={{
-                    fontSize: "9px", padding: "3px 8px", borderRadius: "3px", fontWeight: 600, cursor: busy === s.strategy_id ? "wait" : canControl ? "pointer" : "not-allowed",
-                    background: canPause ? "var(--green-muted)" : "var(--bg-input)",
-                    color: canPause ? "var(--green)" : "var(--text-muted)",
-                    border: "1px solid var(--border)",
-                  }}
-                >
-                  {busy === s.strategy_id ? "..." : controlLabel}
-                </button>
-              </div>
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 8, fontSize: 10 }}>
-              <span style={{ color: gate?.live_gate === "ON" ? "var(--green)" : "var(--amber)" }}>Gate {gate?.live_gate || "UNKNOWN"}</span>
-              <span style={{ color: gate?.entry_enabled ? "var(--green)" : "var(--text-muted)" }}>· Entries {gate?.entry_enabled ? "on" : "off"}</span>
-              <span style={{ color: pending ? "var(--amber)" : "var(--text-muted)" }}>· {pending ? `Trigger ${pending.trigger_price ?? "armed"}` : "No trigger"}</span>
-            </div>
-            {controlError[s.strategy_id] && <div role="alert" style={{ color: "var(--red)", fontSize: 10, marginBottom: 8 }}>{controlError[s.strategy_id]}</div>}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "3px", fontSize: "10px" }}>
-              {[["Instrument", s.instrument], ["Fast TF", s.fast_timeframe], ["HTF", s.htf_timeframe], ["Qty", s.quantity],
-                ["Trades", s.trade_count], ["Win%", `${Number(s.win_rate ?? 0).toFixed(1)}%`],
-                ["P&L", formatINR(s.realized_net)]].map(([k, v]) => (
-                <div key={String(k)} style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span style={{ color: "var(--text-muted)" }}>{String(k)}</span>
-                  <span className="tabular-nums" style={{ color: k === "P&L" ? pnlColor(Number(String(v).replace(/[+₹,]/g, ""))) : "var(--text-primary)", fontWeight: k === "P&L" ? 600 : 400 }}>{String(v)}</span>
-                </div>
-              ))}
-            </div>
+  return <div className="strategy-workspace">
+    <section className="strategy-intro">
+      <div><span className="eyebrow">ACTIVE SIGNAL ENGINE</span><h2>15-minute SuperTrend</h2><p>Only the configured GOLDM and SILVERM profiles are active. Signals use completed native 15-minute candles and are sent as market orders after candle close.</p></div>
+      <div className="strategy-execution-rules"><span>Entry <b>Market after candle close</b></span><span>Opposite flip <b>Exit, confirm flat, then enter</b></span><span>Separate SL <b>None</b></span></div>
+    </section>
+    <div className="strategy-card-grid">
+      {strategies.filter((strategy: any) => strategy.strategy_type === "supertrend").map((strategy: any) => {
+        const gate = settings?.strategy_gates?.[strategy.strategy_id] ?? {};
+        const livePosition = ["LONG", "SHORT"].includes(String(strategy.position_side ?? "").toUpperCase());
+        const indicator = strategy.supertrend ?? {};
+        const value = indicator.value ?? {};
+        const trend = Number(value.trend);
+        return <article className="strategy-profile-card" key={strategy.strategy_id}>
+          <header><div className="strategy-profile-title"><i style={{ background: statusDot(strategy.state) }}/><div><strong>{strategy.instrument}</strong><small>{strategy.strategy_id} · 15-minute chart</small></div></div><span className={`strategy-state ${livePosition ? "in-position" : "flat"}`}>{livePosition ? strategy.position_side : strategy.state ?? "FLAT"}</span></header>
+          <div className="strategy-status-row"><span className={`trend-pill ${trend === 1 ? "bullish" : trend === -1 ? "bearish" : "neutral"}`}>{trend === 1 ? "UPTREND" : trend === -1 ? "DOWNTREND" : "WARMING UP"}</span><span className={gate.live_gate === "ON" ? "text-good" : "text-warn"}>Gate {gate.live_gate ?? "UNKNOWN"}</span><span>{strategy.enabled ? "Runtime enabled" : "Runtime paused"}</span></div>
+          <div className="strategy-profile-metrics">
+            <div><small>Quantity</small><b>{strategy.quantity ?? "—"}</b></div>
+            <div><small>ATR</small><b>{value.atr == null ? "—" : formatINR(value.atr)}</b></div>
+            <div><small>Upper band</small><b>{value.upper == null ? "—" : formatINR(value.upper)}</b></div>
+            <div><small>Lower band</small><b>{value.lower == null ? "—" : formatINR(value.lower)}</b></div>
+            <div><small>Closed trades</small><b>{strategy.trade_count ?? 0}</b></div>
+            <div><small>Realized P&amp;L</small><b style={{ color: pnlColor(strategy.realized_net) }}>{formatINR(strategy.realized_net)}</b></div>
           </div>
-        );
+          <div className="strategy-parameters">ATR {indicator.atr_period ?? "—"} · Multiplier {indicator.multiplier ?? "—"} · {String(indicator.source ?? "—").toUpperCase()} · {indicator.atr_method === "sma_tr" ? "SMA True Range" : indicator.atr_method ?? "—"}</div>
+          {errors[strategy.strategy_id] && <div role="alert" className="strategy-error">{errors[strategy.strategy_id]}</div>}
+          <footer><span>{strategy.pending_entry?.metadata?.is_reversal_entry ? "Reversal entry waiting for broker flat confirmation" : livePosition ? "Position open · no separate strategy SL" : "Waiting for completed candle flip"}</span><button className="secondary-button" disabled={busy !== null || livePosition} title={livePosition ? "The open position remains under its existing lifecycle" : undefined} onClick={() => void toggle(strategy)}>{busy === strategy.strategy_id ? "Applying…" : strategy.enabled ? "Pause signals" : "Resume strategy"}</button></footer>
+        </article>;
       })}
-      {strategies.length === 0 && <div className="animate-fade-in-up" style={{ gridColumn: "1/-1", padding: "40px", textAlign: "center", color: "var(--text-muted)" }}>No strategies loaded</div>}
+      {strategies.filter((strategy: any) => strategy.strategy_type === "supertrend").length === 0 && <div className="settings-empty">No SuperTrend profiles are attached to this runtime.</div>}
     </div>
-  );
+  </div>;
 }

@@ -1,12 +1,10 @@
 """Main trading engine — event-driven architecture with per-strategy isolation.
 
 Architecture:
-    CandleFetcher → NativeCandleDistributor → EventBus → StrategyInstance.on_candle()
+    CandleFetcher → NativeCandleDistributor → EventBus → SuperTrendStrategy.on_candle()
 
-Each StrategyInstance owns its own:
-    - DEMAATR indicators (fast, mid, slow)
-    - HTF state (mid_htf_state, slow_htf_state)
-    - Strategy state (FLAT/LONG/SHORT, pending, stop, etc.)
+Each active strategy owns its own SuperTrend state and consumes completed
+native 15-minute candles for GOLDM or SILVERM.
 
 Shared infrastructure:
     - Dhan REST/WebSocket
@@ -43,11 +41,8 @@ from core.fill_dedup import FillDeduplicator
 from events.bus import EventBus
 from data.native_streams import NativeCandleDistributor
 from data.native_router import NativeCandleRouter
-from strategies.instance import StrategyInstance
+from strategies.base import StrategyBase
 from strategies.types import Signal, SignalType, StrategyState, PendingEntry, resolve_order_role
-from strategies.gold import create_gold_5m, create_gold_15m
-from strategies.silver import create_silver_5m, create_silver_15m
-from indicators.shared import SharedNativeIndicatorEngine
 from execution.models import Fill
 from execution.broker_router import BrokerEventRouter
 from execution.fee_model import MCXFeeModel
@@ -71,9 +66,9 @@ from core.rollover import RolloverService
 from application.signal_flow import SignalFlowMixin
 from application.fill_flow import FillFlowMixin
 from application.live_position_flow import LivePositionFlowMixin
-from application.sl_flow import SLFlowMixin
+from application.position_reconciliation import PositionReconciliationMixin
 from application.persistence_flow import PersistenceFlowMixin
-from application.environment_factory import EnvironmentFactoryMixin, STRATEGY_FACTORIES
+from application.environment_factory import EnvironmentFactoryMixin
 from application.market_flow import MarketEventFlowMixin
 
 log = logging.getLogger(__name__)
@@ -86,11 +81,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 class StrategyGate:
     """Per-strategy operator control state (spec §4/§5 — strategy isolation).
 
-    Every strategy carries its own independent gate that the operator controls
-    via start / stop / close_only / emergency_stop / lock / resume.  The gate
-    ONLY affects NEW ENTRIES and (via the *_enabled flags) which exit classes
-    the engine is allowed to keep placing.  Existing positions are always
-    eligible for protective SL handling unless sl_enabled is explicitly off.
+    Every strategy carries its own independent entry, exit, and reversal gate.
 
     ``live_gate`` mirrors the master LIVE gate vocabulary (ON / OFF /
     CLOSE_ONLY / EMERGENCY_STOP / LOCKED) but scoped to ONE strategy in EVERY
@@ -99,18 +90,17 @@ class StrategyGate:
     """
 
     __slots__ = ("live_gate", "entry_enabled", "exit_enabled",
-                 "reversal_enabled", "sl_enabled", "close_only",
+                 "reversal_enabled", "close_only",
                  "operator_override")
 
     def __init__(self, live_gate: str = "ON",
                  entry_enabled: bool = True, exit_enabled: bool = True,
-                 reversal_enabled: bool = True, sl_enabled: bool = True,
+                 reversal_enabled: bool = True,
                  close_only: bool = False, operator_override: bool = False):
         self.live_gate = str(live_gate).upper()
         self.entry_enabled = bool(entry_enabled)
         self.exit_enabled = bool(exit_enabled)
         self.reversal_enabled = bool(reversal_enabled)
-        self.sl_enabled = bool(sl_enabled)
         self.close_only = bool(close_only)
         # Only an explicit runtime control action may override the configured
         # restart default. Legacy snapshots have no marker and must not shadow
@@ -129,7 +119,6 @@ class StrategyGate:
             "entry_enabled": self.entry_enabled,
             "exit_enabled": self.exit_enabled,
             "reversal_enabled": self.reversal_enabled,
-            "sl_enabled": self.sl_enabled,
             "close_only": self.close_only,
             "operator_override": self.operator_override,
         }
@@ -143,7 +132,6 @@ class StrategyGate:
             entry_enabled=bool(data.get("entry_enabled", True)),
             exit_enabled=bool(data.get("exit_enabled", True)),
             reversal_enabled=bool(data.get("reversal_enabled", True)),
-            sl_enabled=bool(data.get("sl_enabled", True)),
             close_only=bool(data.get("close_only", False)),
             operator_override=bool(data.get("operator_override", False)),
         )
@@ -176,12 +164,12 @@ STRATEGY_GATE_ACTION_ERRORS = {
 
 
 
-class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlowMixin, PersistenceFlowMixin, EnvironmentFactoryMixin, MarketEventFlowMixin):
+class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, PositionReconciliationMixin, PersistenceFlowMixin, EnvironmentFactoryMixin, MarketEventFlowMixin):
     """Event-driven trading engine with per-strategy isolation.
 
     Event flow:
-    Dhan WebSocket → Tick → EventBus → StrategyInstance.on_tick()
-    Dhan REST → CandleFetcher → NativeCandleDistributor → EventBus → StrategyInstance.on_candle()
+    Dhan WebSocket → broker/position marks
+    Dhan REST → CandleFetcher → NativeCandleDistributor → SuperTrendStrategy.on_candle()
     """
 
     def __init__(self, config_path: Optional[str] = None, event_callback=None,
@@ -192,7 +180,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         else:
             self.config.load()
 
-        # ── Contract rollover (expiry −1 trading day for GOLDM/SILVERM) ──
+        # ── Contract rollover (two trading sessions before expiry) ──
         # The service decides, per metal, when to block entries in the
         # expiring series, when to force-close on the final session, and when
         # to persist the next-series override.  The override is applied to the
@@ -212,6 +200,16 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             emit=self.publish_event,
             on_alert=self._rollover_alert,
         )
+        # Fail closed from process construction until the rollover watchdog has
+        # verified every configured LIVE contract against Dhan's current
+        # scrip master. The watchdog is started after warmup/feed setup, so
+        # leaving this empty creates a startup interval where an expired or
+        # mismapped contract could accept a signal before its first check.
+        if self._rollover_service.enabled:
+            self._rollover_blocked.update(
+                ("live", str(metal))
+                for metal in (self.config.get("instruments") or {})
+            )
         self._apply_rollover_startup()
 
         self._event_callback = event_callback
@@ -232,14 +230,9 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         # detection, incomplete-candle guard, then forward to the distributor.
         self.candle_router = NativeCandleRouter(
             distributor=self.candle_distributor.on_candle_closed,
-            instruments=self.config.get("instruments", {}),
+            instruments=self._runtime_instrument_configs(),
         )
-        indicator_cfg = self.config.get("indicators", {})
-        self.indicator_engine = SharedNativeIndicatorEngine(
-            dema_period=indicator_cfg.get("dema_period", 3),
-            atr_period=indicator_cfg.get("atr_period", 6),
-            atr_factor=indicator_cfg.get("atr_factor", 1.0),
-        )
+        self.indicator_engine = None
         # §38 — market-data health.  The stop is local, so a silent feed is an
         # UNPROTECTED position, not a cosmetic dashboard warning.  Fresh ticks
         # or a completed candle both refresh this; losing both is an outage.
@@ -256,7 +249,6 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         self._init_market_status()
         self._init_data_adapter()
         self._init_indicator_engines()
-        self._init_htf_engine()
         self._init_candle_fetcher()
         self._init_monitoring()
         self._init_notifications()
@@ -295,7 +287,11 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         self._strategy_gates: dict[str, StrategyGate] = {}
         self._gate_epoch = 0.0
         self._reversal_today: dict[tuple, int] = {}
-        for sid in (self.config.get("strategies", {}) or {}):
+        active_strategy_ids = {
+            sid for runtime_env in self._envs.values()
+            for sid in (getattr(runtime_env, "strategies", {}) or {})
+        }
+        for sid in active_strategy_ids:
             self._strategy_gates[sid] = self._default_strategy_gate(sid)
 
         # ── Backward-compatible aliases ──
@@ -341,7 +337,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                  len(self.strategies), len(self._envs))
 
     # ═══════════════════════════════════════════════════════════════════
-    # CONTRACT ROLLOVER (GOLDM/SILVERM expiry −1 trading day)
+    # CONTRACT ROLLOVER (GOLDM/SILVERM, two sessions before expiry)
     # ═══════════════════════════════════════════════════════════════════
 
     def _rollover_alert(self, alert: dict) -> None:
@@ -425,16 +421,49 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         threading.Thread(target=loop, daemon=True,
                          name=f"rollover-watchdog-{env.name}").start()
 
-    def _rollover_metal_open(self, env: Environment, metal: str) -> bool:
-        """True when the metal still has exposure or a live pending entry."""
+    def _rollover_metal_open(self, env: Environment, metal: str,
+                             security_id: str) -> bool:
+        """True unless Dhan and local state both confirm the metal is flat.
+
+        Rollover is a contract-level operation, so the broker check uses the
+        exact expiring security ID. Missing broker support, malformed data, or
+        an API error is treated as unknown/open and prevents a contract switch.
+        """
         broker = getattr(env, "broker", None)
+        flat_check = getattr(broker, "instrument_flat", None)
+        if not callable(flat_check):
+            self._rollover_service.alert_once(
+                metal, "position_check_unavailable", datetime.now(IST).date(),
+                f"{metal}: cannot verify the expiring contract is flat with Dhan; "
+                "rollover remains blocked", security_id=str(security_id))
+            return True
+        try:
+            if not flat_check(metal, str(security_id)):
+                self._rollover_service.alert_once(
+                    metal, "position_still_open", datetime.now(IST).date(),
+                    f"{metal}: Dhan still reports an open position in the "
+                    "expiring contract; rollover will wait for broker-flat "
+                    "confirmation",
+                    security_id=str(security_id))
+                return True
+        except Exception as e:
+            log.warning("[Rollover] %s exact broker-flat check failed: %s",
+                        metal, e)
+            self._rollover_service.alert_once(
+                metal, "position_check_failed", datetime.now(IST).date(),
+                f"{metal}: Dhan could not confirm the expiring contract is flat; "
+                "rollover remains blocked", security_id=str(security_id),
+                error=str(e))
+            return True
         if broker is not None and hasattr(broker, "_own_net_positions"):
             try:
                 if any(p.get("instrument") == metal
                        for p in broker._own_net_positions()):
                     return True
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("[Rollover] %s local broker-book check failed: %s",
+                            metal, e)
+                return True
         for strategy in env.strategies.values():
             if getattr(strategy, "instrument", None) != metal:
                 continue
@@ -463,30 +492,79 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             sid = str(inst.get("security_id", "") or "")
             if not symbol or not sid:
                 continue
+            needs_broker_check = self._rollover_service.requires_broker_confirmation(
+                metal, symbol, sid, today)
+            # Avoid repeated position/order REST requests throughout the
+            # contract month. These broker checks are required only after the
+            # configured rollover window begins.
+            has_positions = False
+            orders_clear = True
+            if needs_broker_check:
+                has_positions = self._rollover_metal_open(env, metal, sid)
+                check_orders = getattr(broker, "instrument_orders_clear", None)
+                orders_clear = False
+                if callable(check_orders):
+                    try:
+                        orders_clear = bool(check_orders(metal, sid))
+                        if not orders_clear:
+                            self._rollover_service.alert_once(
+                                metal, "working_orders_remain", today,
+                                f"{metal}: Dhan reports a working order for the "
+                                "expiring contract; system-owned orders will be "
+                                "cancelled and rollover will retry",
+                                security_id=sid)
+                    except Exception as e:
+                        log.warning("[Rollover] %s order-clear check failed: %s",
+                                    metal, e)
+                        self._rollover_service.alert_once(
+                            metal, "order_check_failed", today,
+                            f"{metal}: Dhan order book could not confirm the "
+                            "expiring contract has no working orders; rollover "
+                            "will retry",
+                            security_id=sid, error=str(e))
+                else:
+                    self._rollover_service.alert_once(
+                        metal, "order_check_unavailable", today,
+                        f"{metal}: broker order-book check is unavailable; "
+                        "rollover will retry",
+                        security_id=sid)
             actions = self._rollover_service.evaluate(
-                metal, symbol, sid, today,
-                self._rollover_metal_open(env, metal))
+                metal, symbol, sid, today, has_positions,
+                resting_orders_clear=orders_clear)
             if "block_entries" in actions:
                 self._rollover_blocked.add((env.name, metal))
+            else:
+                self._rollover_blocked.discard((env.name, metal))
             if "cancel_resting" in actions and broker is not None:
                 cancel = getattr(broker, "cancel_instrument_orders", None)
                 if callable(cancel):
-                    day_key = (env.name, metal, today.isoformat())
-                    if day_key not in self._rollover_canceled_daily:
-                        self._rollover_canceled_daily.add(day_key)
-                        try:
-                            result = cancel(metal)
-                            self.publish_event("contract_rollover_cancel_resting", {
-                                "instrument": metal, "result": result,
-                            }, env_name=env.name)
-                        except Exception as e:
-                            log.warning("[Rollover] cancel resting failed: %s", e)
+                    try:
+                        # Retry unresolved cancellations on every watchdog
+                        # pass. The transport verifies each broker status and
+                        # treats already-settled orders idempotently.
+                        result = cancel(metal)
+                        self.publish_event("contract_rollover_cancel_resting", {
+                            "instrument": metal, "result": result,
+                            "orders_clear_after_cancel": bool(
+                                getattr(broker, "instrument_orders_clear",
+                                        lambda _i, _sid=None: False)(metal, sid)),
+                        }, env_name=env.name)
+                    except Exception as e:
+                        log.warning("[Rollover] cancel resting failed: %s", e)
             if "force_close" in actions and broker is not None:
                 try:
                     result = self.emergency_exit_all(env.name, instrument=metal)
                     self.publish_event("contract_rollover_force_close", {
                         "instrument": metal, "result": result,
                     }, env_name=env.name)
+                    if (not result.get("closed") and not result.get("errors")):
+                        self._rollover_service.alert_once(
+                            metal, "force_close_no_owned_position",
+                            today,
+                            f"{metal}: Dhan is not flat but the engine has no "
+                            "locally tracked position to close; manual broker "
+                            "reconciliation is required",
+                            security_id=sid)
                 except Exception as e:
                     log.warning("[Rollover] force-close failed: %s", e)
             if "persist_switch" in actions:
@@ -526,7 +604,10 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         for env_name in ("paper", "live"):
             key = "db_path" if env_name == "paper" else "live_db_path"
             resolved[env_name] = Config.resolve_path(self.config.get(
-                "system", {}).get(key, "data/db/trading.db"))
+                "system", {}).get(
+                    key,
+                    ("data/db/supertrend_paper.sqlite3" if env_name == "paper"
+                     else "live/data/db/supertrend/supertrend_live.sqlite3")))
         if {"paper", "live"} <= set(self.environments) and resolved["paper"] == resolved["live"]:
             raise RuntimeError(
                 "environment config: system.db_path and system.live_db_path "
@@ -539,10 +620,10 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         mode = "LIVE" if is_live else "PAPER"
         if is_live:
             db_path = Config.resolve_path(self.config.get("system", {}).get(
-                "live_db_path", "data/db/live_trading.db"))
+                "live_db_path", "live/data/db/supertrend/supertrend_live.sqlite3"))
         else:
             db_path = Config.resolve_path(self.config.get("system", {}).get(
-                "db_path", "data/db/trading.db"))
+                "db_path", "data/db/supertrend_paper.sqlite3"))
         try:
             event_store = EventStore(db_path=db_path, execution_mode=mode)
         except Exception:
@@ -592,11 +673,14 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             entry_enabled=bool(scfg.get("entry_enabled", True)),
             exit_enabled=bool(scfg.get("exit_enabled", True)),
             reversal_enabled=bool(scfg.get("reversal_enabled", True)),
-            sl_enabled=bool(scfg.get("sl_enabled", True)),
             close_only=bool(scfg.get("close_only", False)),
         )
 
     def _gate_for(self, strategy_id: str) -> StrategyGate:
+        config = getattr(self, "config", None)
+        policy = (config.get("strategy_runtime", {}) or {}) if config is not None else {}
+        if policy.get("exclusive") and strategy_id not in self.strategies:
+            raise KeyError(f"strategy {strategy_id!r} is outside the exclusive runtime")
         gates_map = getattr(self, "_strategy_gates", None)
         if gates_map is None:
             gates_map = {}
@@ -609,9 +693,15 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
 
     def strategy_gates(self) -> dict:
         """All per-strategy gates (read-only views)."""
-        return {sid: gate.to_dict() for sid, gate in self._strategy_gates.items()}
+        active = set(self.strategies or {})
+        return {sid: gate.to_dict() for sid, gate in self._strategy_gates.items()
+                if sid in active}
 
     def strategy_gate(self, strategy_id: str) -> dict:
+        config = getattr(self, "config", None)
+        policy = (config.get("strategy_runtime", {}) or {}) if config is not None else {}
+        if policy.get("exclusive") and strategy_id not in self.strategies:
+            raise KeyError(f"strategy {strategy_id!r} is outside the exclusive runtime")
         if strategy_id not in self._strategy_gates:
             self._strategy_gates[strategy_id] = self._default_strategy_gate(strategy_id)
         return self._strategy_gates[strategy_id].to_dict()
@@ -620,11 +710,11 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         """Set individual gate flags for one strategy (validated, additive).
 
         Accepted fields: live_gate, entry_enabled, exit_enabled,
-        reversal_enabled, sl_enabled, close_only.  Unknown keys are rejected.
+        reversal_enabled, close_only. Unknown keys are rejected.
         """
         gate = self._gate_for(strategy_id)
         allowed = {"live_gate", "entry_enabled", "exit_enabled",
-                   "reversal_enabled", "sl_enabled", "close_only"}
+                   "reversal_enabled", "close_only"}
         unknown = [k for k in fields if k not in allowed]
         if unknown:
             raise ValueError(f"unknown gate field(s): {unknown}")
@@ -636,8 +726,6 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             gate.exit_enabled = bool(fields["exit_enabled"])
         if "reversal_enabled" in fields:
             gate.reversal_enabled = bool(fields["reversal_enabled"])
-        if "sl_enabled" in fields:
-            gate.sl_enabled = bool(fields["sl_enabled"])
         if "close_only" in fields:
             gate.close_only = bool(fields["close_only"])
         if fields:
@@ -660,11 +748,9 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
 
         start          -> fully open (entries + all exit classes).
         resume         -> alias of start (legacy name kept).
-        stop           -> CLOSE_ONLY: block new entries, keep SL + exits so a
-                          running position is still managed to the exit.
-        close_only     -> block new entries + reversals, keep exits + SL.
-        emergency_stop -> block entries immediately; keep SL + standard exits
-                          active (the safe unwind path).
+        stop           -> CLOSE_ONLY: block new entries, keep standard exits.
+        close_only     -> block new entries + reversals, keep exits active.
+        emergency_stop -> block entries immediately and keep exits active.
         lock           -> freeze the strategy entirely (entries + every exit).
         pause (legacy) -> clear pending entry and freeze signal generation.
         """
@@ -679,7 +765,6 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             gate.entry_enabled = True
             gate.exit_enabled = True
             gate.reversal_enabled = True
-            gate.sl_enabled = True
             gate.close_only = False
             if strat is not None:
                 strat.enabled = True
@@ -689,14 +774,12 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             gate.entry_enabled = False
             gate.exit_enabled = True
             gate.reversal_enabled = False
-            gate.sl_enabled = True
             gate.close_only = True
         elif a == "emergency_stop":
             gate.live_gate = "EMERGENCY_STOP"
             gate.entry_enabled = False
             gate.exit_enabled = True
             gate.reversal_enabled = False
-            gate.sl_enabled = True
             gate.close_only = True
             self.publish_event("strategy_emergency_stop", {
                 "strategy_id": strategy_id, "timestamp": time.time(),
@@ -706,7 +789,6 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             gate.entry_enabled = False
             gate.exit_enabled = False
             gate.reversal_enabled = False
-            gate.sl_enabled = False
             gate.close_only = True
         elif a == "pause":
             # Legacy pause semantics preserved: drop the pending breakout and
@@ -1011,9 +1093,10 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 "signal_candle_high": meta.get("signal_candle_high"),
                 "signal_candle_low": meta.get("signal_candle_low"),
                 "signal_candle_time": candle_time,
-                "signal_htf_dema_atr": meta.get("signal_htf_dema_atr"),
-                "signal_mid_dema_atr": meta.get("signal_mid_dema_atr"),
-                "signal_fast_dema_atr": meta.get("signal_fast_dema_atr"),
+                "no_separate_stop": bool(meta.get("no_separate_stop", True)),
+                "supertrend_atr": meta.get("supertrend_atr"),
+                "supertrend_upper": meta.get("supertrend_upper"),
+                "supertrend_lower": meta.get("supertrend_lower"),
                 "fill_price": signal.trigger_price,
                 "mode": env_obj.mode if env_obj is not None else "PAPER",
                 "account": account_dict,
@@ -1124,7 +1207,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 pass
         if persistence is not None and getattr(persistence, "db_path", None):
             exp = Config.resolve_path(self.config.get("system", {}).get(
-                "db_path", "data/db/trading.db"))
+                "db_path", "data/db/supertrend_paper.sqlite3"))
             if not env.is_live and Config.resolve_path(str(persistence.db_path)) != exp:
                 log.warning("[Engine] paper persistence path %s != configured %s "
                             "(check wiring)", persistence.db_path, exp)
@@ -1271,9 +1354,9 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             if not env.is_live:
                 continue
             try:
-                summary = self.sync_sl_from_broker(env_name=name)
+                summary = self.sync_positions_from_broker(env_name=name)
             except Exception as e:
-                log.error("[Engine] startup SL sync failed for %s: %s", name, e)
+                log.error("[Engine] startup position reconciliation failed for %s: %s", name, e)
                 summary = {"status": "failed", "error": str(e)}
             # §35 — trading must not begin on an unreconciled book.  An unknown
             # broker state is not "flat": if the position query failed we do not
@@ -1284,7 +1367,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             if summary.get("status") == "reconciled" and not summary.get(
                     "orphan_exposure"):
                 self._reconciled_envs.add(name)
-                log.info("[Engine] startup SL sync for env %s: %s", name, summary)
+                log.info("[Engine] startup position reconciliation for env %s: %s",
+                         name, summary)
             else:
                 self._reconciled_envs.discard(name)
                 if summary.get("orphan_exposure"):
@@ -1304,25 +1388,6 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 env.market_status.set_engine_status(EngineStatus.WARMING_UP)
         # Warm up PAPER from shared data adapter; LIVE from its own adapter.
         self._warmup_from_rest()
-        # SQLite triggers were restored before the REST warmup. Revalidate
-        # their frozen hourly DEMA-ATR against the warmed, completed 1H line
-        # before the first live tick can cross a stale overnight trigger.
-        for name, env in self._envs.items():
-            if not env.is_live:
-                continue
-            try:
-                self._invalidate_warmed_pending_triggers(env)
-            except Exception as exc:
-                log.exception(
-                    "[Engine] startup pending-trigger DEMA validation failed "
-                    "for %s", name)
-                for strategy in env.strategies.values():
-                    self._discard_unjournaled_live_pending(
-                        strategy, env,
-                        f"startup hourly DEMA-ATR validation failed: {exc}")
-                if env.safe_mode is not None:
-                    env.safe_mode.enter_safe_mode(
-                        "pending_trigger_revalidation_failed", str(exc))
         if not self._live_only:
             # Start PAPER data feeds (shared infrastructure). In LIVE-only mode
             # the engine's candle_fetcher/data_adapter ARE the live env's, so
@@ -1335,6 +1400,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 continue
             try:
                 if env.candle_fetcher is not None:
+                    self._scope_live_candles_to_runtime(env)
                     env.candle_fetcher.start()
                 if env.data_adapter is not None:
                     env.data_adapter.connect()
@@ -1354,7 +1420,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         log.info("[Engine] Started — %d strategies active", len(self.strategies))
         print(f"[Engine] Started — {len(self.strategies)} strategies active", flush=True)
         for name, strat in self.strategies.items():
-            print(f"  {name}: {strat.instrument} {strat.fast_timeframe}/{strat.mid_timeframe}/{strat.htf_timeframe}", flush=True)
+            print(f"  {name}: {strat.instrument} SuperTrend 15m", flush=True)
         try:
             self.publish_event("engine_started", {
                 "timestamp": time.time(),
@@ -1595,8 +1661,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 pass
             for env_name, sids in self._restore_failures.items():
                 log.error("[Engine] %s TRADE-RESTORE FAILED for strategies %s — "
-                          "the broker-authoritative position/SL sync is the "
-                          "only protection", env_name, sids)
+                          "broker-authoritative position reconciliation is "
+                          "required before entry", env_name, sids)
 
     def _warmup_from_rest(self, now_epoch: Optional[int] = None) -> None:
         """Warm up each strategy from Dhan REST historical data.
@@ -1604,12 +1670,11 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         PAPER strategies use the shared (engine-level) data adapter.
         LIVE strategies use their own per-env data adapter (LIVE independence).
 
-        Contract (MCX + Dhan):
+        Active strategy contract (MCX + Dhan):
           - requested end = fetch boundary, NOT a market-close rule;
           - the returned dataset decides the latest available candle;
-          - only genuinely completed candles feed the indicator streams
-            (a forming candle can never poison DEMA/ATR state);
-          - per (symbol, timeframe) forensics + latest-completed watermark.
+          - only completed native 15-minute candles update SuperTrend;
+          - per instrument and timeframe source forensics.
         """
         import pandas as pd
         warmup_cfg = self.config.get("warmup", {})
@@ -1652,48 +1717,31 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         """Warm up one environment's strategies using the given data adapter."""
         import pandas as pd
         for name, strategy in strategies.items():
-            inst_cfg = self.config.get("instruments", {}).get(name, {})
+            # Strategy IDs (gold_02 / silver_01) are not instrument keys.
+            # Warmup must use the actual contract config for Dhan security ID
+            # and exchange session boundaries.
+            inst_cfg = (self.config.get("instruments", {}) or {}).get(
+                strategy.instrument, {})
             session_open = inst_cfg.get("session_open", "09:00")
             session_close = inst_cfg.get("session_close", "23:30")
             security_id = str(inst_cfg.get("security_id", ""))
             try:
-                fast_id = {"5m": "5", "15m": "15"}.get(strategy.fast_timeframe, "5")
-                fast_minutes = strategy._tf_to_minutes(strategy.fast_timeframe)
-                accepted_fast, _ = self._fetch_warmup_candles(
-                    name, strategy.instrument, fast_id, strategy.fast_timeframe,
-                    fast_minutes, base_from, to_date, now_epoch,
-                    session_open, session_close, security_id, last_days,
-                    data_adapter=data_adapter)
-                for _, row in accepted_fast.iterrows():
+                timeframe = "15m"
+                accepted, _ = self._fetch_warmup_candles(
+                    name, strategy.instrument, "15", timeframe, 15,
+                    base_from, to_date, now_epoch, session_open, session_close,
+                    security_id, last_days, data_adapter=data_adapter)
+                for _, row in accepted.iterrows():
                     open_ts = float(row["timestamp"])
-                    strategy.warmup_indicator(Bar(
-                        instrument=strategy.instrument, timeframe=strategy.fast_timeframe,
-                        start_ts=open_ts,
-                        end_ts=open_ts + fast_minutes * 60,
-                        open=row["open"], high=row["high"], low=row["low"], close=row["close"],
-                        volume=int(row["volume"]),
-                    ))
-                for tf_id, tf_name in [("15", strategy.mid_timeframe), ("60", strategy.htf_timeframe)]:
-                    try:
-                        htf_min = int(tf_id)
-                        accepted_htf, _ = self._fetch_warmup_candles(
-                            name, strategy.instrument, tf_id, tf_name, htf_min,
-                            base_from, to_date, now_epoch,
-                            session_open, session_close, security_id, last_days,
-                            data_adapter=data_adapter)
-                        for _, row in accepted_htf.iterrows():
-                            h_open_ts = float(row["timestamp"])
-                            bar = Bar(instrument=strategy.instrument, timeframe=tf_name,
-                                      start_ts=h_open_ts, end_ts=h_open_ts + htf_min * 60,
-                                      open=row["open"], high=row["high"], low=row["low"], close=row["close"],
-                                      volume=int(row["volume"]))
-                            strategy.warmup_htf(bar)
-                            strategy.warmup_indicator_htf(bar)
-                    except Exception as e:
-                        log.warning("[Engine] %s: HTF warmup failed: %s", name, e)
-                log.info("[Engine] %s warmed (%s): fast=%d bars, mid_htf=%d, slow_htf=%d",
-                         name, env.name, strategy.fast_indicator._count,
-                         strategy.mid_htf_state.bar_count(), strategy.slow_htf_state.bar_count())
+                    bar = Bar(
+                        instrument=strategy.instrument, timeframe=timeframe,
+                        start_ts=open_ts, end_ts=open_ts + 15 * 60,
+                        open=row["open"], high=row["high"], low=row["low"],
+                        close=row["close"], volume=int(row["volume"]),
+                    )
+                    strategy.warmup_indicator(bar)
+                log.info("[Engine] %s warmed (%s): SuperTrend %d completed 15m bars",
+                         name, env.name, len(accepted))
             except Exception as e:
                 log.error("[Engine] %s warmup failed (%s): %s", name, env.name, e)
 
@@ -1758,7 +1806,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         # never re-derive the feed timestamp from the tz-converted
         # wall time, which is host-tz-dependent (naive .timestamp()
         # resolves in the process locale and silently shifts every bar
-        # by +5:30 on non-IST hosts, mis-anchoring DEMA/ATR streams).
+        # by +5:30 on non-IST hosts and mis-anchoring candle data.
         df["datetime"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
         df = df.sort_values("datetime").reset_index(drop=True)
         if last_days > 0:
@@ -1805,7 +1853,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
     def restore(self, saved_state: dict, env_name: str = "paper") -> None:
         """Restore ONE environment's engine state from a saved snapshot.
 
-        Restores that environment's per-strategy indicator/HTF/pending state
+        Restores that environment's strategy and pending-order state
         AND its per-strategy position managers (each position back into its
         OWN runtime). Account margin is then reconstituted from the restored
         open positions so the startup reconciliation margin check is exactly
@@ -1904,10 +1952,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 env.position_manager.restore(positions_state)
             except Exception:
                 pass
-        # Arm the stop for every restored OPEN position.  Without this a
-        # restarted strategy keeps stop_price=None and _check_stop_loss() bails
-        # on its `stop_price is None` guard, so a live position restored across
-        # a restart trades with NO stop at all.
+        # Rebind the strategy's ownership to the durable open position. The
+        # configured SuperTrend strategies do not maintain a separate stop.
         for sid, strat in env.strategies.items():
             try:
                 open_pos = next((p for p in env.position_manager.get_positions_by_strategy(sid)
@@ -1923,34 +1969,12 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                 strat.position_generation = open_pos.position_generation
                 strat.position_quantity = open_pos.quantity
                 strat.current_trade_id = open_pos.trade_id
-                if getattr(open_pos, "stop_price", None) is not None:
-                    strat.stop_price = open_pos.stop_price
                 strat.state = (StrategyState.LONG_POSITION if open_pos.is_long
                                else StrategyState.SHORT_POSITION)
-                if getattr(strat, "stop_price", None) is None:
-                    _rec_stop = getattr(open_pos, "stop_price", None)
-                    if _rec_stop is None:
-                        _rec_stop = self._recover_stop_price(env, open_pos)
-                    if _rec_stop is not None:
-                        strat.stop_price = _rec_stop
-                        if getattr(open_pos, "stop_price", None) is None:
-                            open_pos.stop_price = _rec_stop
-                    else:
-                        log.error("[Engine] restore: %s has OPEN position %s with "
-                                  "NO recoverable stop_price - UNPROTECTED",
-                                  sid, getattr(open_pos, "position_id", "?"))
             except Exception as e:
-                log.error("[Engine] restore: stop arming failed for %s: %s", sid, e)
-        # §41b — reconcile orphaned exit states after a restart.  In-flight
-        # paper-broker exit orders do not survive a restart (only the explicit
-        # broker_order_id mapping does), so a strategy restored as
-        # EXIT_ORDER_SUBMITTED with a still-open position has no live exit in
-        # flight.  Re-arm the position state (and clear the stop re-fire
-        # guard) so the now-guaranteed exit path can retry the stop-out on the
-        # next evaluation; otherwise the position would stay open forever.
+                log.error("[Engine] restore: position binding failed for %s: %s", sid, e)
+        # Reconcile exit state after restart when no order remains in flight.
         for name, strat in env.strategies.items():
-            if getattr(strat, "stop_exit_submitted", False):
-                setattr(strat, "stop_exit_submitted", False)
             if strat.state == StrategyState.EXIT_ORDER_SUBMITTED:
                 open_pos = next((
                     p for p in env.position_manager.get_positions_by_strategy(name)
@@ -2032,6 +2056,11 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
         gates_state = saved_state.get("strategy_gates")
         if gates_state:
             try:
+                runtime_policy = self.config.get("strategy_runtime", {}) or {}
+                if runtime_policy.get("exclusive"):
+                    active_ids = set(env.strategies or {})
+                    gates_state = {sid: gate for sid, gate in gates_state.items()
+                                   if sid in active_ids}
                 self._strategy_gates = restore_strategy_gates(
                     self._strategy_gates, gates_state)
             except Exception:
@@ -2226,7 +2255,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
             # sync re-opens the gate, and any later failure closes it again.
             if getattr(env, "is_live", False):
                 try:
-                    sl_summary = self.sync_sl_from_broker(env_name=env.name)
+                    sl_summary = self.sync_positions_from_broker(env_name=env.name)
                 except Exception as e:
                     sl_summary = {"status": "failed", "error": str(e)}
                 with self._lock:
@@ -2270,21 +2299,6 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                         strategy.state = (StrategyState.LONG_POSITION if is_long
                                           else StrategyState.SHORT_POSITION)
                         strategy.position_side = "LONG" if is_long else "SHORT"
-                    # An OPEN position must ALWAYS carry a stop, even when the
-                    # strategy state was already restored as long/short: a
-                    # missing stop_price makes _check_stop_loss() bail and
-                    # leaves the position UNPROTECTED.  Recover it from the
-                    # position, then the signals/trades rows.
-                    if getattr(strategy, "stop_price", None) is None:
-                        _rec_stop = self._recover_stop_price(env, open_pos)
-                        if _rec_stop is not None:
-                            strategy.stop_price = _rec_stop
-                            if getattr(open_pos, "stop_price", None) is None:
-                                open_pos.stop_price = _rec_stop
-                        else:
-                            log.error("[Engine] %s has an OPEN position %s with NO "
-                                      "recoverable stop_price - UNPROTECTED",
-                                      sid, open_pos.position_id)
 
         # Phase 9.7 — broker-authoritative position resolution (LIVE only,
         # opt-in via `live.reconcile_auto_resolve`; default OFF keeps the
@@ -2382,244 +2396,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, SLFlowMixin, LivePositionFlo
                     "reason": "broker_position_unowned_strategy",
                     "execution_mode": env.mode}, env_name=env.name)
 
-    def _persist_recon_order(self, env, fill, order_type: str, trade_id: str,
-                             signal_id) -> None:
-        """Persist the synthetic reconciliation order row (fills/orders
-        integrity triggers require an orders row before a fill can persist)."""
-        if env.persistence is None:
-            return
-        try:
-            now = datetime.fromtimestamp(fill.timestamp or time.time(),
-                                         tz=timezone.utc).isoformat()
-            env.persistence.save_order({
-                "order_id": fill.order_id, "strategy_id": fill.strategy_id,
-                "instrument": fill.instrument, "side": fill.side,
-                "quantity": fill.quantity, "order_type": order_type,
-                "price": fill.price, "planned_entry_price": fill.price,
-                "planned_sl": None, "planned_order_type": order_type,
-                "state": "filled", "filled_quantity": fill.quantity,
-                "average_fill_price": fill.price,
-                "created_at": now, "updated_at": now,
-                "signal_id": signal_id, "trade_id": trade_id,
-            })
-        except Exception as e:
-            log.error("[Engine] reconcile order persist failed for %s: %s",
-                      fill.order_id, e)
 
-    def _close_local_mirror(self, env, sid, position) -> None:
-        """Broker reports FLAT while the local mirror holds an open position:
-        mirror the position closed, audited and persisted (exits are always
-        allowed, independent of the entry gate)."""
-        close_manager = env.trade_close_manager or self._trade_close_manager
-        if close_manager is None:
-            return
-        try:
-            multiplier = getattr(position, "multiplier", 1.0) or 1.0
-            if float(multiplier) == 1.0:
-                configured = self.config.instrument(position.instrument) or {}
-                configured_multiplier = float(configured.get("multiplier", 1.0) or 1.0)
-                if configured_multiplier != 1.0:
-                    # Repair only P&L metadata on the position being closed;
-                    # this does not alter or resubmit any broker order.
-                    multiplier = configured_multiplier
-                    position.multiplier = multiplier
-            fill = Fill(
-                fill_id=f"LIVE-{uuid.uuid4().hex}",
-                order_id=f"RECON-CLOSE-{uuid.uuid4().hex}",
-                instrument=position.instrument,
-                side="SELL" if position.is_long else "BUY",
-                quantity=int(position.quantity),
-                price=float(getattr(position, "average_entry", 0.0) or 0.0),
-                timestamp=time.time(),
-                strategy_id=sid,
-                multiplier=multiplier,
-                entry_signal_id=getattr(position, "entry_signal_id", None),
-                trade_id=position.trade_id,
-            )
-            fill.broker_order_id = "RECON-CLOSE"
-            fill.broker_fill_id = f"RECON-CLOSE:{fill.fill_id}"
-            fill.cumulative_filled_quantity = int(position.quantity)
-            # the persisted close references this synthetic order row (fills and
-            # orders integrity triggers require it before save_fill)
-            self._persist_recon_order(env, fill, "RECONCILE", position.trade_id,
-                                      position.entry_signal_id)
-            result = close_manager.close_position(
-                fill, position, sid, multiplier,
-                exit_reason="RECONCILE_BROKER_FLAT",
-                exit_signal_id=None,
-            )
-            if result is False:
-                return
-            if env.persistence is not None and hasattr(env.persistence, "close_position_record"):
-                try:
-                    env.persistence.close_position_record(position)
-                except Exception:
-                    pass
-            runtime = env.runtimes.require(sid) if env.runtimes is not None else None
-            if runtime is not None and runtime.lifecycle is not None:
-                runtime.lifecycle.register_exit_fill(
-                    position.trade_id, fill.fill_id, fill.price, fill.timestamp,
-                    "", exit_reason="RECONCILE_BROKER_FLAT")
-                runtime.lifecycle.close_trade(
-                    position.trade_id, result["gross_pnl"], result["charges"], result["net_pnl"])
-            self.publish_event("reconciliation_resolved", {
-                "strategy_id": sid, "instrument": position.instrument,
-                "position_id": position.position_id, "direction": "broker_flat_close_local",
-                "exit_reason": "RECONCILE_BROKER_FLAT",
-                "execution_mode": env.mode}, env_name=env.name)
-            self._reset_strategy_state(sid, env_name=env.name)
-        except Exception as e:
-            log.error("[Engine] reconcile close failed for %s: %s", sid, e)
 
-    def _adopt_broker_position(self, env, live_cfg: dict, sid: str,
-                               instrument: str, broker_row: dict) -> None:
-        """Broker reports an open position the local mirror does not hold:
-        adopt it into the local mirror only when the entry gate is ON, margin
-        permits, and the strategy exists (audit + risk check per Phase 9.7)."""
-        if not env.gate_enabled:
-            self.publish_event("reconciliation_mismatch", {
-                "strategy_id": sid, "instrument": instrument,
-                "broker_side": str(broker_row.get("side") or "").upper(),
-                "broker_quantity": int(broker_row.get("quantity") or 0),
-                "reason": "broker_position_adoption_blocked_gate",
-                "execution_mode": env.mode}, env_name=env.name)
-            return
-        if sid not in env.strategies:
-            self.publish_event("reconciliation_mismatch", {
-                "strategy_id": sid, "instrument": instrument,
-                "broker_side": str(broker_row.get("side") or "").upper(),
-                "broker_quantity": int(broker_row.get("quantity") or 0),
-                "reason": "broker_position_adoption_unknown_strategy",
-                "execution_mode": env.mode}, env_name=env.name)
-            return
-        side = str(broker_row.get("side") or "").upper()
-        if side not in ("LONG", "SHORT"):
-            return
-        try:
-            qty = int(broker_row.get("quantity") or 0)
-            avg = float(broker_row.get("average_entry_price") or 0.0)
-            if qty <= 0 or avg <= 0:
-                self.publish_event("reconciliation_mismatch", {
-                    "strategy_id": sid, "instrument": instrument,
-                    "broker_side": side, "broker_quantity": qty,
-                    "reason": "broker_position_adoption_missing_price",
-                    "execution_mode": env.mode}, env_name=env.name)
-                return
-            strategy = env.strategies[sid]
-            runtime = env.runtimes.require(sid) if env.runtimes is not None else None
-            lifecycle = (runtime.lifecycle if runtime is not None
-                         else self._lifecycle)
-            if lifecycle is None:
-                runtime = env.runtimes.require(sid)
-                lifecycle = runtime.lifecycle
-            inst_cfg = self.config.instrument(instrument) or {}
-            multiplier = float(inst_cfg.get("multiplier", 1.0) or 1.0)
-            signal = Signal(signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,
-                            instrument=instrument, strategy_id=sid,
-                            timestamp=time.time(), trigger_price=avg,
-                            stop_price=getattr(strategy, "stop_price", 0.0) or 0.0,
-                            quantity=qty)
-            signal.signal_id = f"RECON-{uuid.uuid4().hex[:12]}"
-            if env.persistence is not None:
-                try:
-                    env.persistence.save_signal({
-                        "signal_id": signal.signal_id,
-                        "strategy_id": sid, "instrument": instrument,
-                        "side": signal.signal_type.value,
-                        "signal_type": "entry", "timestamp": signal.timestamp,
-                        "trigger_price": avg, "stop_price": signal.stop_price,
-                        "quantity": qty})
-                except Exception:
-                    pass
-            trade = lifecycle.create_trade_from_signal(
-                signal, sid, sid, instrument, qty, multiplier)
-            if trade is None or not lifecycle.persist_trade(trade):
-                return
-            margin = self._calculate_margin(instrument, avg, qty)
-            account = env.account_engines.get(sid)
-            if account is None:
-                return
-            account_blocked = account.block_margin(margin)
-            global_blocked = env.account_engine.block_margin(margin) if account_blocked else False
-            if not (account_blocked and global_blocked):
-                if account_blocked:
-                    account.release_margin(margin)
-                # This position ALREADY EXISTS at the broker (it came from the
-                # reconcile snapshot): rejecting the adoption orphans a real
-                # position with no tracking.  Over-allocate the margin and
-                # surface a breach, then proceed so the position is tracked.
-                account.block_margin(margin, force=True)
-                env.account_engine.block_margin(margin, force=True)
-                self.publish_event("reconciliation_mismatch", {
-                    "strategy_id": sid, "instrument": instrument,
-                    "reason": "broker_position_adoption_margin_breach",
-                    "margin": margin, "execution_mode": env.mode},
-                    env_name=env.name)
-                try:
-                    self.telegram.on_risk_alert({
-                        "kind": "reconcile_margin_breach",
-                        "message": (
-                            f"RECONCILE MARGIN BREACH: broker position "
-                            f"{sid} {instrument} x{qty} tracked despite margin "
-                            f"over-limit ({margin:.2f})."),
-                    })
-                except Exception:
-                    pass
-            fill = Fill(
-                fill_id=f"LIVE-{uuid.uuid4().hex}",
-                order_id=f"RECON-ADOPT-{uuid.uuid4().hex}",
-                instrument=instrument,
-                side="BUY" if side == "LONG" else "SELL",
-                quantity=qty, price=avg, timestamp=time.time(),
-                strategy_id=sid, multiplier=multiplier,
-                entry_signal_id=signal.signal_id, trade_id=trade.trade_id,
-            )
-            fill.broker_order_id = "RECON-ADOPT"
-            fill.broker_fill_id = f"RECON-ADOPT:{fill.fill_id}"
-            fill.cumulative_filled_quantity = qty
-            position = env.position_manager.open_position(
-                fill, multiplier=multiplier, margin=margin,
-                stop_price=getattr(strategy, "stop_price", None),
-                entry_signal_id=signal.signal_id, trade_id=trade.trade_id,
-            )
-            # the adopted position needs its synthetic order + fill persisted
-            # (fills and orders integrity triggers require the order row first)
-            if env.persistence is not None:
-                self._persist_recon_order(env, fill, "RECONCILE",
-                                          trade.trade_id, signal.signal_id)
-                try:
-                    env.persistence.save_fill({
-                        "fill_id": fill.fill_id, "order_id": fill.order_id,
-                        "strategy_id": fill.strategy_id, "instrument": fill.instrument,
-                        "side": fill.side, "quantity": fill.quantity, "price": fill.price,
-                        "timestamp": datetime.fromtimestamp(
-                            fill.timestamp, tz=timezone.utc).isoformat(),
-                        "trade_id": trade.trade_id,
-                        "entry_signal_id": signal.signal_id,
-                        "broker_order_id": None, "broker_fill_id": None,
-                        "broker_trade_id": None,
-                        "cumulative_filled_quantity": qty})
-                except Exception:
-                    pass
-            self._persist_position(position, env_name=env.name)
-            lifecycle.register_entry_fill(trade.trade_id, fill.fill_id, avg, fill.timestamp)
-            lifecycle.register_position(trade.trade_id, position.position_id)
-            strategy.current_trade_id = trade.trade_id
-            strategy.state = (StrategyState.LONG_POSITION if side == "LONG"
-                              else StrategyState.SHORT_POSITION)
-            strategy.position_side = side
-            if runtime is not None:
-                runtime.current_trade_id = trade.trade_id
-            self.publish_event("reconciliation_resolved", {
-                "strategy_id": sid, "instrument": instrument,
-                "position_id": position.position_id, "trade_id": trade.trade_id,
-                "direction": "broker_open_adopt_local",
-                "broker_side": side, "broker_quantity": qty,
-                "broker_average_entry": avg,
-                "execution_mode": env.mode}, env_name=env.name)
-        except Exception as e:
-            log.error("[Engine] reconcile adopt failed for %s/%s: %s",
-                      sid, instrument, e)
 
     def _maybe_enable_trading(self) -> None:
         """Transition READY -> TRADING when the market is open and live market

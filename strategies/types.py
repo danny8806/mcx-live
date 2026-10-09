@@ -100,10 +100,7 @@ class SignalExecutionContext:
     high: Optional[float] = None
     low: Optional[float] = None
     close: Optional[float] = None
-    dema: Optional[float] = None      # fast DEMA-ATR line value at signal time
-    atr: Optional[float] = None       # fast ATR value at signal time
-    htf_value: Optional[float] = None # 1H line value at signal time
-    mid_value: Optional[float] = None # 15m value at signal time (when fast != mid)
+    indicator_values: dict[str, Any] = field(default_factory=dict)
     position_side: Optional[str] = None   # held side when the signal was created
     position_stop: Optional[float] = None # live stop when the signal was created
 
@@ -116,10 +113,7 @@ def freeze_signal_context(
     high: Optional[float] = None,
     low: Optional[float] = None,
     close: Optional[float] = None,
-    dema: Optional[float] = None,
-    atr: Optional[float] = None,
-    htf_value: Optional[float] = None,
-    mid_value: Optional[float] = None,
+    indicator_values: Optional[dict[str, Any]] = None,
     position_side: Optional[str] = None,
     position_stop: Optional[float] = None,
     timestamp: Optional[float] = None,
@@ -148,10 +142,7 @@ def freeze_signal_context(
         high=float(high) if high is not None else None,
         low=float(low) if low is not None else None,
         close=float(close) if close is not None else None,
-        dema=float(dema) if dema is not None else None,
-        atr=float(atr) if atr is not None else None,
-        htf_value=float(htf_value) if htf_value is not None else None,
-        mid_value=float(mid_value) if mid_value is not None else None,
+        indicator_values=dict(indicator_values or {}),
         position_side=position_side,
         position_stop=float(position_stop) if position_stop is not None else None,
     )
@@ -176,14 +167,7 @@ def resolve_order_role(signal: Optional['Signal'], *, exit_reason: Optional[str]
     (plus FALLBACK_MARKET).  Pure, shared resolution so paper and live engines
     and persistence all agree on the same classification.
 
-    This function NEVER returns ``STOP_LOSS``.  There is no broker-side
-    protective stop left in the system, so manufacturing that role could only
-    ever do harm: ``LiveExecutionEngine.submit_order`` hard-rejects it, which
-    would silently DISCARD a genuine local-SL exit and leave the position
-    unprotected.  A stop-loss exit therefore resolves to an ordinary ``EXIT``,
-    exactly like every other exit.  The retired role survives only as an
-    explicit value a caller may set on an order, and it is rejected at the
-    engine and at the transport.
+    SuperTrend signals produce entry, exit, or reversal market-order roles.
     """
     reason = exit_reason
     if signal is not None:
@@ -193,13 +177,6 @@ def resolve_order_role(signal: Optional['Signal'], *, exit_reason: Optional[str]
         # before engine plan immutability is checked.
         if md.get("market_fallback") and not md.get("exit") and not md.get("is_exit"):
             return "FALLBACK_MARKET"
-        # The local position-owned SL exit is an ORDINARY exit order: the stop
-        # is monitored in-process and the exit is submitted directly to the
-        # broker.  It is never a broker-side protective (resting) STOP_LOSS
-        # order, so it must classify as EXIT.  Its exit_reason still reads
-        # "stop_loss_hit" so P&L keeps its canonical STOP_LOSS reason.
-        if md.get("local_sl_exit"):
-            return "EXIT"
         if reason is None:
             reason = md.get("exit_reason") or md.get("reason")
         if signal.signal_type == SignalType.REVERSAL:
@@ -214,12 +191,6 @@ def resolve_order_role(signal: Optional['Signal'], *, exit_reason: Optional[str]
             reason_l = str(reason or "").lower()
             if "reversal" in reason_l:
                 return "REVERSAL_EXIT"
-            # A stop-loss reason on an exit signal is an ORDINARY exit.  The
-            # stop is monitored locally, so classifying this as "STOP_LOSS"
-            # would be rejected by the engine and the real protective exit
-            # would be silently DROPPED — leaving the position unprotected.
-            # "STOP_LOSS" is reserved for an explicit broker-side request,
-            # which resolve_order_role must never manufacture.
             return "EXIT"
     if reason is not None:
         reason_l = str(reason).lower()
@@ -232,19 +203,10 @@ def resolve_order_role(signal: Optional['Signal'], *, exit_reason: Optional[str]
 
 @dataclass
 class StrategyInput:
-    """Input data for strategy decision."""
+    """Input data for a completed-candle strategy decision."""
     instrument: str
     timestamp: float
-    fast_bar: 'Bar'  # Forward reference
-    fast_close: float
-    fast_high: float
-    fast_low: float
-    previous_fast_close: float
-    fast_dema_atr: float
-    htf_dema_atr: Optional[float]
-    previous_htf_dema_atr: Optional[float]
-    htf_confirmed: bool
-    htf_source_timestamp: Optional[float]
+    bar: 'Bar'
 
 
 # Bar type is supplied by the strategy runtime at runtime.

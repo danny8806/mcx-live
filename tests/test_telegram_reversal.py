@@ -43,7 +43,6 @@ def test_completed_reversal_sends_distinct_telegram_and_ledger_event():
         "quantity": 1,
         "old_exit_fill_price": 228670,
         "new_entry_fill_price": 228595,
-        "stop_price": 229305,
         "old_exit_order_id": "EXIT-1",
         "new_broker_order_id": "ENTRY-1",
         "status": "COMPLETE",
@@ -53,7 +52,7 @@ def test_completed_reversal_sends_distinct_telegram_and_ledger_event():
     message, silent, meta = client.messages[0]
     assert "REVERSAL COMPLETE" in message
     assert "LONG → SHORT" in message
-    assert "New Local Stop:</b> 229,305.00 (ARMED)" in message
+    assert "New Local Stop" not in message
     assert silent is False
     assert meta["event_type"] == "REVERSAL"
     assert len(ledger.rows) == 1

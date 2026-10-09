@@ -7,14 +7,13 @@ from strategies.types import StrategyState
 def test_legacy_saved_gate_does_not_override_current_config():
     configured = {"gold_02": StrategyGate(
         live_gate="ON", entry_enabled=True, exit_enabled=True,
-        reversal_enabled=True, sl_enabled=True,
+        reversal_enabled=True,
     )}
     legacy_saved = {"gold_02": {
         "live_gate": "CLOSE_ONLY",
         "entry_enabled": False,
         "exit_enabled": True,
         "reversal_enabled": False,
-        "sl_enabled": True,
         "close_only": True,
     }}
 
@@ -26,14 +25,13 @@ def test_legacy_saved_gate_does_not_override_current_config():
 def test_explicit_saved_operator_gate_overrides_current_config():
     configured = {"gold_02": StrategyGate(
         live_gate="ON", entry_enabled=True, exit_enabled=True,
-        reversal_enabled=True, sl_enabled=True,
+        reversal_enabled=True,
     )}
     operator_saved = {"gold_02": {
         "live_gate": "CLOSE_ONLY",
         "entry_enabled": False,
         "exit_enabled": True,
         "reversal_enabled": False,
-        "sl_enabled": True,
         "close_only": True,
         "operator_override": True,
     }}

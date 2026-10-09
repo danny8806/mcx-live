@@ -1,7 +1,7 @@
 """LiveEngine — the LIVE application's own engine graph.
 
 Wraps :class:`trading_engine.TradingEngine` in ``live_only`` mode and attaches
-the LIVE app's own persistence (``live/data/db/live_trading.db``), so the
+the LIVE app's fresh SuperTrend persistence (``live/data/db/supertrend/supertrend_live.sqlite3``), so the
 entire runtime (EventBus, market data, indicators, strategies, risk,
 execution, positions, P&L, persistence) belongs to the LIVE app alone — never
 shared with DEMO.
@@ -41,9 +41,9 @@ def _resolve_live_config(config_path) -> Path:
     raw = json.loads(Path(config_path).read_text(encoding="utf-8"))
     system = raw.setdefault("system", {})
     system["live_db_path"] = str(_app_path(
-        system.get("live_db_path", "live/data/db/live_trading.db")))
+        system.get("live_db_path", "live/data/db/supertrend/supertrend_live.sqlite3")))
     system["live_state_path"] = str(_app_path(
-        system.get("live_state_path", "live/data/db/live_system_state.json")))
+        system.get("live_state_path", "live/data/db/supertrend/supertrend_live_state.json")))
     if "token_file" in raw.get("dhan", {}):
         raw["dhan"]["token_file"] = str(_app_path(raw["dhan"]["token_file"]))
     resolved = APP_ROOT / "config" / "live_settings.resolved.json"
@@ -66,9 +66,11 @@ class LiveEngine:
             raise RuntimeError("LiveEngine must not own a PAPER runtime")
 
         db = _app_path(self.engine.config.get(
-            "system", {}).get("live_db_path", "live/data/db/live_trading.db"))
+            "system", {}).get("live_db_path",
+                              "live/data/db/supertrend/supertrend_live.sqlite3"))
         state = _app_path(self.engine.config.get(
-            "system", {}).get("live_state_path", "live/data/db/live_system_state.json"))
+            "system", {}).get("live_state_path",
+                              "live/data/db/supertrend/supertrend_live_state.json"))
         Path(db).parent.mkdir(parents=True, exist_ok=True)
 
         self.persistence = PersistenceManager(state_path=str(state), db_path=str(db))

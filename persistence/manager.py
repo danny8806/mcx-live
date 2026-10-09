@@ -557,9 +557,9 @@ class PersistenceManager:
                     signal_id, strategy_id, instrument, side, signal_type,
                     signal_timestamp, trigger_price, stop_price, quantity,
                     candle_timestamp, open, high, low, close, volume,
-                    htf_value, mid_value, fast_dema, fast_atr, signal_reason,
+                    signal_reason,
                     candle_data, indicator_data, signal_metadata, execution_mode
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(signal_id) DO UPDATE SET
                     strategy_id=excluded.strategy_id,
                     instrument=excluded.instrument,
@@ -578,10 +578,6 @@ class PersistenceManager:
                     low=COALESCE(excluded.low, signals.low),
                     close=COALESCE(excluded.close, signals.close),
                     volume=COALESCE(excluded.volume, signals.volume),
-                    htf_value=COALESCE(excluded.htf_value, signals.htf_value),
-                    mid_value=COALESCE(excluded.mid_value, signals.mid_value),
-                    fast_dema=COALESCE(excluded.fast_dema, signals.fast_dema),
-                    fast_atr=COALESCE(excluded.fast_atr, signals.fast_atr),
                     signal_reason=COALESCE(excluded.signal_reason,
                                            signals.signal_reason),
                     candle_data=COALESCE(excluded.candle_data,
@@ -606,10 +602,6 @@ class PersistenceManager:
                 signal_data.get("low"),
                 signal_data.get("close"),
                 signal_data.get("volume"),
-                signal_data.get("htf_value"),
-                signal_data.get("mid_value"),
-                signal_data.get("fast_dema"),
-                signal_data.get("fast_atr"),
                 signal_data.get("signal_reason"),
                 json.dumps(candle) if candle else None,
                 json.dumps(indicator) if indicator else None,
@@ -819,7 +811,7 @@ class PersistenceManager:
             current = (row["status"] or "pending").lower()
             terminal = {
                 "resolved", "expired", "cancelled_by_reversal",
-                "cancelled_by_indicator_change",
+                "cancelled_by_indicator_change", "cancelled_by_strategy_change",
             }
             if current in terminal:
                 return False

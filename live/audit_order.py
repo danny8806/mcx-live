@@ -8,7 +8,7 @@ Reconstructs the full identity lineage for any order, from any handle:
 
 Accepts a local order id, broker order id, correlation id, trade id, signal
 id, or fill id and walks: pending lifecycle -> order row -> broker mapping ->
-fills -> position -> SL / exit -> trade P&L -> fill reconciliation ->
+fills -> position -> exit -> trade P&L -> fill reconciliation ->
 lifecycle/failure events.  Optional ``--broker`` performs a READ-ONLY Dhan
 status/trades lookup (offline by default).
 
@@ -57,8 +57,7 @@ COLS = {
         "position_id", "trade_id", "strategy_id", "instrument", "side",
         "quantity", "average_entry_price", "average_exit_price", "status",
         "entry_time", "exit_time", "realized_pnl", "created_at", "updated_at",
-        "execution_mode", "sl_state", "sl_order_id", "sl_trigger_price",
-        "sl_protected_at", "avg_entry_price", "order_id", "liquidation_price",
+        "execution_mode", "avg_entry_price", "order_id", "liquidation_price",
     ],
     "trades": [
         "trade_id", "strategy_id", "instrument", "side", "entry_timestamp",

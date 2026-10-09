@@ -7,10 +7,10 @@
       "live"
     ],
     "log_level": "INFO",
-    "db_path": "data/db/trading.db",
-    "state_path": "data/db/system_state.json",
-    "live_db_path": "live/data/db/live_trading.db",
-    "live_state_path": "live/data/db/live_system_state.json",
+    "db_path": "data/db/supertrend_paper.sqlite3",
+    "state_path": "data/db/supertrend_paper_state.json",
+    "live_db_path": "live/data/db/supertrend/supertrend_live.sqlite3",
+    "live_state_path": "live/data/db/supertrend/supertrend_live_state.json",
     "live_enabled": true
   },
   "dhan": {
@@ -71,52 +71,20 @@
         "intercept": 142900.0,
         "source": "Dhan API /margincalculator (INTRADAY, qty=1, SLIVERM, retrieved 2026-08-27)"
       }
-    },
-    "GOLDPETAL": {
-      "symbol": "MCX:GOLDPETAL202610",
-      "security_id": "571306",
-      "exchange_segment": "MCX_COMM",
-      "instrument": "FUTCOM",
-      "multiplier": 1.0,
-      "tick_size": 1.0,
-      "lot_size": 1,
-      "session_open": "09:00",
-      "session_close": "23:30",
-      "session_minutes": 870,
-      "keep_partial": true,
-      "margin_model": {
-        "slope": 0.0925,
-        "intercept": 0.0,
-        "source": "Dhan API /margincalculator (MARGIN, qty=1, retrieved 2026-09-29)"
-      }
     }
   },
-  "indicators": {
-    "dema_period": 3,
-    "atr_period": 6,
-    "atr_factor": 1.0
-  },
   "strategies": {
-    "gold_01": {
-      "instrument": "GOLDPETAL",
-      "fast_timeframe": "5m",
-      "mid_timeframe": "15m",
-      "htf_timeframe": "1h",
-      "capital": 300000,
-      "enabled": true,
-      "lots": 1,
-      "live_gate": "CLOSE_ONLY",
-      "entry_enabled": false,
-      "exit_enabled": true,
-      "reversal_enabled": false,
-      "sl_enabled": true,
-      "quantity": 1
-    },
     "gold_02": {
       "instrument": "GOLDM",
-      "fast_timeframe": "15m",
-      "mid_timeframe": "15m",
-      "htf_timeframe": "1h",
+      "strategy_type": "supertrend",
+      "signal_timeframe": "15m",
+      "supertrend": {
+        "atr_period": 46,
+        "multiplier": 3.9,
+        "source": "ohlc4",
+        "atr_method": "sma_tr",
+        "first_tr": "na"
+      },
       "capital": 300000,
       "enabled": true,
       "lots": 1,
@@ -124,14 +92,19 @@
       "entry_enabled": true,
       "exit_enabled": true,
       "reversal_enabled": true,
-      "sl_enabled": true,
       "quantity": 1
     },
     "silver_01": {
       "instrument": "SILVERM",
-      "fast_timeframe": "15m",
-      "mid_timeframe": "15m",
-      "htf_timeframe": "1h",
+      "strategy_type": "supertrend",
+      "signal_timeframe": "15m",
+      "supertrend": {
+        "atr_period": 36,
+        "multiplier": 4.9,
+        "source": "low",
+        "atr_method": "sma_tr",
+        "first_tr": "na"
+      },
       "capital": 300000,
       "enabled": true,
       "lots": 1,
@@ -139,23 +112,22 @@
       "entry_enabled": true,
       "exit_enabled": true,
       "reversal_enabled": true,
-      "sl_enabled": true,
       "quantity": 1
-    },
-    "silver_02": {
-      "instrument": "SILVERM",
-      "fast_timeframe": "5m",
-      "mid_timeframe": "15m",
-      "htf_timeframe": "1h",
-      "capital": 300000,
-      "enabled": false,
-      "lots": 1,
-      "live_gate": "CLOSE_ONLY",
-      "entry_enabled": false,
-      "exit_enabled": true,
-      "reversal_enabled": false,
-      "sl_enabled": true,
-      "quantity": 1
+    }
+  },
+  "strategy_runtime": {
+    "exclusive": true,
+    "allowlist": {
+      "gold_02": {
+        "strategy_type": "supertrend",
+        "instrument": "GOLDM",
+        "timeframe": "15m"
+      },
+      "silver_01": {
+        "strategy_type": "supertrend",
+        "instrument": "SILVERM",
+        "timeframe": "15m"
+      }
     }
   },
   "charges": {
@@ -168,14 +140,6 @@
       "stamp_duty_pct": 0.0
     },
     "SILVERM": {
-      "brokerage_per_side": 20.0,
-      "stt_sell_pct": 0.01,
-      "exchange_pct": 0.0026,
-      "sebi_pct": 0.0001,
-      "gst_pct": 18.0,
-      "stamp_duty_pct": 0.0
-    },
-    "GOLDPETAL": {
       "brokerage_per_side": 20.0,
       "stt_sell_pct": 0.01,
       "exchange_pct": 0.0026,
@@ -195,6 +159,10 @@
     "pnl_poll_interval_seconds": 0.5,
     "max_retries": 3,
     "retry_backoff_seconds": 1.0,
+    "market_data": {
+      "stale_after_seconds": 90.0,
+      "max_signal_age_seconds": 60.0
+    },
     "dhan": {
       "client_id": "${DHAN_CLIENT_ID}",
       "access_token": "${DHAN_ACCESS_TOKEN}",
@@ -205,11 +173,6 @@
       "totp_secret": "${TOTP_SECRET}",
       "product_type": "MARGIN"
     },
-    "price_model": {
-      "entry_offset": 0.0,
-      "sl_offset": 0.0,
-      "tick_size": 1.0
-    },
     "order_ws": {
       "enabled": true,
       "url": "wss://api-order-update.dhan.co",
@@ -218,15 +181,12 @@
       "stale_threshold": 90.0
     },
     "order_watcher": {
-      "trigger_detection_enabled": true,
+      "trigger_detection_enabled": false,
       "verify_critical_after_ws_ms": 0,
       "reconcile_verify_interval_ms": 5000,
-      "max_reprices": 2,
-      "reprice_interval_ms": 5000,
       "max_order_age_ms": 60000,
       "max_price_deviation_pct": 0.5,
-      "market_fallback_enabled": true,
-      "market_fallback_timeout_ms": 0,
+      "market_fallback_enabled": false,
       "max_order_ops_per_sec": 10,
       "stale_after_ws_ms": 15000,
       "limit_skip_policy": {
@@ -252,17 +212,16 @@
     },
     "reversal": {
       "enabled": true,
-      "cancel_stale_exits_ms": 60000,
-      "entry_gap_points": 2
+      "cancel_stale_exits_ms": 60000
     },
     "rollover": {
       "enabled": true,
-      "trigger_days_before_expiry": 1,
+      "trigger_days_before_expiry": 2,
       "block_entries_on_window": true,
       "cancel_resting_on_window": true,
       "force_close_on_last_session": true,
       "tick_interval_seconds": 15,
-      "state_path": "live/data/db/rollover_state.json",
+      "state_path": "live/data/db/supertrend/supertrend_rollover_state.json",
       "scrip_master": {
         "url": "https://images.dhan.co/api-data/api-scrip-master.csv",
         "cache_path": "live/data/db/scrip_master.csv",
@@ -272,12 +231,6 @@
       "holidays": []
     }
   },
-  "live_test_order_cycle": {
-    "enabled": false,
-    "strategy_id": "gold_01",
-    "instrument": "GOLDPETAL",
-    "quantity": 1
-  },
   "risk": {
     "max_open_positions_per_strategy": 1,
     "max_open_positions_total": 8,
@@ -285,10 +238,8 @@
     "max_drawdown_pct": 100.0,
     "margin_per_trade_pct": 6.5,
     "kill_switch_enabled": false,
-    "max_unprotected_positions": 0,
     "reversal_position_limit": 1,
     "max_reversal_entry_failures": 3,
-    "sl_failure_cooldown_seconds": 30,
     "allow_broker_margin_reject": true
   },
   "account": {

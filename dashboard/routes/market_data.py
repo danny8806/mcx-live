@@ -19,6 +19,15 @@ def _get_market_data_sync():
     try:
         prices = _engine.execution_engine._current_prices
         instruments = _engine.config.get("instruments", {})
+        runtime_policy = _engine.config.get("strategy_runtime", {}) or {}
+        if runtime_policy.get("exclusive"):
+            allowed = runtime_policy.get("allowlist", {}) or {}
+            active_instruments = {
+                ((_engine.config.get("strategies", {}) or {}).get(strategy_id) or {}).get("instrument")
+                for strategy_id in allowed
+            }
+            instruments = {name: cfg for name, cfg in instruments.items()
+                           if name in active_instruments}
         inst_ticks = {}
         try:
             adapter = getattr(_engine, "data_adapter", None)
@@ -79,11 +88,21 @@ def _get_instrument_data_sync(instrument: str):
         return {"error": "Engine not initialized"}
     try:
         inst = instrument.upper()
+        runtime_policy = _engine.config.get("strategy_runtime", {}) or {}
+        if runtime_policy.get("exclusive"):
+            allowed = runtime_policy.get("allowlist", {}) or {}
+            active_instruments = {
+                ((_engine.config.get("strategies", {}) or {}).get(strategy_id) or {}).get("instrument")
+                for strategy_id in allowed
+            }
+            if inst not in active_instruments:
+                return {"error": f"instrument {inst!r} is outside the exclusive strategy runtime"}
         prices = _engine.execution_engine._current_prices
         ltp = prices.get(inst, 0.0)
         cfg = _engine.config.instrument(inst)
         bars = {}
-        for tf in ["5m", "15m", "1h"]:
+        timeframes = ["15m"]
+        for tf in timeframes:
             try:
                 fetcher = _engine.candle_fetcher
                 bars[tf] = {

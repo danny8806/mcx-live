@@ -46,6 +46,7 @@ class CandleFetcher:
         session_open: str = "09:00",
         session_close: str = "23:30",
         market_status=None,
+        timeframes: Optional[list[str]] = None,
     ):
         self.data_adapter = data_adapter
         self.instruments = instruments
@@ -53,14 +54,25 @@ class CandleFetcher:
         self.session_open = session_open
         self.session_close = session_close
         self.market_status = market_status
+        allowed = set(TIMEFRAME_MINUTES)
+        requested = timeframes or list(TIMEFRAME_MINUTES)
+        self.timeframes = tuple(tf for tf in dict.fromkeys(requested)
+                                if tf in allowed) or ("5m", "15m", "1h")
         
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._started_at_epoch = time.time()
         self._last_fetched: dict[str, float] = {}  # key -> last_fetch_timestamp
         # Learned native HTF offset (candle start minute % timeframe) per
         # timeframe, so close instants are scheduled exactly instead of polled.
         self._native_offsets: dict[str, int] = {}
         self._native_primed: set[str] = set()
+        # Dhan's native candle endpoint can publish a completed 15m candle a
+        # few seconds after the wall-clock close. Retry only the just-closed
+        # bar with a bounded schedule instead of waiting for the next window.
+        self._native_retries: dict[str, dict] = {}
+        self._native_retry_delays = (1.0, 2.0, 4.0, 8.0)
+        self._native_last_close_attempt: dict[str, int] = {}
         # A process restart must not replay today's already-closed REST bars
         # through the live strategy callbacks.  The engine's indicator warmup
         # handles history; this worker only owns bars closing after it starts.
@@ -70,6 +82,7 @@ class CandleFetcher:
         """Start the candle fetcher thread."""
         if self._running:
             return
+        self._started_at_epoch = time.time()
         self._running = True
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="candle-fetcher"
@@ -106,7 +119,12 @@ class CandleFetcher:
                 # seconds after its close. Retry that same bar briefly rather
                 # than waiting until the next 5m close.
                 self._retry_recent_5m()
-                self._sleep_until_stop(self._seconds_until_next_close())
+                self._retry_native_closed_bars()
+                delay = self._seconds_until_next_close()
+                retry_delay = self._seconds_until_native_retry()
+                if retry_delay is not None:
+                    delay = min(delay, retry_delay)
+                self._sleep_until_stop(delay)
             except Exception as e:
                 print(f"[CandleFetcher] Error: {e}", flush=True)
                 self._sleep_until_stop(30.0)
@@ -120,6 +138,8 @@ class CandleFetcher:
             time.sleep(0.1)
 
     def _retry_recent_5m(self) -> None:
+        if "5m" not in self.timeframes:
+            return
         now = datetime.now(IST)
         if now.minute % 5 or now.second >= 30:
             return
@@ -161,9 +181,17 @@ class CandleFetcher:
         to ~1 per window per instrument per day.
         """
         tf_minutes = TIMEFRAME_MINUTES.get(timeframe, 15)
-        offset = self._native_offsets.get(timeframe)
+        offset = self._native_offsets.get(f"{name}:{timeframe}",
+                                          self._native_offsets.get(timeframe))
         if offset is None:
-            return True  # offset not yet learned -> probe the native series
+            # Until Dhan provides a candle from which to learn its exact
+            # offset, probe the configured session boundary and the common
+            # one-minute-late MCX boundary. Never probe every worker wake.
+            hour, minute = map(int, self.session_open.split(":"))
+            session_offset = (hour * 60 + minute) % tf_minutes
+            residue = (now.hour * 60 + now.minute) % tf_minutes
+            return residue in {session_offset,
+                               (session_offset + 1) % tf_minutes}
         residue = (now.hour * 60 + now.minute) % tf_minutes
         return residue == offset
 
@@ -184,15 +212,77 @@ class CandleFetcher:
         """Seconds until the soonest candle close across every watched
         instrument/timeframe (5m clock + native 15m/1h offsets)."""
         now = now or datetime.now(IST)
-        deadlines = [
-            self._next_minute_with_residue(now, 5, 0),
-            self._next_minute_with_residue(now, TIMEFRAME_MINUTES["15m"],
-                                           self._native_offsets.get("15m", 0)),
-            self._next_minute_with_residue(now, TIMEFRAME_MINUTES["1h"],
-                                           self._native_offsets.get("1h", 0)),
-        ]
+        deadlines = []
+        names = list(self.instruments) or [None]
+        for name in names:
+            for timeframe in self.timeframes:
+                minutes = TIMEFRAME_MINUTES[timeframe]
+                if timeframe == "5m":
+                    deadlines.append(self._next_minute_with_residue(now, minutes, 0))
+                else:
+                    instrument_offset = (self._native_offsets.get(
+                        f"{name}:{timeframe}") if name is not None else None)
+                    offset = instrument_offset
+                    if offset is None and name is None:
+                        offset = self._native_offsets.get(timeframe)
+                    if offset is None:
+                        hour, minute = map(int, self.session_open.split(":"))
+                        offset = (hour * 60 + minute) % minutes
+                        deadlines.append(self._next_minute_with_residue(
+                            now, minutes, offset))
+                        deadlines.append(self._next_minute_with_residue(
+                            now, minutes, (offset + 1) % minutes))
+                    else:
+                        deadlines.append(self._next_minute_with_residue(
+                            now, minutes, offset))
         delay = (min(deadlines) - now).total_seconds()
         return max(0.0, delay)
+
+    def _schedule_native_retry(self, name: str, timeframe: str,
+                               candle_start_ts: int) -> None:
+        key = f"{name}:{timeframe}"
+        now = time.monotonic()
+        self._native_retries[key] = {
+            "candle_start_ts": int(candle_start_ts),
+            "attempt": 0,
+            "next_at": now + self._native_retry_delays[0],
+            "deadline": now + sum(self._native_retry_delays) + 1.0,
+        }
+
+    def _seconds_until_native_retry(self) -> Optional[float]:
+        if not self._native_retries:
+            return None
+        now = time.monotonic()
+        return max(0.0, min(item["next_at"] for item in
+                            self._native_retries.values()) - now)
+
+    def _retry_native_closed_bars(self) -> None:
+        now_mono = time.monotonic()
+        for stream_key, state in list(self._native_retries.items()):
+            if now_mono < state["next_at"]:
+                continue
+            if now_mono >= state["deadline"]:
+                log_msg = ("[CandleFetcher] native close not available after "
+                           f"bounded retries: {stream_key} "
+                           f"start={state['candle_start_ts']}")
+                print(log_msg, flush=True)
+                self._native_retries.pop(stream_key, None)
+                continue
+            name, timeframe = stream_key.rsplit(":", 1)
+            cfg = self.instruments.get(name, {})
+            start_ts = state["candle_start_ts"]
+            found = self._check_native_timeframe(
+                name, cfg, timeframe, datetime.now(IST),
+                expected_start_ts=start_ts)
+            if found:
+                self._native_retries.pop(stream_key, None)
+                continue
+            state["attempt"] += 1
+            if state["attempt"] >= len(self._native_retry_delays):
+                state["next_at"] = state["deadline"]
+            else:
+                state["next_at"] = (now_mono
+                                     + self._native_retry_delays[state["attempt"]])
             
     def _check_and_fetch(self):
         """Check if any candle should have closed and fetch it."""
@@ -212,10 +302,10 @@ class CandleFetcher:
             # (matches the backtest's per-bar mapping: the strategy sees the
             # current bar's HTF level, never the previous one).  1H before
             # 15m (an hour boundary is also a 15m/5m boundary).
-            self._check_timeframe(name, cfg, "1h", now)
-            self._check_timeframe(name, cfg, "15m", now)
-            # Check 5m candles LAST.
-            self._check_timeframe(name, cfg, "5m", now)
+            for timeframe in sorted(
+                    self.timeframes,
+                    key=lambda tf: TIMEFRAME_MINUTES[tf], reverse=True):
+                self._check_timeframe(name, cfg, timeframe, now)
 
     def _prime_startup_watermarks(self, now: datetime) -> None:
         """Mark completed bars already available at startup as seen.
@@ -226,7 +316,7 @@ class CandleFetcher:
         """
         hour, minute = map(int, self.session_open.split(":"))
         session_start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if now >= session_start:
+        if "5m" in self.timeframes and now >= session_start:
             completed = int((now - session_start).total_seconds() // 300)
             if completed > 0:
                 last_5m = session_start + timedelta(minutes=(completed - 1) * 5)
@@ -236,7 +326,7 @@ class CandleFetcher:
         # For native bars, use the exchange's latest completed start as the
         # watermark and learn its actual offset. No callback fires here.
         for name in self.instruments:
-            for timeframe in ("15m", "1h"):
+            for timeframe in (tf for tf in self.timeframes if tf in ("15m", "1h")):
                 self._prime_native_watermark(name, timeframe, now)
 
     def _prime_native_watermark(self, name: str, timeframe: str, now: datetime) -> None:
@@ -253,7 +343,9 @@ class CandleFetcher:
         self._native_primed.add(f"{name}:{timeframe}")
         newest = max(candles, key=lambda candle: candle[0])
         st_dt = datetime.fromtimestamp(newest[0], IST)
-        self._native_offsets[timeframe] = (st_dt.hour * 60 + st_dt.minute) % tf_minutes
+        offset = (st_dt.hour * 60 + st_dt.minute) % tf_minutes
+        self._native_offsets[timeframe] = offset  # backward-compatible view
+        self._native_offsets[f"{name}:{timeframe}"] = offset
         now_epoch = int(now.timestamp())
         for candle in candles:
             if candle[0] + tf_minutes * 60 <= now_epoch:
@@ -274,7 +366,26 @@ class CandleFetcher:
             # exchange offset is learned) so we don't re-fetch the series at
             # every 5m wake as a no-op.
             if self._native_close_due(name, timeframe, now):
-                self._check_native_timeframe(name, cfg, timeframe, now)
+                retry_key = f"{name}:{timeframe}"
+                close_token = int(now.replace(second=0, microsecond=0).timestamp())
+                if self._native_last_close_attempt.get(retry_key) == close_token:
+                    return
+                self._native_last_close_attempt[retry_key] = close_token
+                # If the offset was not yet known, a :01 probe can supersede
+                # the :00 candidate. The native fetch below returns all closed
+                # bars, so no completed bar is lost when the target advances.
+                self._native_retries.pop(retry_key, None)
+                close_at = now.replace(second=0, microsecond=0)
+                expected_start_ts = int((close_at - timedelta(
+                    minutes=TIMEFRAME_MINUTES[timeframe])).timestamp())
+                found = self._check_native_timeframe(
+                    name, cfg, timeframe, now,
+                    expected_start_ts=expected_start_ts)
+                if found:
+                    self._native_retries.pop(retry_key, None)
+                elif retry_key not in self._native_retries:
+                    self._schedule_native_retry(
+                        name, timeframe, expected_start_ts)
             return
 
         # --- 5m clock-aligned scheduling ---
@@ -321,25 +432,33 @@ class CandleFetcher:
         # Fetch the candle from REST API
         self._fetch_candle(name, cfg, timeframe, candle_start, key)
 
-    def _check_native_timeframe(self, name: str, cfg: dict, timeframe: str, now: datetime):
+    def _check_native_timeframe(self, name: str, cfg: dict, timeframe: str,
+                                now: datetime, expected_start_ts: Optional[int] = None):
         """Emit the most recent CLOSED native HTF candle (offset-aware)."""
         tf_minutes = TIMEFRAME_MINUTES.get(timeframe, 15)
+        fetch_started = time.perf_counter()
 
         # Session open guard
         hour, minute = map(int, self.session_open.split(":"))
         session_start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if now < session_start:
-            return
+            return True
 
         # Fetch native candles for today (interval "15"/"60").
         native_interval = {"15m": "15", "1h": "60"}[timeframe]
         try:
             candles = self.data_adapter.fetch_historical_candles(name, native_interval, now.date(), now.date())
         except Exception as e:
-            print(f"[CandleFetcher] Error fetching native {name} {timeframe}: {e}", flush=True)
-            return
+            elapsed_ms = (time.perf_counter() - fetch_started) * 1000
+            print(f"[CandleFetcher] Error fetching native {name} {timeframe} "
+                  f"fetch_ms={elapsed_ms:.1f}: {e}", flush=True)
+            return False
+        rest_fetch_ms = (time.perf_counter() - fetch_started) * 1000
         if not candles:
-            return
+            print(f"[CandleFetcher] native candle response empty "
+                  f"instrument={name} timeframe={timeframe} "
+                  f"rest_ms={rest_fetch_ms:.1f}", flush=True)
+            return False
 
         now_epoch = int(now.timestamp())
         stream_key = f"{name}:{timeframe}"
@@ -350,8 +469,9 @@ class CandleFetcher:
             # scheduled precisely instead of probed every 5m.
             newest = max(candles, key=lambda c: c[0])
             st_dt = datetime.fromtimestamp(newest[0], IST)
-            self._native_offsets[timeframe] = \
-                (st_dt.hour * 60 + st_dt.minute) % tf_minutes
+            offset = (st_dt.hour * 60 + st_dt.minute) % tf_minutes
+            self._native_offsets[timeframe] = offset
+            self._native_offsets[f"{name}:{timeframe}"] = offset
             self._native_primed.add(stream_key)
         # Every CLOSED native candle not yet emitted, newest-last: a transient
         # fetch failure between windows self-heals at the next close instead of
@@ -361,14 +481,29 @@ class CandleFetcher:
             key=lambda c: c[0],
         )
         if not closed:
-            return
+            print(f"[CandleFetcher] native response has no completed bar "
+                  f"instrument={name} timeframe={timeframe} "
+                  f"rest_ms={rest_fetch_ms:.1f}", flush=True)
+            return False
         if stream_uninitialized:
-            # If startup priming had a temporary REST failure, this first
-            # successful response still establishes a baseline only. Never
-            # turn bars that predate the live worker into fresh signals.
+            # If startup priming failed, establish a baseline for bars that
+            # predate this worker, but still forward bars that closed after it
+            # started. SignalFlow decides whether a recovered bar is fresh
+            # enough to trade; older recovered bars only warm the indicator.
             for candle in closed:
-                self._last_fetched[f"{name}:{timeframe}:{candle[0]}"] = time.time()
-            return
+                key = f"{name}:{timeframe}:{candle[0]}"
+                self._last_fetched[key] = time.time()
+                candle_end = float(candle[0]) + tf_minutes * 60
+                if candle_end > self._started_at_epoch:
+                    bar = self._create_bar(
+                        name, timeframe, candle,
+                        datetime.fromtimestamp(candle[0], IST), tf_minutes)
+                    if bar:
+                        self.on_candle_closed(bar)
+            return True
+        target_found = (expected_start_ts is None or any(
+            int(candle[0]) == int(expected_start_ts) for candle in closed))
+        callback_ms = 0.0
         for candle in closed:
             key = f"{name}:{timeframe}:{candle[0]}"
             if key in self._last_fetched:
@@ -378,10 +513,18 @@ class CandleFetcher:
                 datetime.fromtimestamp(candle[0], IST), tf_minutes)
             if bar:
                 self._last_fetched[key] = time.time()
+                available_lag_ms = max(
+                    0.0, (time.time() - (float(candle[0]) + tf_minutes * 60)) * 1000)
+                callback_started = time.perf_counter()
                 self.on_candle_closed(bar)
+                callback_ms += (time.perf_counter() - callback_started) * 1000
                 print(f"[CandleFetcher] {name} {timeframe} native closed: "
                       f"{datetime.fromtimestamp(candle[0], IST).strftime('%H:%M')} "
-                      f"O={bar.open:.0f} H={bar.high:.0f} L={bar.low:.0f} C={bar.close:.0f}", flush=True)
+                      f"O={bar.open:.0f} H={bar.high:.0f} L={bar.low:.0f} C={bar.close:.0f} "
+                      f"rest_ms={rest_fetch_ms:.1f} "
+                      f"bar_available_lag_ms={available_lag_ms:.1f} "
+                      f"pipeline_ms={callback_ms:.1f}", flush=True)
+        return target_found
 
     def _fetch_candle(self, name: str, cfg: dict, timeframe: str, candle_time: datetime, key: str):
         """Fetch a single candle from REST API.

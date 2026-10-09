@@ -104,7 +104,7 @@ function StrategyRow({ s }: { s: any }) {
   return (
     <div style={{
       display: "grid",
-      gridTemplateColumns: "120px 40px 40px 55px 55px 1fr 70px",
+      gridTemplateColumns: "1.2fr 55px 75px 65px 60px 90px",
       gap: "8px",
       alignItems: "center",
       padding: "5px 12px",
@@ -115,16 +115,15 @@ function StrategyRow({ s }: { s: any }) {
         <span style={{ width: "4px", height: "4px", borderRadius: "50%", background: statusDot(s.state) }} />
         <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>{s.strategy_id}</span>
       </div>
-      <span style={{ color: "var(--text-muted)" }}>{s.fast_timeframe}</span>
-      <span style={{ color: "var(--text-muted)" }}>{s.htf_timeframe}</span>
+      <span style={{ color: "var(--text-muted)" }}>15m</span>
+      <span style={{ color: "var(--text-muted)" }}>{s.supertrend?.value?.trend === 1 ? "UPTREND" : s.supertrend?.value?.trend === -1 ? "DOWNTREND" : "WARMUP"}</span>
       <span style={{
         color: s.position_side === "LONG" ? "var(--green)" : s.position_side === "SHORT" ? "var(--red)" : "var(--text-muted)",
         fontWeight: s.position_side ? 600 : 400,
       }}>
         {s.position_side ?? "FLAT"}
       </span>
-      <span style={{ color: "var(--text-secondary)" }}>{s.trade_count}</span>
-      <span style={{ color: "var(--text-muted)" }}>{(s.win_rate).toFixed(0)}%</span>
+      <span style={{ color: "var(--text-secondary)" }}>{s.trade_count ?? 0}</span>
       <span className="tabular-nums" style={{ color: pnlColor(s.realized_net), fontWeight: 600, textAlign: "right" }}>
         {formatINR(s.realized_net)}
       </span>
@@ -136,7 +135,7 @@ function PositionRow({ p }: { p: any }) {
   return (
     <div style={{
       display: "grid",
-      gridTemplateColumns: "70px 100px 50px 40px 80px 50px 90px",
+      gridTemplateColumns: "70px 100px 50px 40px 80px 90px",
       gap: "8px",
       alignItems: "center",
       padding: "5px 12px",
@@ -148,7 +147,6 @@ function PositionRow({ p }: { p: any }) {
       <span style={{ color: p.side === "LONG" ? "var(--green)" : "var(--red)", fontWeight: 600 }}>{p.side}</span>
       <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{p.quantity}</span>
       <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{safeINR(p.average_entry)}</span>
-      <span className="tabular-nums" style={{ color: "var(--text-muted)" }}>{p.stop_price ? safeINR(p.stop_price) : "—"}</span>
       <span className="tabular-nums" style={{ color: pnlColor(p.unrealized_pnl), fontWeight: 600, textAlign: "right" }}>
         {p.unrealized_pnl >= 0 ? "+" : ""}₹{safeNum(p.unrealized_pnl).toLocaleString("en-IN", { minimumFractionDigits: 2 })}
       </span>
@@ -254,6 +252,9 @@ export default function Overview() {
         {strategyGroups.map(({ instrument, strategies: instrumentStrategies }) => (
           <div key={instrument} className="lift" style={panelStyle}>
             <div style={panelHeader}>{instrument} STRATEGIES ({instrumentStrategies.length})</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1.2fr 55px 75px 65px 60px 90px", gap: "8px", padding: "7px 12px", color: "var(--text-disabled)", background: "var(--bg-table-header)", borderBottom: "1px solid var(--border-subtle)", fontSize: "8px", fontWeight: 700, letterSpacing: ".04em" }}>
+              <span>PROFILE</span><span>TF</span><span>TREND</span><span>POSITION</span><span>TRADES</span><span style={{ textAlign: "right" }}>NET P&amp;L</span>
+            </div>
             <div style={{ maxHeight: "200px", overflow: "auto" }}>
               {instrumentStrategies.map((s: any) => <StrategyRow key={s.strategy_id} s={s} />)}
             </div>
@@ -270,6 +271,9 @@ export default function Overview() {
           </div>
         ) : (
           <div>
+            <div style={{ display: "grid", gridTemplateColumns: "70px 100px 50px 40px 80px 90px", gap: "8px", padding: "7px 12px", color: "var(--text-disabled)", background: "var(--bg-table-header)", borderBottom: "1px solid var(--border-subtle)", fontSize: "8px", fontWeight: 700, letterSpacing: ".04em" }}>
+              <span>INSTRUMENT</span><span>STRATEGY</span><span>SIDE</span><span>QTY</span><span>AVG ENTRY</span><span style={{ textAlign: "right" }}>LOCAL P&amp;L</span>
+            </div>
             {openPositions.map((p: any) => <PositionRow key={p.position_id} p={p} />)}
           </div>
         )}

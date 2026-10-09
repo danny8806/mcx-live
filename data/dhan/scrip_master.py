@@ -43,7 +43,7 @@ HDR_SM_SYMBOL = "SM_SYMBOL_NAME"
 
 EXPIRY_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-_KNOWN_ASSETS = ("GOLDM", "SILVERM", "GOLDPETAL")
+_KNOWN_ASSETS = ("GOLDM", "SILVERM")
 
 
 class FutureContract:
@@ -151,6 +151,7 @@ class ScripMasterClient:
         self._last_error: Optional[str] = None
         self._next_network_attempt: float = 0.0
         self._last_download_epoch: float = 0.0
+        self._next_forced_refresh: float = 0.0
 
     # ── loading ────────────────────────────────────────────────────────
 
@@ -181,16 +182,17 @@ class ScripMasterClient:
         except OSError as e:
             log.warning("[ScripMaster] cache write failed: %s", e)
 
-    def resolve(self) -> bool:
+    def resolve(self, *, force_network: bool = False) -> bool:
         """Populate/refresh the contract table.  False when NO data is known.
 
         A populated table is used until the cache turns stale; a stale cache
         triggers one download attempt (with a 10-minute backoff after a
-        failure), so a transient outage retries at the next tick instead of
-        wedging the metal in "cannot resolve" forever.
+        failure). Rollover can also request a separately rate-limited refresh
+        when a current or next contract is missing from a still-fresh cache.
         """
         now = time.time()
-        if self._contracts is not None and not self._cache_stale(now):
+        if (not force_network and self._contracts is not None
+                and not self._cache_stale(now)):
             return True
         text = None
         if self._fetch is not None:
@@ -199,11 +201,11 @@ class ScripMasterClient:
             except Exception as e:
                 self._last_error = f"fetch failed: {e}"
                 log.warning("[ScripMaster] %s", self._last_error)
-        if not text:
+        if not text and not force_network:
             text = self._read_cache()
             if text:
                 log.info("[ScripMaster] using on-disk cache %s", self.cache_path)
-        if not text and self.url and now >= self._next_network_attempt:
+        if not text and self.url and (force_network or now >= self._next_network_attempt):
             try:
                 import urllib.request
                 req = urllib.request.Request(self.url, headers={
@@ -227,7 +229,26 @@ class ScripMasterClient:
                 self._write_cache(text)
                 return True
             self._last_error = "parsed 0 MCX FUTCOM contracts"
+            self._next_network_attempt = now + 600.0
         return self._contracts is not None
+
+    def refresh_if_due(self, min_interval_seconds: float = 600.0) -> bool:
+        """Force-refresh the ladder at most once per interval when rollover needs it.
+
+        A valid 24-hour cache is useful for routine operation, but cannot be
+        trusted as the final word when the next expiry is missing during an
+        active rollover. Failed forced refreshes preserve known rows and are
+        retried after the bounded cooldown.
+        """
+        now = time.time()
+        if now < self._next_forced_refresh:
+            return self._contracts is not None
+        # If there is no usable in-memory ladder and the normal request just
+        # failed, respect its backoff instead of immediately doubling traffic.
+        if self._contracts is None and now < self._next_network_attempt:
+            return False
+        self._next_forced_refresh = now + max(1.0, float(min_interval_seconds))
+        return self.resolve(force_network=True)
 
     # ── queries ────────────────────────────────────────────────────────
 

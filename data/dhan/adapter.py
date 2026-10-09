@@ -110,6 +110,63 @@ class DhanDataAdapter:
                 meta.instrument,
             )
 
+    def register_rollover_candidate(self, alias: str,
+                                    config: dict[str, Any]) -> InstrumentMeta:
+        """Subscribe a next-expiry candidate under an isolated logical alias.
+
+        Until promotion, its ticks are emitted under ``alias`` so they cannot
+        mark or trigger stops belonging to the currently active contract.
+        """
+        meta = register_instrument(alias, config)
+        self._instruments[alias] = meta
+        self._security_to_symbol[meta.security_id] = alias
+        self.ws.add_instrument(meta.symbol, meta.security_id,
+                               meta.exchange_segment, meta.instrument)
+        return meta
+
+    def promote_rollover_candidate(self, alias: str,
+                                   instrument: str) -> InstrumentMeta:
+        """Atomically remap a warmed alias to its production logical symbol."""
+        candidate = self._instruments.get(alias)
+        if candidate is None:
+            raise KeyError(f"unknown rollover candidate {alias!r}")
+        previous = self._instruments.get(instrument)
+        if previous is not None:
+            self._security_to_symbol.pop(previous.security_id, None)
+            if previous.symbol != candidate.symbol:
+                self.ws.remove_instrument(previous.symbol)
+        self._instruments.pop(alias, None)
+        self._instruments[instrument] = candidate
+        self._security_to_symbol[candidate.security_id] = instrument
+        with self._ltp_lock:
+            self._live_ltp.pop(instrument, None)
+            self._live_ltp.pop(alias, None)
+        # Registry aliases are process-global for compatibility; replace the
+        # logical instrument mapping only after the old contract is broker-flat.
+        register_instrument(instrument, {
+            "symbol": candidate.symbol,
+            "security_id": candidate.security_id,
+            "exchange_segment": candidate.exchange_segment,
+            "instrument": candidate.instrument,
+            "multiplier": candidate.multiplier,
+            "tick_size": candidate.tick_size,
+            "lot_size": candidate.lot_size,
+            "session_open": candidate.session_open,
+            "session_close": candidate.session_close,
+            "session_minutes": candidate.session_minutes,
+        })
+        return candidate
+
+    def discard_rollover_candidate(self, alias: str) -> None:
+        """Remove an unpromoted candidate feed and mapping."""
+        candidate = self._instruments.pop(alias, None)
+        if candidate is None:
+            return
+        self._security_to_symbol.pop(candidate.security_id, None)
+        self.ws.remove_instrument(candidate.symbol)
+        with self._ltp_lock:
+            self._live_ltp.pop(alias, None)
+
     def connect(self) -> None:
         """Start data feed connections."""
         self.ws.connect()
@@ -118,6 +175,12 @@ class DhanDataAdapter:
     def disconnect(self) -> None:
         """Stop data feed connections."""
         self.ws.disconnect()
+        # The REST client owns a daemon renewal thread as well as the WebSocket.
+        # Stop both resources together so engine shutdown/restart does not
+        # leave orphan token schedulers behind.
+        stop_scheduler = getattr(self.rest, "stop_scheduler", None)
+        if callable(stop_scheduler):
+            stop_scheduler()
         self._connected = False
 
     def _process_tick(self, raw_tick: dict[str, Any]) -> None:

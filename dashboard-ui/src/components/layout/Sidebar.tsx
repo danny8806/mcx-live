@@ -1,11 +1,11 @@
 import { NavLink } from "react-router-dom";
 import { useDataSelector } from "../../store/DataProvider";
-import { Activity, BarChart3, Bell, BookOpen, BriefcaseBusiness, CandlestickChart, ChevronLeft, ChevronRight, CircleDollarSign, ClipboardList, FileClock, Gauge, GitCompareArrows, LayoutDashboard, RotateCcw, Settings2, ShieldCheck, SlidersHorizontal, Waves } from "lucide-react";
+import { Activity, Bell, BookOpen, BriefcaseBusiness, CandlestickChart, ChevronLeft, ChevronRight, CircleDollarSign, ClipboardList, FileClock, Gauge, GitCompareArrows, LayoutDashboard, RotateCcw, Settings2, ShieldCheck, SlidersHorizontal, Waves } from "lucide-react";
 
 const groups = [
   { label: "WORKSPACE", items: [{ to: "/", label: "Live desk", icon: LayoutDashboard }, { to: "/live-ops", label: "Operations", icon: Activity }] },
   { label: "TRADING", items: [{ to: "/positions", label: "Positions", icon: BriefcaseBusiness }, { to: "/orders", label: "Orders", icon: ClipboardList }, { to: "/trades", label: "Trade history", icon: BookOpen }, { to: "/strategies", label: "Strategies", icon: SlidersHorizontal }, { to: "/reversals", label: "Reversals", icon: RotateCcw }] },
-  { label: "ANALYSIS", items: [{ to: "/pnl", label: "P&L analytics", icon: CircleDollarSign }, { to: "/risk", label: "Risk", icon: ShieldCheck }, { to: "/market-data", label: "Market data", icon: Waves }, { to: "/indicators", label: "Indicators", icon: Gauge }, { to: "/matrix", label: "Strategy matrix", icon: BarChart3 }] },
+  { label: "ANALYSIS", items: [{ to: "/pnl", label: "P&L analytics", icon: CircleDollarSign }, { to: "/risk", label: "Risk", icon: ShieldCheck }, { to: "/market-data", label: "Market data", icon: Waves }, { to: "/indicators", label: "SuperTrend values", icon: Gauge }] },
   { label: "SYSTEM", items: [{ to: "/reconciliation", label: "Reconciliation", icon: GitCompareArrows }, { to: "/health", label: "System health", icon: CandlestickChart }, { to: "/alerts", label: "Alerts", icon: Bell }, { to: "/audit", label: "Audit log", icon: FileClock }, { to: "/settings", label: "Settings", icon: Settings2 }] },
 ];
 
