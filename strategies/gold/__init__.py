@@ -8,14 +8,11 @@ def _gold_security_id(security_id: str = "") -> str:
     """Resolve the current GOLDM contract from config (rollover-safe)."""
     if security_id:
         return str(security_id)
-    try:
-        from config import Config
-        value = Config.instrument("GOLDM").get("security_id", "") or ""
-        if value:
-            return str(value)
-    except Exception:
-        pass
-    return "569003"
+    from config import Config
+    value = Config.instrument("GOLDM").get("security_id", "") or ""
+    if not value:
+        raise RuntimeError("GOLDM security_id is missing from active instrument config")
+    return str(value)
 
 
 def create_gold_15m(strategy_id: str = "gold_02", instrument: str = "GOLDM",

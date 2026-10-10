@@ -69,6 +69,10 @@ def test_exclusive_runtime_builds_only_the_two_15m_supertrend_strategies(tmp_pat
 
 def test_persisted_rollover_contract_is_applied_before_runtime_feeds_are_built(tmp_path):
     config = _test_config(tmp_path)
+    # Simulate an installation whose base config still points at the prior
+    # expiry, while the durable rollover state already selected November.
+    config["instruments"]["GOLDM"]["symbol"] = "MCX:GOLDM202610"
+    config["instruments"]["GOLDM"]["security_id"] = "569003"
     config["live"]["rollover"]["state_path"] = str(tmp_path / "rollover.json")
     (tmp_path / "rollover.json").write_text(json.dumps({
         "GOLDM": {
@@ -103,12 +107,31 @@ def test_exclusive_runtime_fails_closed_if_an_allowed_strategy_config_drifts(tmp
         raise AssertionError("exclusive strategy timeframe mismatch must fail startup")
 
 
-def test_instrument_factories_create_only_supertrend_profiles():
+def test_instrument_factories_create_only_supertrend_profiles(monkeypatch):
     from strategies.gold import create_gold_15m
     from strategies.silver import create_silver_15m
+    from config import Config
+    from events.types import CandleEvent
 
-    assert create_gold_15m().strategy_type == "supertrend"
+    live_config = json.loads(
+        (Path(__file__).resolve().parents[1] / "config" / "live_settings.json")
+        .read_text())
+    monkeypatch.setattr(Config, "_config", live_config)
+
+    gold = create_gold_15m()
+    assert gold.strategy_type == "supertrend"
+    assert gold.security_id == "571445"
     assert create_silver_15m().strategy_type == "supertrend"
+    assert CandleEvent("GOLDM", "15m", 0, 900, 1, 2, 0, 1, 0).security_id == "571445"
+
+
+def test_checked_in_gold_defaults_point_to_nearest_verified_expiry():
+    root = Path(__file__).resolve().parents[1]
+    for filename in ("settings.json", "live_settings.json"):
+        config = json.loads((root / "config" / filename).read_text())
+        gold = config["instruments"]["GOLDM"]
+        assert gold["symbol"] == "MCX:GOLDM202611"
+        assert gold["security_id"] == "571445"
 
 
 def test_production_factory_loads_only_supertrend_calculations():

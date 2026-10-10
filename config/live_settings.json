@@ -37,8 +37,8 @@
   },
   "instruments": {
     "GOLDM": {
-      "symbol": "MCX:GOLDM202610",
-      "security_id": "569003",
+      "symbol": "MCX:GOLDM202611",
+      "security_id": "571445",
       "exchange_segment": "MCX_COMM",
       "instrument": "FUTCOM",
       "multiplier": 10.0,

@@ -26,8 +26,12 @@ class CandleEvent:
 
     @property
     def security_id(self) -> str:
-        """Security ID lookup from instrument name."""
-        return _SECURITY_IDS.get(self.instrument, "")
+        """Resolve the active contract ID from config (including rollovers)."""
+        try:
+            from config import Config
+            return str(Config.instrument(self.instrument).get("security_id", "") or "")
+        except Exception:
+            return ""
 
 
 @dataclass(frozen=True)
@@ -37,10 +41,3 @@ class TickEvent:
     ltp: float
     timestamp: float         # epoch seconds
     volume: float = 0.0
-
-
-# Instrument → security_id mapping
-_SECURITY_IDS = {
-    "GOLDM": "569003",
-    "SILVERM": "483080",
-}
