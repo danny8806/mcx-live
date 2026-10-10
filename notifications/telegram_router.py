@@ -39,6 +39,71 @@ logger = logging.getLogger(__name__)
 _EMIT_STOP = object()
 _EMIT_QUEUE_MAX = 512
 
+# Only durable, operator-actionable transitions are bridged from the engine
+# event stream. High-frequency market data and transient wait/poll events are
+# intentionally excluded so Telegram remains useful during a live session.
+_ENGINE_ALERT_CATEGORIES = {
+    "trigger_crossed": "ORDER",
+    "order_submission_outcome": "ORDER",
+    "order_rejected": "ORDER",
+    "order_created": "ORDER",
+    "pending_order_created": "ORDER",
+    "pending_order_armed": "ORDER",
+    "pending_order_entry_sent": "ORDER",
+    "pending_order_blocked": "ORDER",
+    "entry_order_terminal_without_fill": "ORDER",
+    "stale_lifecycle_trigger_rejected": "ORDER",
+    "entry_market_fallback": "ORDER",
+    "entry_cancel": "ORDER",
+    "entry_reprice": "ORDER",
+    "market_fallback_partial_exit_cancelled": "ORDER",
+    "position_augmented": "POSITION",
+    "position_partially_exited": "POSITION",
+    "reversal_entry_triggered_after_flat": "REVERSAL",
+    "reversal_flat_gate_blocked": "REVERSAL",
+    "reversal_entry_park_persist_failed": "REVERSAL",
+    "reversal_entry_journal_failed": "REVERSAL",
+    "reversal_entry_waiting_for_entry_gate": "REVERSAL",
+    "broker_orphan_position": "RECONCILIATION",
+    "broker_position_reconciliation_error": "RECONCILIATION",
+    "reconciliation_mismatch": "RECONCILIATION",
+    "reconciliation_snapshot_discarded": "RECONCILIATION",
+    "position_close_persistence_failed": "CRITICAL",
+    "position_close_persistence_recovered": "RECONCILIATION",
+    "trade_close_persistence_failed": "CRITICAL",
+    "pending_trigger_cleanup_failed": "ERROR",
+    "startup_restore_failed": "CRITICAL",
+    "quarantine_event": "CRITICAL",
+    "safe_mode_entered": "CRITICAL",
+    "strategy_emergency_stop": "RISK",
+    "strategy_control": "CONFIGURATION_CHANGED",
+    "strategy_runtime_policy_blocked": "RISK",
+    "strategy_gate_blocked": "RISK",
+    "stale_signal_candle_skipped": "RISK",
+    "contract_rollover_applied_at_boot": "SYSTEM",
+    "contract_rollover_cancel_resting": "SYSTEM",
+    "contract_rollover_force_close": "CRITICAL",
+    "contract_rollover_switched": "SYSTEM",
+    "market_websocket_status_changed": "WEBSOCKET",
+    "order_websocket_status_changed": "WEBSOCKET",
+    "MARKET_FALLBACK_PARTIAL_FILL": "ORDER",
+    "MARKET_FALLBACK_TERMINAL_WITHOUT_FULL_FILL": "CRITICAL",
+    "ENTRY_ORDER_CANCELLED_OR_REJECTED": "ORDER",
+    "ENTRY_REPRICE_FAILED": "ORDER",
+    "PARTIAL_REMAINDER_ABANDONED": "RISK",
+    "ENTRY_MARKET_FALLBACK_FAILED": "CRITICAL",
+    "MARKET_FALLBACK_WAITING_FOR_BROKER_CONFIRMATION": "ORDER",
+}
+
+# These events already have a richer, dedicated alert path. Bridging them a
+# second time would generate duplicate Telegram messages and ledger rows.
+_ENGINE_ALERT_EXCLUSIONS = {
+    "signal_created", "position_opened", "trade_closed",
+    "margin_breach_entry", "contract_rollover_alert", "engine_started",
+    "engine_stopped", "strategy_gate_changed", "settings_refreshed",
+    "engine_restored",
+}
+
 
 class TelegramRouter:
     def __init__(self, client: Optional[TelegramClient] = None,
@@ -265,6 +330,52 @@ class TelegramRouter:
         text = format_order_lifecycle(data or {})
         event_type = (data or {}).get("event_type", "LIFECYCLE")
         self._emit(event_type, data or {}, text, source="LOCAL")
+
+    def on_engine_event(self, event_type: str, data: dict) -> None:
+        """Send selected engine state transitions through the alert ledger.
+
+        This deliberately does not forward every event: ticks, candles, and
+        repeated broker-wait polls are not useful as Telegram alerts. Events
+        with dedicated signal/fill/exit/risk handlers are excluded to prevent
+        duplicate notifications.
+        """
+        event_type = str(event_type or "").strip()
+        if not event_type or event_type in _ENGINE_ALERT_EXCLUSIONS:
+            return
+        category = _ENGINE_ALERT_CATEGORIES.get(event_type)
+        if not category:
+            return
+        source_data = data if isinstance(data, dict) else {}
+        details = source_data.get("details")
+        details = details if isinstance(details, dict) else {}
+
+        # Keep messages informative without dumping raw broker responses,
+        # credentials, or arbitrary nested payloads into Telegram.
+        fields = (
+            ("component", "Component"), ("status", "Status"),
+            ("detail", "Detail"),
+            ("strategy_id", "Strategy"), ("instrument", "Instrument"),
+            ("side", "Side"), ("order_side", "Side"),
+            ("quantity", "Quantity"), ("trigger_price", "Trigger"),
+            ("price", "Price"), ("new_status", "Status"),
+            ("reason", "Reason"),
+            ("error", "Error"), ("broker_order_id", "Broker order"),
+            ("order_id", "Order"), ("signal_id", "Signal"),
+        )
+        lines = [f"📣 <b>{escape(event_type.replace('_', ' ').upper())}</b>"]
+        seen = set()
+        for key, label in fields:
+            value = source_data.get(key)
+            if value is None or value == "":
+                value = details.get(key)
+            if value is None or value == "" or label in seen:
+                continue
+            seen.add(label)
+            lines.append(f"<b>{label}:</b> {escape(str(value))}")
+        lines.append(f"<b>Timestamp:</b> {datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S IST')}")
+        payload = {**source_data, "engine_event_type": event_type}
+        self._emit(category, payload, "\n".join(lines), source="ENGINE",
+                   async_fast_path=True)
 
     def on_configuration_change(self, data: dict) -> None:
         """Audit an operator-applied settings change in the ledger and Telegram."""

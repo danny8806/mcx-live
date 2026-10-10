@@ -8,6 +8,7 @@ so identical rows are collapsed before comparison.
 from __future__ import annotations
 
 import logging
+import json
 from collections import defaultdict
 from typing import Optional
 
@@ -162,7 +163,16 @@ class PositionReconciliationMixin:
         elif hasattr(env, "_reported_broker_orphans"):
             env._reported_broker_orphans = ()
         if local_mismatch or inconsistent_broker_rows:
-            self.publish_event("broker_position_reconciliation_error", {
-                **summary, "execution_mode": env.mode,
-            }, env_name=env.name)
+            fingerprint = json.dumps(
+                {"local_mismatch": local_mismatch,
+                 "invalid_broker_rows": inconsistent_broker_rows},
+                sort_keys=True, separators=(",", ":"), default=str)
+            prior = getattr(env, "_reported_position_reconciliation_error", None)
+            if prior != fingerprint:
+                env._reported_position_reconciliation_error = fingerprint
+                self.publish_event("broker_position_reconciliation_error", {
+                    **summary, "execution_mode": env.mode,
+                }, env_name=env.name)
+        elif hasattr(env, "_reported_position_reconciliation_error"):
+            env._reported_position_reconciliation_error = None
         return summary

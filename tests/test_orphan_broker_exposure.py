@@ -94,6 +94,28 @@ def test_quantity_or_side_mismatch_keeps_environment_unreconciled():
     assert result["local_mismatch"][0]["reason"] == "local_broker_position_mismatch"
 
 
+def test_reconciliation_error_alert_is_emitted_once_per_state_and_again_after_recovery():
+    position = _position(side=PositionSide.LONG, quantity=1)
+    broker = _Broker([{"instrument": "SILVERM", "side": "SHORT",
+                       "quantity": 1}])
+    engine, env = _engine(broker.rows, [position])
+
+    engine.sync_positions_from_broker("live")
+    engine.sync_positions_from_broker("live")
+    assert len([event for event in engine.events
+                if event[0] == "broker_position_reconciliation_error"]) == 1
+
+    env.broker.rows = [{"instrument": "SILVERM", "side": "LONG", "quantity": 1}]
+    assert engine.sync_positions_from_broker("live")["status"] == "reconciled"
+    assert env._reported_position_reconciliation_error is None
+
+    env.broker.rows = [{"instrument": "SILVERM", "side": "SHORT",
+                        "quantity": 1}]
+    engine.sync_positions_from_broker("live")
+    assert len([event for event in engine.events
+                if event[0] == "broker_position_reconciliation_error"]) == 2
+
+
 def test_failed_broker_query_is_never_reported_as_flat():
     class BrokenBroker:
         def positions(self):

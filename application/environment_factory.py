@@ -363,7 +363,26 @@ class EnvironmentFactoryMixin:
     def _make_env_status_handler(self, env: Environment):
         """Create a status handler bound to a specific LIVE environment."""
         def handler(status):
-            pass
+            raw = str(status or "unknown")
+            lowered = raw.lower()
+            if lowered == "connected":
+                state = "CONNECTED"
+            elif "closed" in lowered or "disconnect" in lowered:
+                state = "DISCONNECTED"
+            elif "error" in lowered or "failed" in lowered:
+                state = "ERROR"
+            else:
+                state = "STATUS"
+            previous = getattr(env, "_last_market_ws_alert_state", None)
+            if previous == state:
+                return
+            env._last_market_ws_alert_state = state
+            self.publish_event("market_websocket_status_changed", {
+                "component": "Dhan market data WebSocket",
+                "status": state,
+                "detail": raw[:240],
+                "environment": env.name,
+            }, env_name=env.name)
         return handler
     def _legacy_paper_env(self) -> Optional[Environment]:
         """Resolve the PAPER environment, lazily building it for the legacy

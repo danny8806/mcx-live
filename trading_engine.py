@@ -1261,6 +1261,37 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                 })
             except Exception:
                 pass
+        # Telegram is a best-effort presentation channel. Route only the
+        # router's curated actionable events; never let alert delivery affect
+        # order/state transitions or the dashboard event callback.
+        telegram = getattr(self, "telegram", None)
+        if telegram is not None:
+            try:
+                notify = getattr(telegram, "on_engine_event", None)
+                if callable(notify):
+                    notify(event_type, data if isinstance(data, dict) else {})
+            except Exception as exc:
+                log.warning("[Engine] Telegram event alert failed (%s): %s",
+                            event_type, exc)
+
+    def _publish_order_failure_alert(self, event: dict,
+                                     env_name: Optional[str] = None) -> None:
+        """Persist order-watcher failure evidence and alert on material failures."""
+        event = event if isinstance(event, dict) else {}
+        try:
+            env = self._env_for(env_name) if env_name is not None else None
+            persistence = env.persistence if env is not None else self._persistence
+            if persistence is not None:
+                persistence.save_execution_failure_event(event)
+        except Exception as exc:
+            log.warning("[Engine] execution failure persistence failed: %s", exc)
+        try:
+            telegram = getattr(self, "telegram", None)
+            notify = getattr(telegram, "on_engine_event", None)
+            if callable(notify):
+                notify(str(event.get("event_type") or "ORDER_FAILURE"), event)
+        except Exception as exc:
+            log.warning("[Engine] Telegram order failure alert failed: %s", exc)
 
     # ── §34 cross-strategy quarantine ───────────────────────────────────
 
@@ -1577,6 +1608,18 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                 on_reconcile=on_reconcile,
                 reset_strategy_fn=reset_strategy_fn,
                 state_lock=self._lock,
+                    on_status=lambda status: self.publish_event(
+                        "order_websocket_status_changed", {
+                            "component": "Dhan order update WebSocket",
+                            "status": ("CONNECTED" if str(status).lower() == "connected"
+                                      else "DISCONNECTED" if any(x in str(status).lower()
+                                                                 for x in ("closed", "disconnect", "stale"))
+                                      else "ERROR" if any(x in str(status).lower()
+                                                          for x in ("error", "failed"))
+                                      else "STATUS"),
+                            "detail": str(status)[:240],
+                            "environment": name,
+                        }, env_name=name),
             )
             # Order Watcher — continuous broker+market+intent observation with
             # REST-verified recovery (WS fast path → targeted REST verify →
@@ -1591,9 +1634,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                     clock=time.time,
                     on_event=lambda kind, data: self.publish_event(
                         kind, data, env_name=name),
-                    on_failure_event=lambda ev: (
-                        env.persistence.save_execution_failure_event(ev)
-                        if env.persistence is not None else None),
+                    on_failure_event=lambda ev: self._publish_order_failure_alert(
+                        ev, env_name=name),
                     blocker_fn=lambda sid, rec: self._entry_priority_blocker(
                         sid, name, rec=rec),
                     preflight_fn=lambda sid, rec: self._market_fallback_preflight(

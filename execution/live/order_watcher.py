@@ -411,6 +411,7 @@ class OrderWatcher:
         immediately (not on the next candle)."""
         if ltp is None:
             return
+        crossed_records = []
         with self._lock:
             now = self._now()
             for rec in self._records.values():
@@ -424,6 +425,19 @@ class OrderWatcher:
                         rec.trigger_crossed = True
                         rec.trigger_cross_time = now
                         rec.trigger_cross_price = ltp
+                        crossed_records.append((rec, now, float(ltp)))
+        # Keep potentially slow event persistence/callbacks off the watcher
+        # lock. The state flag above is set first, so duplicate ticks cannot
+        # emit duplicate trigger-cross alerts.
+        for rec, crossed_at, cross_price in crossed_records:
+            self._publish("trigger_crossed", rec, {
+                "side": rec.side,
+                "quantity": rec.requested_quantity,
+                "trigger_price": rec.trigger_price,
+                "price": cross_price,
+                "status": rec.status,
+                "timestamp": crossed_at,
+            })
 
     @staticmethod
     def _trigger_crossed(side: str, ltp: float, trigger: float) -> bool:

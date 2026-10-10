@@ -78,12 +78,15 @@ class BrokerSyncService:
         reset_strategy_fn: Optional[Callable] = None,
         state_lock=None,
         wire_now: bool = False,
+        on_status: Optional[Callable[[str], None]] = None,
     ):
         self.env = env
         self.config = config or {}
         self._clock = clock or time.time
         self._handle_fill = handle_fill
         self._on_reconcile = on_reconcile
+        self._on_status = on_status
+        self._last_ws_status_state: Optional[str] = None
         self._wire_now = wire_now
 
         live_cfg = as_dict(config).get("live", {}) or {}
@@ -239,8 +242,27 @@ class BrokerSyncService:
                           self.env.name, e)
 
     def _on_ws_status(self, status: str) -> None:
-        if "error" in status.lower() or "closed" in status.lower():
+        raw = str(status or "unknown")
+        lowered = raw.lower()
+        if lowered == "connected":
+            state = "CONNECTED"
+        elif "closed" in lowered or "disconnect" in lowered or "stale" in lowered:
+            state = "DISCONNECTED"
+        elif "error" in lowered or "failed" in lowered:
+            state = "ERROR"
+        else:
+            state = "STATUS"
+        if state == self._last_ws_status_state:
+            return
+        self._last_ws_status_state = state
+        if state in {"ERROR", "DISCONNECTED"}:
             log.warning("[BrokerSync:%s] WS status: %s", self.env.name, status)
+        if self._on_status is not None:
+            try:
+                self._on_status(raw[:240])
+            except Exception as exc:
+                log.warning("[BrokerSync:%s] WS status callback failed: %s",
+                            self.env.name, exc)
 
     # ── fill fast path (order watcher on_fills hook) ───────────────────
 
