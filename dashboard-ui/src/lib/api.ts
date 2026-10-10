@@ -108,6 +108,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(settings),
     }),
+  updateLiveGate: (gate: "ON" | "OFF") =>
+    requestJSON<any>("/api/settings/live-gate", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gate }),
+    }),
   audit: (params?: Query) => fetchJSON<any>(withQuery("/api/audit", params)),
   liveDashboard: () => fetchJSON<any>("/api/live/dashboard"),
   liveOrders: (params?: Query) => fetchJSON<any>(withQuery("/api/live/orders", params)),

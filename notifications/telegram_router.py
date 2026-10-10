@@ -17,7 +17,10 @@ import logging
 import queue
 import threading
 import time
+from datetime import datetime
+from html import escape
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from notifications.telegram_client import TelegramClient
 from notifications.telegram_formatter import (
@@ -258,6 +261,27 @@ class TelegramRouter:
         text = format_order_lifecycle(data or {})
         event_type = (data or {}).get("event_type", "LIFECYCLE")
         self._emit(event_type, data or {}, text, source="LOCAL")
+
+    def on_configuration_change(self, data: dict) -> None:
+        """Audit an operator-applied settings change in the ledger and Telegram."""
+        data = data or {}
+        changes = data.get("changes") or {}
+        lines = ["⚙️ <b>LIVE SETTINGS CHANGED</b>"]
+        if data.get("strategy_id"):
+            lines.append(f"<b>Strategy:</b> {escape(str(data['strategy_id']))}")
+        if data.get("scope"):
+            lines.append(f"<b>Scope:</b> {escape(str(data['scope']))}")
+        for name, values in changes.items():
+            if not isinstance(values, dict):
+                continue
+            old = escape(str(values.get("from", "—")))
+            new = escape(str(values.get("to", "—")))
+            lines.append(f"<b>{escape(str(name))}:</b> {old} → {new}")
+        timestamp = datetime.now(ZoneInfo("Asia/Kolkata")).strftime(
+            "%Y-%m-%d %H:%M:%S IST")
+        lines.append(f"<b>Timestamp:</b> {timestamp}")
+        self._emit("CONFIGURATION_CHANGED", data, "\n".join(lines),
+                   source="DASHBOARD")
 
     def on_startup(self, data: dict) -> None:
         text = format_startup_alert(data)

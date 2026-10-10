@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 EVENT_CATEGORIES = [
     "SIGNAL", "ORDER", "FILL", "POSITION", "SL", "EXIT", "REVERSAL",
     "RECONCILIATION", "WEBSOCKET", "LTP", "RISK", "SYSTEM", "TELEGRAM",
+    "CONFIGURATION_CHANGED",
     "ERROR", "CRITICAL",
 ]
 

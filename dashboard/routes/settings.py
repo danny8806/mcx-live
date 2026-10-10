@@ -18,6 +18,7 @@ _engine = None
 _config_path: Path | None = None
 _resolved_config_path: Path | None = None
 _persistence = None
+_event_bus = None
 _settings_lock = threading.RLock()
 
 _GATE_FIELDS = {
@@ -35,12 +36,33 @@ _MAX_SUPERTREND_ATR_PERIOD = 500
 
 def init(engine, event_bus, *, config_path=None, resolved_config_path=None,
          persistence=None):
-    global _engine, _config_path, _resolved_config_path, _persistence
+    global _engine, _event_bus, _config_path, _resolved_config_path, _persistence
     _engine = engine
+    _event_bus = event_bus
     _config_path = Path(config_path).resolve() if config_path else None
     _resolved_config_path = (Path(resolved_config_path).resolve()
                              if resolved_config_path else None)
     _persistence = persistence
+
+
+def _publish_settings_change(data: dict) -> None:
+    """Publish successful operator changes to dashboard audit and Telegram.
+
+    Audit/notification failures must never roll back a setting that has already
+    been atomically persisted and applied to the running engine.
+    """
+    try:
+        if _event_bus is not None:
+            _event_bus.publish("settings_changed", data)
+    except Exception:
+        pass
+    try:
+        router = getattr(_engine, "telegram", None)
+        notify = getattr(router, "on_configuration_change", None)
+        if callable(notify):
+            notify(data)
+    except Exception:
+        pass
 
 
 def _mask_cid(cid) -> str:
@@ -48,6 +70,12 @@ def _mask_cid(cid) -> str:
     if len(cid) <= 4:
         return cid
     return f"{cid[:3]}{'*' * (len(cid) - 5)}{cid[-2:]}"
+
+
+def _live_environment():
+    envs = getattr(_engine, "_envs", {}) or {}
+    env = envs.get("live") if isinstance(envs, dict) else None
+    return env or getattr(_engine, "live", None)
 
 
 def _get_settings_sync():
@@ -60,6 +88,8 @@ def _get_settings_sync():
         tg_stats = {"enabled": False, "queue_size": 0,
                     "total_sent": 0, "total_failed": 0}
     strategies = _engine.config.get("strategies", {}) or {}
+    live_cfg = _engine.config.get("live", {}) or {}
+    live_env = _live_environment()
     runtime_policy = _engine.config.get("strategy_runtime", {}) or {}
     if runtime_policy.get("exclusive"):
         allowed_ids = set((runtime_policy.get("allowlist", {}) or {}).keys())
@@ -80,6 +110,14 @@ def _get_settings_sync():
         indicator_settings = _engine.config.get("indicators", {})
     return {
         "system": _engine.config.get("system", {}),
+        "live_master_gate": {
+            "gate": (getattr(live_env, "gate_state", None)
+                     or live_cfg.get("gate", "OFF")),
+            "live_trading_enabled": bool(
+                live_cfg.get("live_trading_enabled", False)),
+            "broker_gate_enabled": bool(getattr(
+                getattr(live_env, "broker", None), "gate_enabled", False)),
+        },
         "dhan": {"client_id": _mask_cid(_engine.config.get("dhan.client_id", "")),
                  "ws_url": _engine.config.get("dhan.ws_url", "")},
         "instruments": instruments,
@@ -108,6 +146,157 @@ def _get_settings_sync():
 @router.get("/api/settings")
 async def get_settings():
     return await asyncio.to_thread(_get_settings_sync)
+
+
+def _local_live_gate_blocker(env) -> str | None:
+    """Check in-process and durable state while the engine lock is held."""
+    manager = getattr(env, "position_manager", None)
+    if manager is None:
+        return "LIVE position state is unavailable; master gate was not changed"
+    try:
+        if any(getattr(position, "is_open", False)
+               for position in manager.open_positions):
+            return "Close all live positions before disabling the master gate"
+    except Exception:
+        return "LIVE position state could not be verified; master gate was not changed"
+    for strategy in (getattr(env, "strategies", {}) or {}).values():
+        if (getattr(strategy, "pending_entry", None) is not None
+                or getattr(strategy, "pending_exit_trigger", None) is not None):
+            return "Resolve pending strategy triggers before disabling the master gate"
+
+    execution = getattr(env, "execution_engine", None)
+    orders = getattr(execution, "_orders", None)
+    if not isinstance(orders, dict):
+        return "LIVE order state is unavailable; master gate was not changed"
+    terminal = {"filled", "rejected", "canceled", "cancelled", "expired"}
+    for order in orders.values():
+        state = getattr(order, "state", None)
+        state = str(getattr(state, "value", state) or "unknown").lower()
+        if state not in terminal:
+            return "Resolve active or unknown orders before disabling the master gate"
+
+    persistence = getattr(env, "persistence", None)
+    if persistence is not None:
+        try:
+            rows = persistence.get_pending_orders(execution_mode="LIVE")
+        except Exception:
+            return "Durable LIVE order state could not be verified; master gate was not changed"
+        active_pending = {"pending", "armed", "entry_sent", "waiting_for_flat"}
+        if any(str(row.get("status", "unknown")).lower() in active_pending
+               for row in rows):
+            return "A durable LIVE trigger or order is still active"
+    return None
+
+
+def _live_gate_blocker(env) -> str | None:
+    """Fail closed before disabling the broker gate around exposure/order state."""
+    blocker = _local_live_gate_blocker(env)
+    if blocker:
+        return blocker
+    broker = getattr(env, "broker", None)
+    positions_method = getattr(broker, "positions", None)
+    if not callable(positions_method):
+        return "Broker position lookup is unavailable; master gate was not changed"
+    try:
+        if positions_method():
+            return "Dhan reports an open position; use per-strategy CLOSE ONLY instead"
+    except Exception:
+        return "Dhan position lookup failed; master gate was not changed"
+    return None
+
+
+def _save_live_gate_sync(body: dict):
+    if not _engine:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    if _config_path is None or _resolved_config_path is None:
+        raise HTTPException(status_code=503,
+                            detail="active LIVE configuration paths are unavailable")
+    if not isinstance(body, dict) or set(body) != {"gate"}:
+        raise HTTPException(status_code=422,
+                            detail="body must contain only gate: ON or OFF")
+    gate = str(body.get("gate", "")).upper()
+    if gate not in {"ON", "OFF"}:
+        raise HTTPException(status_code=422, detail="gate must be ON or OFF")
+
+    live_env = _live_environment()
+    if live_env is None or not getattr(live_env, "is_live", False):
+        raise HTTPException(status_code=503, detail="LIVE environment is unavailable")
+    live_cfg = _engine.config.get("live", {}) or {}
+    if gate == "ON" and not bool(live_cfg.get("live_trading_enabled", False)):
+        raise HTTPException(status_code=409,
+                            detail="live_trading_enabled is false in the active configuration")
+    if gate == "OFF":
+        blocker = _live_gate_blocker(live_env)
+        if blocker:
+            raise HTTPException(status_code=409, detail=blocker)
+
+    state_lock = getattr(_engine, "_lock", None) or nullcontext()
+    with _settings_lock, state_lock:
+        # Recheck local ownership after acquiring the engine lock so a signal
+        # or fill cannot race the gate transition.
+        if gate == "OFF":
+            blocker = _local_live_gate_blocker(live_env)
+            if blocker:
+                raise HTTPException(status_code=409, detail=blocker)
+        previous_gate = (getattr(live_env, "gate_state", None)
+                         or live_cfg.get("gate", "OFF"))
+        try:
+            raw = json.loads(_config_path.read_text(encoding="utf-8"))
+            resolved = json.loads(_resolved_config_path.read_text(encoding="utf-8"))
+            if not isinstance(raw.get("live"), dict) or not isinstance(
+                    resolved.get("live"), dict):
+                raise ValueError("live configuration section is missing")
+            raw["live"]["gate"] = gate
+            resolved["live"]["gate"] = gate
+            original_raw = _config_path.read_bytes()
+            original_resolved = _resolved_config_path.read_bytes()
+            _atomic_json_write(_config_path, raw)
+            _atomic_json_write(_resolved_config_path, resolved)
+        except Exception as exc:
+            try:
+                if "original_raw" in locals():
+                    _atomic_json_write(_config_path, json.loads(original_raw))
+                if "original_resolved" in locals():
+                    _atomic_json_write(_resolved_config_path,
+                                       json.loads(original_resolved))
+            except Exception:
+                pass
+            raise HTTPException(status_code=500,
+                                detail=f"could not persist LIVE gate: {exc}") from exc
+
+        config_data = getattr(_engine.config, "_config", None)
+        if isinstance(config_data, dict):
+            config_data.setdefault("live", {})["gate"] = gate
+        live_env.gate_state = gate
+        live_env.gate_enabled = gate == "ON"
+        broker = getattr(live_env, "broker", None)
+        if broker is not None and hasattr(broker, "gate_enabled"):
+            broker.gate_enabled = gate == "ON"
+        execution_broker = getattr(
+            getattr(live_env, "execution_engine", None), "broker", None)
+        if execution_broker is not None and hasattr(execution_broker,
+                                                    "gate_enabled"):
+            execution_broker.gate_enabled = gate == "ON"
+        if _persistence is not None:
+            try:
+                _persistence.save_state(_engine.snapshot("live"))
+            except Exception:
+                pass
+    if previous_gate != gate:
+        _publish_settings_change({
+            "scope": "live master gate",
+            "changes": {"gate": {"from": previous_gate, "to": gate}},
+            "timestamp": time.time(),
+        })
+    return {"status": "saved", "gate": gate,
+            "live_trading_enabled": bool(live_cfg.get("live_trading_enabled")),
+            "broker_gate_enabled": bool(getattr(broker, "gate_enabled", False)),
+            "timestamp": time.time()}
+
+
+@router.put("/api/settings/live-gate")
+async def save_live_gate(body: dict):
+    return await asyncio.to_thread(_save_live_gate_sync, body)
 
 
 def _atomic_json_write(path: Path, data: dict) -> None:
@@ -288,6 +477,18 @@ def _save_strategy_settings_sync(strategy_id: str, body: dict):
                 **(raw_strategy.get("supertrend") or {}),
                 **update["supertrend"],
             }
+        previous_values = {}
+        for key, value in update.items():
+            old_value = raw_strategy.get(key)
+            if key == "supertrend":
+                old_params = raw_strategy.get("supertrend") or {}
+                previous_values[key] = {
+                    name: {"from": old_params.get(name), "to": new_value}
+                    for name, new_value in value.items()
+                    if old_params.get(name) != new_value
+                }
+            elif old_value != value:
+                previous_values[key] = {"from": old_value, "to": value}
         raw_strategy.update(update)
         resolved_strategy.update(update)
         try:
@@ -342,6 +543,21 @@ def _save_strategy_settings_sync(strategy_id: str, body: dict):
         notify = getattr(_engine, "notify_settings_refreshed", None)
         if callable(notify):
             notify()
+
+    changes = {}
+    for key, values in previous_values.items():
+        if key == "supertrend":
+            changes.update({f"supertrend.{name}": pair
+                            for name, pair in values.items()})
+        else:
+            changes[key] = values
+    if changes:
+        _publish_settings_change({
+            "scope": "strategy",
+            "strategy_id": strategy_id,
+            "changes": changes,
+            "timestamp": time.time(),
+        })
 
     return {
         "status": "saved",
