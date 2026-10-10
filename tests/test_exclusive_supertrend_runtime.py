@@ -216,6 +216,41 @@ def test_native_candle_retry_uses_bounded_backoff_and_stops_when_bar_arrives():
     assert fetcher._native_retries == {}
 
 
+def test_native_candle_retry_uses_fast_schedule_and_stays_bounded(monkeypatch):
+    import core.candle_fetcher as candle_fetcher_module
+
+    clock = [100.0]
+    monkeypatch.setattr(candle_fetcher_module.time, "monotonic",
+                        lambda: clock[0])
+    fetcher = CandleFetcher(None, {"GOLDM": {}}, lambda bar: None,
+                            timeframes=["15m"])
+    attempts = []
+    fetcher._check_native_timeframe = lambda *args, **kwargs: (
+        attempts.append((clock[0], kwargs.get("expected_start_ts"))) or False)
+    start_ts = 1_800_000_000
+    fetcher._schedule_native_retry("GOLDM", "15m", start_ts)
+
+    state = fetcher._native_retries["GOLDM:15m"]
+    assert state["next_at"] == 100.25
+    assert state["deadline"] == 108.75
+
+    retry_offsets = (0.25, 0.75, 1.75, 3.75, 7.75)
+    for offset in retry_offsets:
+        clock[0] = 100.0 + offset
+        fetcher._retry_native_closed_bars()
+
+    assert [round(at - 100.0, 2) for at, _ in attempts] == list(retry_offsets)
+    assert all(expected == start_ts for _, expected in attempts)
+    assert fetcher._native_retries["GOLDM:15m"]["next_at"] == 108.75
+
+    # Once the bounded retry window expires, the task is retired rather than
+    # spinning or issuing an unbounded stream of REST requests.
+    clock[0] = 108.75
+    fetcher._retry_native_closed_bars()
+    assert len(attempts) == len(retry_offsets)
+    assert fetcher._native_retries == {}
+
+
 def test_late_native_15m_response_is_emitted_on_short_retry():
     close_at = datetime(2026, 10, 9, 9, 15, tzinfo=IST)
     candle_start = close_at - timedelta(minutes=15)
