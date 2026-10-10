@@ -232,20 +232,20 @@ def test_native_candle_retry_uses_fast_schedule_and_stays_bounded(monkeypatch):
 
     state = fetcher._native_retries["GOLDM:15m"]
     assert state["next_at"] == 100.25
-    assert state["deadline"] == 108.75
+    assert state["deadline"] == 116.0
 
-    retry_offsets = (0.25, 0.75, 1.75, 3.75, 7.75)
+    retry_offsets = (0.25, 0.75, 1.75, 3.75, 15.0)
     for offset in retry_offsets:
         clock[0] = 100.0 + offset
         fetcher._retry_native_closed_bars()
 
     assert [round(at - 100.0, 2) for at, _ in attempts] == list(retry_offsets)
     assert all(expected == start_ts for _, expected in attempts)
-    assert fetcher._native_retries["GOLDM:15m"]["next_at"] == 108.75
+    assert fetcher._native_retries["GOLDM:15m"]["next_at"] == 116.0
 
     # Once the bounded retry window expires, the task is retired rather than
     # spinning or issuing an unbounded stream of REST requests.
-    clock[0] = 108.75
+    clock[0] = 116.0
     fetcher._retry_native_closed_bars()
     assert len(attempts) == len(retry_offsets)
     assert fetcher._native_retries == {}
