@@ -78,6 +78,24 @@ class TokenBucket:
             time.sleep(delay)
 
 
+# Market-data adapters are created per strategy environment, but Dhan's
+# market-data request budget is account-wide. Share one conservative limiter
+# per client ID so two instruments cannot each spend an independent quota.
+_MARKET_DATA_LIMITERS: dict[str, TokenBucket] = {}
+_MARKET_DATA_LIMITERS_LOCK = threading.Lock()
+
+
+def market_data_limiter(client_id: str) -> TokenBucket:
+    """Return the process-wide 3 req/s market-data limiter for an account."""
+    key = str(client_id or "").strip() or "__default__"
+    with _MARKET_DATA_LIMITERS_LOCK:
+        limiter = _MARKET_DATA_LIMITERS.get(key)
+        if limiter is None:
+            limiter = TokenBucket(rate_per_sec=3.0, burst=3)
+            _MARKET_DATA_LIMITERS[key] = limiter
+        return limiter
+
+
 class DhanAuthError(Exception):
     """Authentication error from Dhan API."""
     pass
@@ -434,7 +452,6 @@ class DhanRESTClient:
         ``extra_headers`` merges per-request headers (e.g. the ``client-id``
         header the /marketfeed/* data APIs require on top of ``access-token``).
         """
-        self.limiter.acquire()
         last = None
         auth_retried = False
         # Order placement calls use retry_network=False: NEVER blind-re-POST on
@@ -447,6 +464,10 @@ class DhanRESTClient:
 
         attempt = 0
         while True:
+            # Acquire for every actual HTTP attempt, including safe retries.
+            # Acquiring only once before this loop let transient retries bypass
+            # the configured request rate.
+            self.limiter.acquire()
             attempt += 1
             try:
                 headers = self._headers()
@@ -515,11 +536,11 @@ class DhanRESTClient:
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         """Make a rate-limited GET request with retry + auto-renew on auth failure."""
-        self.limiter.acquire()
         last = None
         auth_retried = False
 
         for attempt in range(self.max_retries):
+            self.limiter.acquire()
             try:
                 r = self._session.get(
                     f"{self.base_url}{path}",
@@ -596,12 +617,12 @@ class DhanRESTClient:
 
     def _mutate(self, method: str, path: str, payload: Optional[dict] = None) -> dict:
         """Shared implementation for PUT/DELETE (order modify / cancel)."""
-        self.limiter.acquire()
         last = None
         auth_retried = False
         resp = getattr(self._session, method)
 
         for attempt in range(self.max_retries):
+            self.limiter.acquire()
             try:
                 request_kwargs = {"headers": self._headers(), "timeout": 30}
                 # The Dhan v2 DELETE /orders/{id} contract has no request

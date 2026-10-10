@@ -101,6 +101,40 @@ def test_get_404_returns_immediately_for_higher_level_bounded_retry():
     assert len(session.calls) == 1
 
 
+def test_rest_post_retry_acquires_rate_limit_token_for_each_http_attempt(monkeypatch):
+    import data.dhan.rest_client as rest_client_module
+
+    class RetryingSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, *_args, **_kwargs):
+            self.calls += 1
+            return _Response(503, {"error": "temporary"})
+
+    class CountingLimiter:
+        def __init__(self):
+            self.calls = 0
+
+        def acquire(self):
+            self.calls += 1
+
+    monkeypatch.setattr(rest_client_module.time, "sleep", lambda _seconds: None)
+    client = DhanRESTClient(max_retries=3)
+    session = RetryingSession()
+    limiter = CountingLimiter()
+    client._session = session
+    client._headers = lambda: {"access-token": "test"}
+    client.limiter = limiter
+
+    with pytest.raises(DhanHTTPError) as exc:
+        client._post("/charts/intraday", {"securityId": "123"})
+
+    assert exc.value.status == 503
+    assert session.calls == 3
+    assert limiter.calls == 3
+
+
 def test_transport_confirms_order_state_after_documented_202_cancel_ack():
     class Http:
         def __init__(self):

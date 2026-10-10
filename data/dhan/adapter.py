@@ -13,7 +13,7 @@ import threading
 from typing import Any, Callable, Optional
 
 from .websocket_client import DhanWebSocketClient
-from .rest_client import DhanRESTClient, DhanAuthError
+from .rest_client import DhanRESTClient, DhanAuthError, market_data_limiter
 from .instrument_mapper import InstrumentMeta, get_instrument, register_instrument
 
 
@@ -47,6 +47,10 @@ class DhanDataAdapter:
             pin=pin,
             totp_secret=totp_secret,
         )
+        # Strategy environments construct one adapter each. Share the
+        # account's candle-data budget across them to avoid multiplying the
+        # per-client rate when GOLDM and SILVERM fetch/retry together.
+        self.rest.limiter = market_data_limiter(client_id)
 
         # Auto-login on startup: ALWAYS mint a freshly auto-generated token via
         # PIN+TOTP (never reuse a possibly stale/expired cached token). This

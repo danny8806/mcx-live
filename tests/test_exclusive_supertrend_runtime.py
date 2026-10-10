@@ -231,10 +231,10 @@ def test_native_candle_retry_uses_fast_schedule_and_stays_bounded(monkeypatch):
     fetcher._schedule_native_retry("GOLDM", "15m", start_ts)
 
     state = fetcher._native_retries["GOLDM:15m"]
-    assert state["next_at"] == 100.25
+    assert state["next_at"] == 100.33
     assert state["deadline"] == 116.0
 
-    retry_offsets = (0.25, 0.75, 1.75, 3.75, 15.0)
+    retry_offsets = (0.33, 0.66, 1.0, 1.33, 1.66, 3.75, 7.75, 15.0)
     for offset in retry_offsets:
         clock[0] = 100.0 + offset
         fetcher._retry_native_closed_bars()
@@ -249,6 +249,19 @@ def test_native_candle_retry_uses_fast_schedule_and_stays_bounded(monkeypatch):
     fetcher._retry_native_closed_bars()
     assert len(attempts) == len(retry_offsets)
     assert fetcher._native_retries == {}
+
+
+def test_market_data_clients_share_three_requests_per_second_account_limiter():
+    from data.dhan.rest_client import market_data_limiter
+
+    first = market_data_limiter("test-account")
+    second = market_data_limiter("test-account")
+    other_account = market_data_limiter("other-account")
+
+    assert first is second
+    assert first is not other_account
+    assert first.rate == 3.0
+    assert first.capacity == 3.0
 
 
 def test_late_native_15m_response_is_emitted_on_short_retry():

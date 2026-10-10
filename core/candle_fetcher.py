@@ -71,14 +71,16 @@ class CandleFetcher:
         # few seconds after the wall-clock close. Retry only the just-closed
         # bar with a bounded schedule instead of waiting for the next window.
         self._native_retries: dict[str, dict] = {}
-        # Retry the just-closed native candle promptly. Dhan's REST client
-        # applies its own shared token-bucket limit (3.5 requests/second), so
-        # the short initial delays stay fast without bypassing API throttling.
-        # These are intervals between attempts: cumulative retries occur at
-        # about +0.25, +0.75, +1.75, +3.75, and +15 seconds. Keep the final
-        # attempt at the previous recovery horizon while accelerating the
-        # early retries.
-        self._native_retry_delays = (0.25, 0.5, 1.0, 2.0, 11.25)
+        # Count the just-closed-candle fetch as attempt 1. Retry at cumulative
+        # offsets +0.33, +0.66, +1.00, +1.33, and +1.66 seconds, giving three
+        # attempts in each of the first two seconds (including the initial
+        # fetch). Keep later retries at +3.75, +7.75, and +15 seconds so a
+        # delayed Dhan candle can still be recovered within the prior horizon.
+        # DhanDataAdapter shares a 3 req/s limiter across market-data clients,
+        # so simultaneous GOLDM/SILVERM retries cannot exceed that aggregate.
+        self._native_retry_delays = (
+            0.33, 0.33, 0.34, 0.33, 0.33, 2.09, 4.0, 7.25,
+        )
         self._native_last_close_attempt: dict[str, int] = {}
         # A process restart must not replay today's already-closed REST bars
         # through the live strategy callbacks.  The engine's indicator warmup
