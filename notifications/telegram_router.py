@@ -209,13 +209,17 @@ class TelegramRouter:
                 ok = bool(self.client.send_sync(text, silent=silent))
                 error = None if ok else getattr(
                     self.client, "last_error", lambda: None)() or "send_failed"
+                if event_id:
+                    self._finalize(event_id, ok, error)
             else:
                 ok = bool(self.client.send(
                     text, silent=silent,
                     meta={"event_id": event_id, "event_type": event_type}))
                 error = None if ok else "queue_full_or_error"
-            if event_id:
-                self._finalize(event_id, ok, error)
+                # Queue acceptance is not delivery. The Telegram client's
+                # post-send callback owns QUEUED -> SENT/FAILED transitions.
+                if event_id and not ok:
+                    self._finalize(event_id, False, error)
         except Exception as e:  # Telegram must never break trading
             logger.error("[Telegram] send failed: %s", e)
             self._finalize(event_id, False, str(e))

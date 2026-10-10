@@ -2,8 +2,11 @@ from notifications.telegram_router import TelegramRouter
 
 
 class FakeTelegramClient:
+    def __init__(self):
+        self.callback = None
+
     def set_delivery_callback(self, _callback):
-        pass
+        self.callback = _callback
 
     def send(self, text, *, silent=False, meta=None):
         self.text = text
@@ -42,4 +45,25 @@ def test_configuration_change_is_audited_and_sent_to_telegram():
     assert "1 → 2" in client.text
     assert client.meta == {
         "event_id": "event-1", "event_type": "CONFIGURATION_CHANGED"}
+    assert ledger.rows[0]["telegram_status"] == "QUEUED"
+    assert ledger.delivery == []
+
+    client.callback(client.meta, True, None)
     assert ledger.delivery == [("event-1", "SENT", None)]
+
+
+def test_configuration_alert_is_failed_only_after_delivery_callback():
+    client = FakeTelegramClient()
+    ledger = FakeLedger()
+    router = TelegramRouter(client, ledger)
+    router._enabled = True
+
+    router.on_configuration_change({
+        "scope": "strategy",
+        "strategy_id": "gold_02",
+        "changes": {"live_gate": {"from": "OFF", "to": "ON"}},
+    })
+
+    assert ledger.rows[0]["telegram_status"] == "QUEUED"
+    client.callback(client.meta, False, "network timeout")
+    assert ledger.delivery == [("event-1", "FAILED", "network timeout")]

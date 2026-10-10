@@ -11,6 +11,8 @@ class FakeTelegramClient:
 
     def send(self, text, silent=False, meta=None):
         self.messages.append((text, silent, meta))
+        if self.callback is not None:
+            self.callback(meta or {}, True, None)
         return True
 
 
