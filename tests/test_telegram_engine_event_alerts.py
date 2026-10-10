@@ -95,3 +95,34 @@ def test_broker_sync_websocket_status_alerts_only_on_state_changes():
     service._on_ws_status("connected")
 
     assert statuses == ["connected", "error: socket reset", "connected"]
+
+
+def test_broker_sync_health_watchdog_emits_stale_and_recovered_transitions():
+    from execution.live.broker_sync import BrokerSyncService
+
+    stale = {"value": True}
+    service = BrokerSyncService.__new__(BrokerSyncService)
+    service._lock = threading.RLock()
+    service._stats = {"health_checks": 0}
+    service.env = SimpleNamespace(name="live")
+    service._poller = SimpleNamespace(running=True)
+    service._running = True
+    service._ws_enabled = True
+    service._ws_feed = SimpleNamespace(
+        connected=True, is_stale=lambda: stale["value"])
+    service._clock = lambda: 1000.0
+    service._ws_stale_active = False
+    service._ws_stale_warned_at = 0.0
+    service._healthy = True
+    statuses = []
+    service._on_status = statuses.append
+
+    service._health_tick_once()
+    service._health_tick_once()
+    assert statuses == ["stale: heartbeat timeout"]
+    assert service.healthy is False
+
+    stale["value"] = False
+    service._health_tick_once()
+    assert statuses == ["stale: heartbeat timeout", "connected"]
+    assert service.healthy is True

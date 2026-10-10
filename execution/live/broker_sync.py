@@ -252,14 +252,15 @@ class BrokerSyncService:
             state = "ERROR"
         else:
             state = "STATUS"
-        if state == self._last_ws_status_state:
+        if state == getattr(self, "_last_ws_status_state", None):
             return
         self._last_ws_status_state = state
         if state in {"ERROR", "DISCONNECTED"}:
             log.warning("[BrokerSync:%s] WS status: %s", self.env.name, status)
-        if self._on_status is not None:
+        status_callback = getattr(self, "_on_status", None)
+        if status_callback is not None:
             try:
-                self._on_status(raw[:240])
+                status_callback(raw[:240])
             except Exception as exc:
                 log.warning("[BrokerSync:%s] WS status callback failed: %s",
                             self.env.name, exc)
@@ -328,6 +329,7 @@ class BrokerSyncService:
             self._stop_event.wait(timeout=self._health_tick)
 
     def _health_tick_once(self) -> None:
+        ws_status_event = None
         with self._lock:
             self._stats["health_checks"] += 1
             # Worker thread alive check
@@ -359,10 +361,13 @@ class BrokerSyncService:
                                     "connected=%s — retrying every %.0fs",
                                     self.env.name, ws_alive, _WS_STALE_WARN_INTERVAL)
                         self._ws_stale_warned_at = now
+                    if not was_stale:
+                        ws_status_event = "stale: heartbeat timeout"
                     self._ws_stale_active = True
                 else:
                     if was_stale:
                         log.info("[BrokerSync:%s] WS feed recovered", self.env.name)
+                        ws_status_event = "connected"
                     self._ws_stale_active = False
                     self._ws_stale_warned_at = 0.0
                 if not ws_ok:
@@ -372,6 +377,10 @@ class BrokerSyncService:
             # the REST poller worker is alive. Fills still arrive over REST, so
             # this is degraded, not stopped.
             self._healthy = worker_alive and ws_ok
+        # Notify outside the sync lock; the event pipeline may persist the
+        # transition and must never hold the broker-health lock while doing so.
+        if ws_status_event is not None:
+            self._on_ws_status(ws_status_event)
 
     # ── stale detection ───────────────────────────────────────────────
 
