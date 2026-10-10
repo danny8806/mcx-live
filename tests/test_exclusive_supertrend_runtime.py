@@ -266,3 +266,56 @@ def test_close_scheduler_does_not_duplicate_fetches_during_same_close_minute():
 
     assert adapter.calls == 1
     assert "GOLDM:15m" in fetcher._native_retries
+
+
+def test_15m_fallback_rejects_partial_5m_window_even_when_keep_partial_is_set(monkeypatch):
+    candle_time = datetime(2026, 10, 9, 9, 0, tzinfo=IST)
+    start = int(candle_time.timestamp())
+
+    class SparseFiveMinuteAdapter:
+        def fetch_historical_candles(self, _instrument, interval, _from, _to):
+            if interval == "15":
+                return []
+            return [
+                [start, 100, 102, 99, 101, 10],
+                [start + 300, 101, 103, 100, 102, 12],
+            ]
+
+    emitted = []
+    fetcher = CandleFetcher(
+        SparseFiveMinuteAdapter(), {"GOLDM": {"keep_partial": True}},
+        emitted.append, timeframes=["15m"])
+    monkeypatch.setattr("core.candle_fetcher.time.time", lambda: start + 900 + 2)
+
+    fetcher._fetch_candle("GOLDM", {"keep_partial": True}, "15m",
+                          candle_time, "GOLDM:15m:test")
+
+    assert emitted == []
+
+
+def test_15m_fallback_accepts_complete_three_bar_5m_window(monkeypatch):
+    candle_time = datetime(2026, 10, 9, 9, 0, tzinfo=IST)
+    start = int(candle_time.timestamp())
+
+    class CompleteFiveMinuteAdapter:
+        def fetch_historical_candles(self, _instrument, interval, _from, _to):
+            if interval == "15":
+                return []
+            return [
+                [start, 100, 102, 99, 101, 10],
+                [start + 300, 101, 104, 100, 103, 12],
+                [start + 600, 103, 105, 102, 104, 15],
+            ]
+
+    emitted = []
+    fetcher = CandleFetcher(
+        CompleteFiveMinuteAdapter(), {"GOLDM": {"keep_partial": True}},
+        emitted.append, timeframes=["15m"])
+    monkeypatch.setattr("core.candle_fetcher.time.time", lambda: start + 900 + 2)
+
+    fetcher._fetch_candle("GOLDM", {"keep_partial": True}, "15m",
+                          candle_time, "GOLDM:15m:test")
+
+    assert len(emitted) == 1
+    assert (emitted[0].open, emitted[0].high, emitted[0].low,
+            emitted[0].close, emitted[0].volume) == (100, 105, 99, 104, 37)

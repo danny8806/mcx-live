@@ -178,7 +178,8 @@ class OrderManager:
         """Get active orders."""
         orders = [
             o for o in self.execution_engine._orders.values()
-            if o.state in (OrderState.CREATED, OrderState.SUBMITTED, OrderState.PARTIALLY_FILLED)
+            if o.state in (OrderState.CREATED, OrderState.SUBMITTED,
+                           OrderState.ACKNOWLEDGED, OrderState.PARTIALLY_FILLED)
         ]
         if strategy_id:
             orders = [o for o in orders if o.strategy_id == strategy_id]

@@ -582,7 +582,13 @@ class CandleFetcher:
                 window_candles.sort(key=lambda candle: candle[0])
                 keep_partial = bool(cfg.get("keep_partial", False))
                 expected_count = tf_minutes // 5
-                if len(window_candles) == expected_count or (keep_partial and len(window_candles) > 0):
+                # The active SuperTrend signal contract consumes completed
+                # 15m candles. A sparse 5m fallback must never be promoted to
+                # a closed strategy candle, even when an instrument setting
+                # allows partial bars for other timeframes.
+                partial_allowed = keep_partial and timeframe != "15m"
+                if (len(window_candles) == expected_count
+                        or (partial_allowed and len(window_candles) > 0)):
                     bar = self._aggregate_candles(name, timeframe, window_candles, candle_time, tf_minutes)
                     if bar:
                         self._last_fetched[key] = time.time()

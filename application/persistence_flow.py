@@ -29,7 +29,8 @@ class PersistenceFlowMixin:
         # every candle column NULL and the blobs absent.
         ctx = getattr(signal, "context", None)
         metadata = getattr(signal, "metadata", None) or {}
-        # Persist metadata needed to reconstruct reversal and breakout triggers.
+        # Persist metadata needed to reconstruct the current signal and any
+        # broker-confirmed reversal handoff.
         # Nested Signal objects are represented by their ids; their full rows
         # are saved separately by this same signal flow.
         saved_metadata = {}
@@ -190,11 +191,10 @@ class PersistenceFlowMixin:
             raise
 
     def _arm_live_pending_durable(self, signal, env) -> None:
-        """Register a LIVE pending breakout durably: PENDING -> ARMED.
+        """Register a LIVE signal durably: PENDING -> ARMED.
 
-        The row is written PENDING first (the moment the strategy armed the
-        breakout) then immediately promoted to ARMED (accepted into LIVE
-        execution).  A replayed pending signal for an already-ARMED or
+        The row is written before submission and promoted to ARMED. A replayed
+        signal for an already-ARMED or
         terminal row is a no-op (idempotent)."""
         pend_id = signal.signal_id
         base = {
@@ -421,13 +421,16 @@ class PersistenceFlowMixin:
         for row in rows:
             if str(row.get("status", "")).lower() != PendingOrderState.ARMED.value:
                 continue
-            registry.cache_live_row(row)
             sid = str(row.get("strategy_id") or "")
             strategy = (getattr(env, "strategies", {}) or {}).get(sid)
             signal_id = str(row.get("signal_id") or row.get("pending_order_id") or "")
             if strategy is None or not signal_id or row.get("trigger_price") is None:
                 log.error("[Engine] armed pending %s cannot be restored; missing strategy/id/trigger",
                           signal_id or "?")
+                if env.safe_mode is not None:
+                    env.safe_mode.enter_safe_mode(
+                        "unverified_strategy_trigger",
+                        f"Armed trigger {signal_id or '?'} has no active current strategy")
                 continue
             if getattr(strategy, "strategy_type", None) == "supertrend":
                 try:
@@ -440,8 +443,12 @@ class PersistenceFlowMixin:
                               signal_id, exc)
                 valid_handoff = bool(
                     stored_meta.get("strategy_type") == "supertrend"
-                    and stored_meta.get("market_on_signal_close")
-                    and stored_meta.get("no_separate_stop"))
+                    and stored_meta.get("strategy_timeframe") == "15m"
+                    and stored_meta.get("signal_source")
+                        == "completed_native_15m_candle"
+                    and stored_meta.get("market_on_signal_close") is True
+                    and stored_meta.get("no_separate_stop") is True
+                    and stored_meta.get("is_reversal_entry") is True)
                 if not valid_handoff:
                     try:
                         retired = persistence.terminalize_pending_order(
@@ -465,6 +472,10 @@ class PersistenceFlowMixin:
                     log.warning("[Engine] retired legacy-format pending trigger %s "
                                 "for SuperTrend strategy %s", signal_id, sid)
                     continue
+            # Only cache after the strategy and its current signal lineage have
+            # both passed validation. Unknown/retired rows must not enter the
+            # in-memory trigger index where a later tick could activate them.
+            registry.cache_live_row(row)
             current = strategy.pending_entry
             if current is not None and getattr(current.signal, "signal_id", None) == signal_id:
                 registry.sync_strategy(strategy)

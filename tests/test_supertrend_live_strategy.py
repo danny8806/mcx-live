@@ -106,3 +106,6 @@ def test_opposite_supertrend_flip_builds_market_reversal_pair_without_stop():
     assert paired.signal_type.value == "SHORT"
     assert paired.trigger_price == closes[-1]
     assert paired.stop_price == 0
+    assert paired.metadata["strategy_timeframe"] == "15m"
+    assert paired.metadata["signal_source"] == "completed_native_15m_candle"
+    assert paired.metadata["no_separate_stop"] is True

@@ -321,8 +321,8 @@ class SignalFlowMixin:
                     signal, env, "entry_blocked_contract_rollover")
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
                 return
-            # Entries must pass the strategy's own gate AND the legacy enabled
-            # flag (defense in depth: the config/operator can freeze here too).
+            # Entries must pass the configured strategy enable flag and the
+            # runtime operator gate.
             if (not getattr(strategy, "enabled", True)
                     or not gates.entries_allowed):
                 reason = ("strategy_disabled" if not getattr(strategy, "enabled", True)
@@ -453,9 +453,9 @@ class SignalFlowMixin:
         if not is_exit:
             self._notify_signal(signal, env_name)
         if is_pending:
-            # Phase 9.6 — a LIVE pending breakout gets a durable lifecycle row
-            # (PENDING -> ARMED) in the live DB immediately, so every LIVE
-            # pending order owns one durable state that survives restart.
+            # A LIVE strategy signal gets a durable lifecycle row
+            # (PENDING -> ARMED) before order submission, preserving this
+            # signal's broker handoff across restart.
             # PAPER is untouched (strategy memory only, as before). The
             # strategy itself is never modified (read-only for 9.6).
             if env.mode == "LIVE":
@@ -589,7 +589,7 @@ class SignalFlowMixin:
             # §25/§28/§108 — EXIT-FIRST: a LIVE entry is only placed after the
             # broker proves the instrument FLAT (only when live.exit_first is
             # enabled).  A residual broker position blocks the entry and keeps
-            # the pending breakout armed for the next verified cycle.
+            # the pending signal state until a verified flat cycle.
             if env.mode == "LIVE" and not is_pending:
                 exit_first = ((self.config.get("live") or {}).get("exit_first")
                               or {}).get("enabled", False)

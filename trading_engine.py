@@ -791,8 +791,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
             gate.reversal_enabled = False
             gate.close_only = True
         elif a == "pause":
-            # Legacy pause semantics preserved: drop the pending breakout and
-            # freeze all signal generation (this also sets gate entry OFF).
+            # Pause this current strategy profile and freeze signal generation
+            # (this also sets the entry gate OFF).
             if strat is not None:
                 open_positions = self.position_manager.get_positions_by_strategy(strategy_id)
                 if any(pos.is_open for pos in open_positions):
@@ -868,10 +868,24 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                             if getattr(o, "strategy_id", None) == strategy_id])
         except Exception:
             pass
+        # Count the durable execution engine's active states as well as the
+        # order-manager view.  In particular ACKNOWLEDGED is still working at
+        # the broker and must occupy the strategy's one-entry slot.
+        active_states = {"created", "submitted", "acknowledged", "partially_filled"}
+        orders = {}
         try:
-            return len(om.get_active_orders(strategy_id) or [])
+            for order in om.get_active_orders(strategy_id) or []:
+                orders[str(getattr(order, "order_id", id(order)))] = order
         except Exception:
-            return 0
+            pass
+        execution = getattr(om, "execution_engine", None)
+        for order in (getattr(execution, "_orders", {}) or {}).values():
+            if (getattr(order, "strategy_id", None) == strategy_id
+                    and str(getattr(getattr(order, "state", None), "value",
+                                    getattr(order, "state", ""))).lower()
+                    in active_states):
+                orders[str(getattr(order, "order_id", id(order)))] = order
+        return len(orders)
 
     def _reversal_under_cap(self, signal) -> bool:
         """True when the strategy's daily reversal cap (config max_reversals)
@@ -934,8 +948,10 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                          / float(acct.starting_capital) * 100.0)
                 if ddpct >= float(md):
                     return False, "drawdown_cap"
-        mo = scfg.get("max_pending_orders")
-        if mo is not None and self._pending_orders_count(env, sid) >= int(mo):
+        # This runtime has one position per profile. Keep one working-order
+        # slot even if an older/external config omits the field.
+        mo = scfg.get("max_pending_orders", 1)
+        if self._pending_orders_count(env, sid) >= int(mo):
             return False, "pending_orders_cap"
         return True, ""
 
@@ -1220,6 +1236,38 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
             # broker_order_id -> strategy mapping from canonical persistence so
             # late-arriving broker fills still route to the correct strategy.
             env.broker_router.set_persistence(persistence)
+            if env.is_live and persistence is not None:
+                def validate_current_mapping(mapping):
+                    get_orders = getattr(persistence, "get_orders", None)
+                    if not callable(get_orders):
+                        return False
+                    rows = get_orders(order_id=str(mapping.get("order_id") or ""))
+                    if not rows:
+                        return False
+                    row = rows[0]
+                    matches_mapping = (
+                        str(row.get("strategy_id") or "")
+                            == str(mapping.get("strategy_id") or "")
+                        and str(row.get("instrument") or "").upper()
+                            == str(mapping.get("instrument") or "").upper()
+                    )
+                    valid = matches_mapping and self._is_current_supertrend_order(
+                        env, persistence, row, allow_terminal=True)
+                    active_states = {"created", "submitted", "acknowledged",
+                                     "partially_filled"}
+                    if (not valid
+                            and str(row.get("state") or "").lower() in active_states
+                            and env.safe_mode is not None):
+                        env.safe_mode.enter_safe_mode(
+                            "unverified_strategy_order",
+                            f"Broker mapping {mapping.get('broker_order_id')} points "
+                            "to a working order without current SuperTrend lineage")
+                    return valid
+
+                set_validator = getattr(env.broker_router,
+                                        "set_mapping_validator", None)
+                if callable(set_validator):
+                    set_validator(validate_current_mapping)
             try:
                 env.broker_router.restore()
             except Exception as e:
@@ -1892,6 +1940,141 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
         log.info("[Engine] warmup forensics %s: %s", key,
                  json.dumps(fore, default=str))
 
+    @staticmethod
+    def _is_current_supertrend_position(env, persistence, position_data) -> bool:
+        """Only rehydrate exposure whose entry signal identifies this runtime.
+
+        A same-named position row from an older strategy is not valid evidence
+        that the current SuperTrend generated the trade. Unknown or untagged
+        rows are left for broker reconciliation/safe mode instead of being
+        silently attached to the current strategy.
+        """
+        strategy_id = str(position_data.get("strategy_id") or "")
+        strategy = (getattr(env, "strategies", {}) or {}).get(strategy_id)
+        signal_id = str(position_data.get("entry_signal_id") or "")
+        if (strategy is None or getattr(strategy, "strategy_type", None) != "supertrend"
+                or not signal_id or persistence is None
+                or not callable(getattr(persistence, "get_signal", None))):
+            return False
+        try:
+            signal = persistence.get_signal(signal_id)
+            metadata = json.loads((signal or {}).get("signal_metadata") or "{}")
+        except Exception:
+            return False
+        return bool(
+            signal
+            and str(signal.get("strategy_id") or "") == strategy_id
+            and str(signal.get("instrument") or "").upper()
+                == str(position_data.get("instrument") or "").upper()
+            and metadata.get("strategy_type") == "supertrend"
+            and metadata.get("strategy_timeframe") == "15m"
+            and metadata.get("market_on_signal_close") is True
+            and metadata.get("no_separate_stop") is True
+        )
+
+    def _current_supertrend_position_rows(self, env, rows):
+        """Filter position rows and fail closed when their strategy lineage is unknown."""
+        persistence = getattr(env, "persistence", None)
+        accepted = []
+        for row in rows or []:
+            if self._is_current_supertrend_position(env, persistence, row):
+                accepted.append(row)
+                continue
+            position_id = str(row.get("position_id") or "unknown")
+            if env.safe_mode is not None:
+                env.safe_mode.enter_safe_mode(
+                    "unverified_strategy_position",
+                    f"Position {position_id} lacks current SuperTrend lineage")
+            log.error("[Engine] did not restore unverified position %s; "
+                      "broker reconciliation required", position_id)
+        return accepted
+
+    @staticmethod
+    def _is_current_supertrend_order(env, persistence, order_data,
+                                     allow_terminal: bool = False) -> bool:
+        """Validate a working order before restoring it into the live engine.
+
+        Active broker orders without a verifiable current-strategy signal must
+        not be rebound to the current strategy after restart. Such orders are
+        left for broker reconciliation and safe mode instead.
+        """
+        strategy_id = str(order_data.get("strategy_id") or "")
+        strategy = (getattr(env, "strategies", {}) or {}).get(strategy_id)
+        instrument = str(order_data.get("instrument") or "").upper()
+        strategy_instrument = str(getattr(strategy, "instrument", "") or "").upper()
+        order_type = str(order_data.get("order_type") or "MARKET").upper()
+        order_role = str(order_data.get("order_role") or "").upper()
+        state = str(order_data.get("state") or "").lower()
+        allowed_states = {"created", "submitted", "acknowledged", "partially_filled"}
+        if allow_terminal:
+            allowed_states.update({"filled", "rejected", "canceled", "cancelled", "expired"})
+        if (strategy is None
+                or getattr(strategy, "strategy_type", None) != "supertrend"
+                or not instrument
+                or (strategy_instrument and strategy_instrument != instrument)
+                or order_type != "MARKET"
+                or order_role not in {"ENTRY", "EXIT", "REVERSAL_ENTRY",
+                                      "REVERSAL_EXIT", "EMERGENCY_EXIT"}
+                or state not in allowed_states
+                or persistence is None
+                or not callable(getattr(persistence, "get_signal", None))):
+            return False
+        signal_id = str(
+            order_data.get("signal_id")
+            or order_data.get("entry_signal_id")
+            or order_data.get("parent_signal_id")
+            or ""
+        )
+        if not signal_id:
+            return False
+        try:
+            signal = persistence.get_signal(signal_id)
+            metadata = json.loads((signal or {}).get("signal_metadata") or "{}")
+        except Exception:
+            return False
+        if not (signal
+                and str(signal.get("strategy_id") or "") == strategy_id
+                and str(signal.get("instrument") or "").upper() == instrument
+                and metadata.get("strategy_type") == "supertrend"
+                and metadata.get("market_on_signal_close") is True):
+            return False
+        # Strategy-generated entry/reversal signals include timeframe and
+        # no-stop markers. Operator exit signals are current execution actions
+        # and carry `exit: true` instead of a candle timeframe.
+        return bool(
+            (metadata.get("strategy_timeframe") == "15m"
+             and metadata.get("signal_source")
+                 == "completed_native_15m_candle"
+             and metadata.get("no_separate_stop") is True)
+            or (metadata.get("is_reversal_entry") is True
+                and metadata.get("strategy_timeframe") == "15m"
+                and metadata.get("signal_source")
+                    == "completed_native_15m_candle"
+                and metadata.get("no_separate_stop") is True)
+            or metadata.get("exit") is True
+        )
+
+    def _current_supertrend_order_rows(self, env, rows):
+        """Keep verified active current-strategy orders; quarantine unknown ones."""
+        persistence = getattr(env, "persistence", None)
+        accepted = []
+        active_states = {"created", "submitted", "acknowledged", "partially_filled"}
+        for row in rows or []:
+            if str(row.get("state") or "").lower() not in active_states:
+                accepted.append(row)
+                continue
+            if self._is_current_supertrend_order(env, persistence, row):
+                accepted.append(row)
+                continue
+            order_id = str(row.get("order_id") or "unknown")
+            if env.safe_mode is not None:
+                env.safe_mode.enter_safe_mode(
+                    "unverified_strategy_order",
+                    f"Working order {order_id} lacks current SuperTrend lineage")
+            log.error("[Engine] did not restore unverified working order %s; "
+                      "broker reconciliation required", order_id)
+        return accepted
+
     def restore(self, saved_state: dict, env_name: str = "paper") -> None:
         """Restore ONE environment's engine state from a saved snapshot.
 
@@ -1909,22 +2092,59 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
         strategies_state = saved_state.get("strategies", {})
         for name, strat in env.strategies.items():
             if name in strategies_state:
+                strategy_snapshot = strategies_state[name]
+                current_snapshot = (isinstance(strategy_snapshot, dict)
+                                    and strategy_snapshot.get("strategy_type") == "supertrend"
+                                    and strategy_snapshot.get("timeframe") == "15m")
+                if not current_snapshot:
+                    if (isinstance(strategy_snapshot, dict)
+                            and strategy_snapshot.get("position_side")):
+                        reason = "unverified_strategy_snapshot_position"
+                        if env.safe_mode is not None:
+                            env.safe_mode.enter_safe_mode(
+                                reason, f"Ignored non-current strategy snapshot for {name}")
+                        log.error("[Engine] ignored non-current strategy snapshot with "
+                                  "position for %s; broker reconciliation required", name)
+                    strategy_snapshot = None
+            else:
+                strategy_snapshot = None
+            if strategy_snapshot is not None:
                 try:
-                    strat.restore(strategies_state[name])
+                    strat.restore(strategy_snapshot)
                 except Exception:
                     pass
             registry = getattr(env, "pending_triggers", None)
             if registry is not None:
                 registry.sync_strategy(strat)
+        persistence = getattr(env, "persistence", None)
         positions_state = saved_state.get("positions")
-        if not positions_state and env.mode == "LIVE":
-            persistence = getattr(env, "persistence", None)
+        if isinstance(positions_state, dict):
+            open_positions = positions_state.get("open_positions", {}) or {}
+            if isinstance(open_positions, dict):
+                accepted = {}
+                for key, position_data in open_positions.items():
+                    if (isinstance(position_data, dict)
+                            and self._is_current_supertrend_position(
+                                env, persistence, position_data)):
+                        accepted[key] = position_data
+                    else:
+                        if env.safe_mode is not None:
+                            env.safe_mode.enter_safe_mode(
+                                "unverified_strategy_position",
+                                f"Position {key} lacks current SuperTrend lineage")
+                        log.error("[Engine] did not restore unverified open position %s; "
+                                  "broker reconciliation required", key)
+                positions_state = dict(positions_state)
+                positions_state["open_positions"] = accepted
+        if (env.mode == "LIVE"
+                and not (positions_state and positions_state.get("open_positions"))):
             get_open_positions = getattr(persistence, "get_open_positions", None)
             if callable(get_open_positions):
                 try:
                     durable_positions = get_open_positions()
                     restored_open = {}
-                    for row in durable_positions or []:
+                    for row in self._current_supertrend_position_rows(
+                            env, durable_positions):
                         pid = str(row.get("position_id") or "")
                         if not pid:
                             continue
@@ -1971,9 +2191,10 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                             "lifecycle_id": row.get("lifecycle_id") or row.get("trade_id"),
                         }
                     if restored_open:
-                        positions_state = {"open_positions": restored_open,
-                                           "closed_positions": [],
-                                           "generation_counters": {}}
+                        positions_state = dict(positions_state or {})
+                        positions_state["open_positions"] = restored_open
+                        positions_state.setdefault("closed_positions", [])
+                        positions_state.setdefault("generation_counters", {})
                         log.warning("[Engine] restored %d LIVE open position(s) "
                                     "from canonical DB without a JSON snapshot",
                                     len(restored_open))
@@ -1985,8 +2206,10 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                 get_open_positions = getattr(persistence, "get_open_positions", None)
                 if callable(get_open_positions):
                     try:
+                        durable_rows = self._current_supertrend_position_rows(
+                            env, get_open_positions())
                         positions_state = merge_durable_open_position_rows(
-                            positions_state, get_open_positions())
+                            positions_state, durable_rows)
                     except Exception:
                         log.exception(
                             "[Engine] durable open-position hydration failed; "
@@ -2057,6 +2280,10 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
         exec_state = saved_state.get("live_execution")
         if exec_state:
             try:
+                if env.mode == "LIVE" and isinstance(exec_state, dict):
+                    exec_state = dict(exec_state)
+                    exec_state["orders"] = self._current_supertrend_order_rows(
+                        env, exec_state.get("orders", []))
                 if getattr(env.execution_engine, "restore", None) is not None:
                     env.execution_engine.restore(exec_state)
                     router = getattr(env.execution_engine, "broker_router", None)
@@ -2064,7 +2291,19 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                         for o in (getattr(env.execution_engine, "_orders", {})
                                   or {}).values():
                             bid = getattr(o, "_broker_order_id", None)
-                            if bid and router.resolve(str(bid)) is None:
+                            current_order = {
+                                "strategy_id": getattr(o, "strategy_id", ""),
+                                "instrument": getattr(o, "instrument", ""),
+                                "order_type": getattr(o, "order_type", "MARKET"),
+                                "order_role": getattr(o, "order_role", ""),
+                                "state": getattr(getattr(o, "state", None),
+                                                  "value", getattr(o, "state", "")),
+                                "entry_signal_id": getattr(o, "entry_signal_id", None),
+                            }
+                            if (bid and router.resolve(str(bid)) is None
+                                    and self._is_current_supertrend_order(
+                                        env, env.persistence, current_order,
+                                        allow_terminal=True)):
                                 try:
                                     router.register_from_kwargs(
                                         broker_order_id=str(bid),
@@ -2087,7 +2326,8 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
             get_orders = getattr(env.persistence, "get_orders", None)
             if callable(restore_orders) and callable(get_orders):
                 try:
-                    count = restore_orders(get_orders())
+                    order_rows = self._current_supertrend_order_rows(env, get_orders())
+                    count = restore_orders(order_rows)
                     if count:
                         log.warning("[Engine] restored %d LIVE order(s) from canonical DB "
                                     "missing in execution snapshot", count)

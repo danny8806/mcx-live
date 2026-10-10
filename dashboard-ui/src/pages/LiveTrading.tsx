@@ -130,7 +130,7 @@ export default function LiveTrading() {
     </section>
 
     <section className="desk-section">
-      <div className="desk-section-heading"><div><div className="eyebrow">SIGNAL TO EXECUTION</div><h3>Strategy state</h3></div><span className="source-note">No armed breakout trigger or strategy SL</span></div>
+      <div className="desk-section-heading"><div><div className="eyebrow">SIGNAL TO EXECUTION</div><h3>Strategy state</h3></div><span className="source-note">Market entry after candle close · no separate SL</span></div>
       {!strategiesKnown ? <div className="empty-state"><ShieldAlert size={18}/><div><b>Strategy state is not confirmed.</b><small>The runtime snapshot has not arrived.</small></div></div> : <div className="signal-state-grid">{strategies.filter((strategy: any) => strategy.strategy_type === "supertrend").map((strategy: any) => {
         const pendingReversal = strategy.pending_entry?.metadata?.is_reversal_entry;
         const trendValue = strategy.supertrend?.value?.trend;

@@ -100,6 +100,8 @@ class StrategyBase:
         ts, close = float(timestamp), float(close)
         signal_candle = {
             "strategy_type": "supertrend",
+            "strategy_timeframe": "15m",
+            "signal_source": "completed_native_15m_candle",
             "signal_candle_start": ts,
             "signal_candle_open": None,
             "signal_candle_high": float(high),

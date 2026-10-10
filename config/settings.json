@@ -79,7 +79,8 @@
       "live_gate": "OFF",
       "entry_enabled": true,
       "exit_enabled": true,
-      "reversal_enabled": true
+      "reversal_enabled": true,
+      "max_pending_orders": 1
     },
     "silver_01": {
       "instrument": "SILVERM",
@@ -93,7 +94,8 @@
       "live_gate": "OFF",
       "entry_enabled": true,
       "exit_enabled": true,
-      "reversal_enabled": true
+      "reversal_enabled": true,
+      "max_pending_orders": 1
     }
   },
   "paper_execution": {

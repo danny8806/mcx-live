@@ -48,6 +48,7 @@ class BrokerEventRouter:
 
     def __init__(self, persistence: Optional[Any] = None):
         self._persistence = persistence
+        self._mapping_validator: Optional[Callable[[dict], bool]] = None
         self._lock = threading.RLock()
         self._mappings: dict[str, BrokerOrderMapping] = {}
         self._quarantined_events: list[dict] = []
@@ -190,6 +191,10 @@ class BrokerEventRouter:
     def set_persistence(self, persistence) -> None:
         self._persistence = persistence
 
+    def set_mapping_validator(self, validator: Optional[Callable[[dict], bool]]) -> None:
+        """Install an application-specific guard for durable mapping restore."""
+        self._mapping_validator = validator
+
     def restore(self) -> int:
         """Restore all durable broker mappings from canonical persistence.
 
@@ -206,6 +211,16 @@ class BrokerEventRouter:
             return 0
         restored = 0
         for row in rows:
+            if self._mapping_validator is not None:
+                try:
+                    if not self._mapping_validator(row):
+                        log.error("[BrokerRouter] skipped unverified durable mapping %s",
+                                  row.get("broker_order_id"))
+                        continue
+                except Exception as e:
+                    log.error("[BrokerRouter] mapping validation failed for %s: %s",
+                              row.get("broker_order_id"), e)
+                    continue
             self._mappings[row["broker_order_id"]] = BrokerOrderMapping(
                 broker_order_id=row["broker_order_id"],
                 order_id=row["order_id"],

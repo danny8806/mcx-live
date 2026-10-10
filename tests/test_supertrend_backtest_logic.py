@@ -1,35 +1,52 @@
 import pandas as pd
 
-from tools.backtest_supertrend_15m_csv import pine_atr, supertrend
+from indicators.supertrend import SuperTrend
+from tools.backtest_supertrend_15m_csv import supertrend
 
 
-def test_pine_atr_uses_sma_seed_then_wilder_rma():
+def test_backtest_uses_the_production_indicator_calculation():
+    closes = [100, 98, 96, 94, 92, 90, 92, 94, 96, 98,
+              100, 102, 104, 102, 100, 98, 96, 94, 92, 90]
     bars = pd.DataFrame({
-        "high": [11.0, 12.0, 14.0, 15.0],
-        "low": [9.0, 10.0, 12.0, 13.0],
-        "close": [10.0, 11.0, 13.0, 14.0],
-    })
+        "open": closes,
+        "high": [v + 1 for v in closes],
+        "low": [v - 1 for v in closes],
+        "close": closes,
+    }, index=pd.date_range("2026-01-01", periods=len(closes), freq="15min"))
 
-    atr = pine_atr(bars, 2, change_atr=True)
+    actual = supertrend(bars, period=3, multiplier=1.5, source="low",
+                        atr_method="sma_tr", first_tr="na")
+    indicator = SuperTrend(3, 1.5, "low", "sma_tr", first_tr="na")
+    expected = []
+    for ts, bar in bars.iterrows():
+        value = indicator.update(bar.open, bar.high, bar.low, bar.close,
+                                 ts.timestamp())
+        expected.append((value.atr, value.upper, value.lower, value.trend,
+                         value.buy_signal, value.sell_signal))
 
-    assert pd.isna(atr.iloc[0])
-    assert atr.iloc[1] == 2.0
-    assert atr.iloc[2] == 2.5
-    assert atr.iloc[3] == 2.25
+    assert list(actual.columns) == ["atr", "up", "dn", "trend",
+                                    "buy_signal", "sell_signal"]
+    for i, row in enumerate(expected):
+        for column, expected_value in zip(actual.columns, row):
+            actual_value = actual[column].iloc[i]
+            if expected_value is None:
+                assert pd.isna(actual_value)
+            elif isinstance(expected_value, bool):
+                assert bool(actual_value) == expected_value
+            else:
+                assert actual_value == expected_value
 
 
-def test_supertrend_emits_signals_only_on_direction_flips():
-    close = [100, 98, 96, 94, 92, 90, 92, 94, 96, 98,
-             100, 102, 104, 102, 100, 98, 96, 94, 92, 90]
+def test_backtest_compatibility_switch_maps_to_production_atr_method():
     bars = pd.DataFrame({
-        "open": close,
-        "high": [v + 1 for v in close],
-        "low": [v - 1 for v in close],
-        "close": close,
-    })
+        "open": [10.0, 11.0, 12.0],
+        "high": [11.0, 13.0, 15.0],
+        "low": [9.0, 10.0, 11.0],
+        "close": [10.0, 12.0, 14.0],
+    }, index=pd.date_range("2026-01-01", periods=3, freq="15min"))
 
-    result = supertrend(bars, period=3, multiplier=1.5, change_atr=True)
-
-    assert result.index[result["sell_signal"]].tolist() == [5, 15]
-    assert result.index[result["buy_signal"]].tolist() == [8]
-    assert result["trend"].iloc[-1] == -1
+    via_switch = supertrend(bars, 2, 2.0, change_atr=False, source="ohlc4",
+                            first_tr="na")
+    via_config = supertrend(bars, 2, 2.0, source="ohlc4",
+                            atr_method="sma_tr", first_tr="na")
+    pd.testing.assert_frame_equal(via_switch, via_config)

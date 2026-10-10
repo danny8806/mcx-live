@@ -414,8 +414,8 @@ class FillFlowMixin:
             if exit_role == "REVERSAL_EXIT" or (exit_reason
                                               and "reversal" in exit_reason.lower()):
                 self._update_reversal_exit_fill(env, signal_id, fill)
-            # Reversal exits arm an OPPOSITE pending breakout entry which must
-            # survive the close: keep it if the strategy has one armed.
+            # Preserve the paired opposite entry while the broker confirms
+            # the reversal exit and flat state.
             pending_entry = env.strategies[fill.strategy_id].pending_entry
             pending_signal = getattr(pending_entry, "signal", None)
             pending_metadata = (getattr(pending_signal, "metadata", None) or {})

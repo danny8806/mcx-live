@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -15,64 +14,33 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.backtest_data import fees, load_5m_csv, resample_clock_bars  # noqa: E402
+from indicators.supertrend import SuperTrend  # noqa: E402
 
 
-def pine_atr(data: pd.DataFrame, period: int, change_atr: bool = True) -> pd.Series:
-    """Pine v4 atr() (Wilder RMA) or SMA(true range) when changeATR is false."""
-    previous_close = data["close"].shift(1)
-    tr = pd.concat([
-        data["high"] - data["low"],
-        (data["high"] - previous_close).abs(),
-        (data["low"] - previous_close).abs(),
-    ], axis=1).max(axis=1)
-    if change_atr:
-        values = [float("nan")] * len(tr)
-        if len(tr) >= period:
-            seed = float(tr.iloc[:period].mean())
-            values[period - 1] = seed
-            for i in range(period, len(tr)):
-                values[i] = (values[i - 1] * (period - 1) + float(tr.iloc[i])) / period
-        return pd.Series(values, index=data.index, dtype="float64")
-    return tr.rolling(period, min_periods=period).mean()
+def supertrend(data: pd.DataFrame, period: int, multiplier: float,
+               change_atr: bool | None = None, *, source: str = "hl2",
+               atr_method: str = "sma_tr", first_tr: str = "high_low") -> pd.DataFrame:
+    """Run the production indicator over bars in timestamp order.
 
-
-def supertrend(data: pd.DataFrame, period: int = 10, multiplier: float = 3.0,
-               change_atr: bool = True) -> pd.DataFrame:
-    """Reproduce the supplied Pine v4 recursive band/trend calculation."""
+    ``change_atr`` remains a compatibility switch for command-line overrides;
+    the normal run takes source/ATR/initial-TR settings from the active profile.
+    """
     if period < 1 or multiplier <= 0:
         raise ValueError("period must be >= 1 and multiplier must be > 0")
-    atr = pine_atr(data, period, change_atr)
-    src = (data["high"] + data["low"]) / 2.0
-    basic_up = src - multiplier * atr
-    basic_dn = src + multiplier * atr
-    up = [float("nan")] * len(data)
-    dn = [float("nan")] * len(data)
-    trend = [1] * len(data)
-    buy = [False] * len(data)
-    sell = [False] * len(data)
-    for i in range(len(data)):
-        if not math.isfinite(float(atr.iloc[i])):
-            if i:
-                trend[i] = trend[i - 1]
-            continue
-        u, d = float(basic_up.iloc[i]), float(basic_dn.iloc[i])
-        up1 = up[i - 1] if i and math.isfinite(up[i - 1]) else u
-        dn1 = dn[i - 1] if i and math.isfinite(dn[i - 1]) else d
-        prev_close = float(data["close"].iloc[i - 1]) if i else float("nan")
-        up[i] = max(u, up1) if i and prev_close > up1 else u
-        dn[i] = min(d, dn1) if i and prev_close < dn1 else d
-        prior_trend = trend[i - 1] if i else 1
-        close = float(data["close"].iloc[i])
-        if prior_trend == -1 and close > dn1:
-            trend[i] = 1
-        elif prior_trend == 1 and close < up1:
-            trend[i] = -1
-        else:
-            trend[i] = prior_trend
-        buy[i] = trend[i] == 1 and prior_trend == -1
-        sell[i] = trend[i] == -1 and prior_trend == 1
-    return pd.DataFrame({"atr": atr, "up": up, "dn": dn, "trend": trend,
-                         "buy_signal": buy, "sell_signal": sell}, index=data.index)
+    if change_atr is not None:
+        atr_method = "wilder" if change_atr else "sma_tr"
+    indicator = SuperTrend(period, multiplier, source, atr_method,
+                           first_tr=first_tr)
+    values = []
+    for ts, row in data.iterrows():
+        value = indicator.update(row.open, row.high, row.low, row.close,
+                                 ts.timestamp())
+        values.append({
+            "atr": value.atr, "up": value.upper, "dn": value.lower,
+            "trend": value.trend, "buy_signal": value.buy_signal,
+            "sell_signal": value.sell_signal,
+        })
+    return pd.DataFrame(values, index=data.index)
 
 
 def _bar(data: pd.DataFrame, i: int) -> dict[str, Any]:
@@ -80,15 +48,23 @@ def _bar(data: pd.DataFrame, i: int) -> dict[str, Any]:
 
 
 def run_one(symbol: str, data_dir: Path, config: dict[str, Any], out_dir: Path,
-            period: int, multiplier: float, change_atr: bool, fill_model: str,
+            period: int | None, multiplier: float | None, change_atr: bool | None,
+            fill_model: str,
             apply_live_fees: bool) -> dict[str, Any]:
     instrument = config["instruments"][symbol]
     base = load_5m_csv(data_dir / f"{symbol}_5m_mcx.csv", instrument.get("session_open", "09:00"),
                        instrument.get("session_close", "23:30"))
     bars = resample_clock_bars(base, 15, instrument.get("session_close", "23:30"))
-    bars = bars.join(supertrend(bars, period, multiplier, change_atr))
-    bars = bars.dropna(subset=["atr"])
     strategy_cfg = config["strategies"]["gold_02" if symbol == "GOLDM" else "silver_01"]
+    params = strategy_cfg["supertrend"]
+    period = int(period if period is not None else params["atr_period"])
+    multiplier = float(multiplier if multiplier is not None else params["multiplier"])
+    source = str(params["source"])
+    atr_method = ("wilder" if change_atr else "sma_tr") if change_atr is not None else str(params["atr_method"])
+    first_tr = str(params["first_tr"])
+    bars = bars.join(supertrend(bars, period, multiplier, source=source,
+                                atr_method=atr_method, first_tr=first_tr))
+    bars = bars.dropna(subset=["atr"])
     qty = int(strategy_cfg.get("quantity", 1))
     contract_multiplier = float(instrument["multiplier"])
     tick_size = float(instrument["tick_size"])
@@ -139,7 +115,7 @@ def run_one(symbol: str, data_dir: Path, config: dict[str, Any], out_dir: Path,
             "previous_up_band": float(bars["up"].iloc[signal_i - 1]) if signal_i and math.isfinite(float(bars["up"].iloc[signal_i - 1])) else None,
             "previous_down_band": float(bars["dn"].iloc[signal_i - 1]) if signal_i and math.isfinite(float(bars["dn"].iloc[signal_i - 1])) else None,
             "entry_time": fill_ts.isoformat(sep=" "), "entry_price": price,
-            "entry_type": "next_bar_market_open" if fill_model == "next_open" else "signal_bar_market_close",
+            "entry_type": "next_bar_market_open" if fill_model == "next_open" else "signal_bar_close_proxy",
             "entry_open": fill_bar["open"], "entry_high": fill_bar["high"],
             "entry_low": fill_bar["low"], "entry_close": fill_bar["close"],
             "reversal_entry": reversal,
@@ -153,8 +129,9 @@ def run_one(symbol: str, data_dir: Path, config: dict[str, Any], out_dir: Path,
         ts = bars.index[i]
         signal = "LONG" if bool(bars["buy_signal"].iloc[i]) else "SHORT" if bool(bars["sell_signal"].iloc[i]) else None
 
-        # By default, the signal is produced at this bar's close and the
-        # broker emulator fills the resulting market order at next bar open.
+        # Live submits a market order immediately after the completed signal
+        # candle. Historical OHLC has no broker fill; signal_close is only a
+        # proxy. next_open is an explicitly non-live sensitivity model.
         if pending is not None and pending["fill_i"] == i:
             order = pending; pending = None
             if position is not None and position["side"] != order["side"]:
@@ -209,7 +186,7 @@ def run_one(symbol: str, data_dir: Path, config: dict[str, Any], out_dir: Path,
     losses = sum(r["net_pnl"] < 0 for r in closed)
     winners = [r["net_pnl"] for r in closed if r["net_pnl"] > 0]
     losers = [r["net_pnl"] for r in closed if r["net_pnl"] < 0]
-    equity = peak = 1000000.0
+    equity = peak = float(strategy_cfg.get("capital", 300000.0))
     max_drawdown = 0.0
     for trade in sorted(closed, key=lambda r: r["exit_time"]):
         equity += trade["net_pnl"]
@@ -220,9 +197,10 @@ def run_one(symbol: str, data_dir: Path, config: dict[str, Any], out_dir: Path,
         "source_5m_rows": int(base["source_rows"].sum()),
         "filtered_out_of_session_rows": int(base.attrs.get("filtered_rows", 0)),
         "derived_15m_bars": int(len(bars)), "atr_period": period,
-        "atr_multiplier": multiplier, "change_atr": change_atr,
+        "atr_multiplier": multiplier, "change_atr": atr_method == "wilder",
         "entry_fill_model": fill_model, "quantity": qty, "contract_multiplier": contract_multiplier,
-        "initial_capital": 1000000.0,
+        "initial_capital": float(strategy_cfg.get("capital", 300000.0)),
+        "source": source, "atr_method": atr_method, "first_tr": first_tr,
         "commission_model": "live fee schedule" if apply_live_fees else "TradingView default: no commission",
         "closed_trades": len(closed), "open_trades_at_data_end": sum(r["status"] == "OPEN" for r in trades),
         "wins": wins, "losses": losses,
@@ -247,10 +225,13 @@ def main() -> None:
     parser.add_argument('--data-dir', type=Path, required=True)
     parser.add_argument('--config', type=Path, default=ROOT / 'config' / 'live_settings.json')
     parser.add_argument('--output-dir', type=Path, default=ROOT / 'backtest_results_supertrend_15m')
-    parser.add_argument('--atr-period', type=int, default=10)
-    parser.add_argument('--atr-multiplier', type=float, default=3.0)
-    parser.add_argument('--change-atr', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--fill-model', choices=('next_open', 'signal_close'), default='next_open')
+    parser.add_argument('--atr-period', type=int, default=None,
+                        help='Override both current profile periods (normally read from config).')
+    parser.add_argument('--atr-multiplier', type=float, default=None,
+                        help='Override both current profile multipliers (normally read from config).')
+    parser.add_argument('--change-atr', action=argparse.BooleanOptionalAction, default=None,
+                        help='Override profile ATR method: Wilder when on, SMA(TR) when off.')
+    parser.add_argument('--fill-model', choices=('signal_close', 'next_open'), default='signal_close')
     parser.add_argument('--apply-live-fees', action='store_true',
                         help='Use configured Dhan/MCX fees instead of TradingView default zero commission.')
     args = parser.parse_args()
@@ -259,17 +240,18 @@ def main() -> None:
                        args.atr_period, args.atr_multiplier, args.change_atr,
                        args.fill_model, args.apply_live_fees) for sym in ('GOLDM', 'SILVERM')]
     metadata = {
-        'strategy': 'Supplied Pine v4 SuperTrend strategy, 15-minute timeframe',
-        'atr_period': args.atr_period, 'atr_multiplier': args.atr_multiplier,
-        'change_atr': args.change_atr,
-        'source': 'hl2',
-        'atr_method': 'Wilder ATR (RMA of true range)' if args.change_atr else 'SMA of true range',
+        'strategy': 'Current production SuperTrend strategy, 15-minute timeframe',
+        'indicator_implementation': 'indicators.supertrend.SuperTrend shared with live execution',
+        'profile_parameters': {k: v['supertrend'] for k, v in config['strategies'].items()},
+        'atr_period_override': args.atr_period,
+        'atr_multiplier_override': args.atr_multiplier,
+        'change_atr_override': args.change_atr,
         'entry_fill_model': args.fill_model,
-        'fill_model_note': 'Pine default next-bar open' if args.fill_model == 'next_open' else 'Signal-bar close sensitivity case',
-        'strategy_entry_behavior': 'Opposite strategy.entry closes the prior position and opens the new direction at the same fill price.',
-        'exit_rule': 'No fixed stop or target in supplied Pine code; positions exit/reverse only on the opposite SuperTrend signal.',
-        'quantity': 'TradingView default fixed quantity: 1. Contract multipliers from the instrument configuration are applied to P&L.',
-        'initial_capital': 'TradingView default: 1,000,000 account-currency units (treated as INR for these MCX prices).',
+        'fill_model_note': 'Signal-close price proxy; live submits a market order immediately after candle close, actual broker fill can differ.' if args.fill_model == 'signal_close' else 'Next-bar open sensitivity model; not the live execution timing.',
+        'strategy_entry_behavior': 'Live entry is a market order after a completed SuperTrend flip candle. Opposite flip closes old exposure and submits the opposite entry after broker-flat confirmation.',
+        'exit_rule': 'No separate stop or target; exit/reversal only on opposite SuperTrend flip.',
+        'quantity': 'Current profile quantity: 1 for each instrument. Contract multipliers from instrument configuration are applied to P&L.',
+        'initial_capital': 'Current profile accounting capital: ₹300,000 per strategy.',
         'commission': 'TradingView default zero commission.' if not args.apply_live_fees else 'Configured live fee schedule applied as a non-default comparison.',
         'slippage': 'TradingView default zero slippage.',
         'date_window': 'Pine inputs default to 2018-09-01 through 9999-01-01; all provided data falls inside this range.',
