@@ -44,10 +44,6 @@ class StrategyBase:
         self.just_entered = False
         self.enabled = True
         self._bars_processed = 0
-        self._prev_fast_close = None
-        self._prev_fast_high = None
-        self._prev_fast_low = None
-        self.just_entered = False
         self._trigger_generation = 0
         self._last_armed_pending_id: Optional[str] = None
         self._last_fired_trigger_signal_id: Optional[str] = None

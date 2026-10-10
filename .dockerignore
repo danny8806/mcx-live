@@ -43,6 +43,7 @@ desktop.ini
 # diagnostics contain credentials, so never copy them into a build context.
 /tools/
 /scripts/
+/verification/
 /indicators/dema.py
 /indicators/atr.py
 /indicators/dema_atr.py
@@ -56,3 +57,4 @@ desktop.ini
 /check_*.py
 /verify_live_signals.py
 /deploy_restart.py
+/deploy_vps.py

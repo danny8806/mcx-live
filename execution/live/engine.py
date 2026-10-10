@@ -159,15 +159,9 @@ class LiveExecutionEngine:
             plan = self._price_preset.plan_for(signal, order_side)
             # §9.5 — immutability: the first plan for a signal_id is canonical;
             # any later recompute for the SAME signal MUST be byte-equal.
-            # C3 — the plan is keyed by (signal_id, role), NOT signal_id alone:
-            # a reversal intentionally reuses ONE signal_id for the old trade's
-            # exit leg and the new opposite-side entry leg, and those two legs
-            # legitimately carry different plans (system exit vs.
-            # local-triggered entry). Immutability is preserved per-leg.
-            # A watcher fallback is a distinct execution leg even when an
-            # EXIT-family fallback intentionally keeps the EXIT role for
-            # priority/risk routing. Its MARKET plan must not collide with
-            # the original signal's canonical LIMIT exit plan.
+            # A reversal intentionally reuses one signal_id for the old
+            # position's exit and the new opposite-side entry. Keep each plan
+            # keyed by its role and execution leg.
             execution_leg = ("fallback" if (signal.metadata or {}).get(
                 "market_fallback") else "primary")
             plan_key = (signal.signal_id, order.order_role, execution_leg)
@@ -209,10 +203,9 @@ class LiveExecutionEngine:
             order.reason = "ORDER_ROLE_INVALID"
             order.updated_at = self._now()
             return order
-        # A market entry is allowed only for a watcher-created fallback after
-        # the originating fired LIMIT has been broker-confirmed cancelled.
-        # The watcher preserves the original trigger and order lineage; this
-        # gateway still rejects direct/unowned market entry attempts below.
+        # Direct market entry is allowed only when it carries the active
+        # completed-candle SuperTrend execution mode. Other market entries
+        # must be broker-confirmed fallback orders with original lineage.
         direct_signal_market = (
             str(getattr(order, "order_type", "") or "").upper() == "MARKET"
             and getattr(order, "signal_execution_mode", None)

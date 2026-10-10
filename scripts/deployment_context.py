@@ -13,7 +13,7 @@ SKIP_DIRS = {
     "verification",
 }
 SKIP_ROOT_PREFIXES = ("p6_", "live_verify", "vps_", "verify_", "check_")
-SKIP_ROOT_NAMES = {"deploy_restart.py"}
+SKIP_ROOT_NAMES = {"deploy_restart.py", "deploy_vps.py"}
 SKIP_SUFFIXES = (
     ".pyc", ".pyo", ".db", ".db-shm", ".db-wal", ".log", ".tmp",
     ".bak", ".lock", ".crt", ".key",
