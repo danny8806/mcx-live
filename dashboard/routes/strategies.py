@@ -38,6 +38,33 @@ def _position_snapshot(env, strategy_id: str) -> list[dict]:
     return result
 
 
+def _reconcile_open_position(strategy_id: str, snap: dict, env=None) -> dict:
+    """Make the pushed strategy state agree with its authoritative position book.
+
+    The live WebSocket snapshot path uses this helper before enriching strategy
+    rows. The strategy object can lag the position manager during restoration
+    or a broker fill; in that case the open position is the source of truth for
+    the dashboard's displayed side/state.
+    """
+    target_env = _env_for(env)
+    manager = getattr(target_env, "position_manager", None) if target_env else None
+    if manager is None:
+        return dict(snap)
+    try:
+        positions = manager.get_positions_by_strategy(strategy_id) or []
+    except Exception:
+        return dict(snap)
+    open_positions = [p for p in positions if getattr(p, "is_open", False)]
+    if len(open_positions) != 1:
+        return dict(snap)
+    position = open_positions[0]
+    result = dict(snap)
+    result["state"] = "long_position" if position.is_long else "short_position"
+    result["position_side"] = "LONG" if position.is_long else "SHORT"
+    result["position"] = position.snapshot()
+    return result
+
+
 def _strategy_rows(instrument: Optional[str] = None, status: Optional[str] = None,
                    env_name=None):
     if _engine is None:
