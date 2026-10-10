@@ -346,7 +346,15 @@ class BrokerSyncService:
             ws_ok = True
             if self._ws_enabled and self._ws_feed is not None:
                 ws_alive = self._ws_feed.connected
-                stale = self._ws_feed.is_stale() if hasattr(self._ws_feed, "is_stale") else False
+                # ``is_stale`` implementations commonly return True while
+                # disconnected. That is useful as a generic liveness result,
+                # but it is not evidence of a heartbeat timeout. Keep the
+                # two states separate: disconnected feeds still degrade
+                # service health, while the stale label is reserved for a
+                # connected socket whose heartbeat expired.
+                stale = (bool(self._ws_feed.is_stale())
+                         if ws_alive and hasattr(self._ws_feed, "is_stale")
+                         else False)
                 now = self._clock()
                 # A socket can report connected=True while its heartbeat has
                 # already timed out, so liveness is BOTH conditions. Reporting
@@ -490,8 +498,8 @@ class BrokerSyncService:
         if self._ws_feed is None:
             return {"connected": False, "stale": False, "live": False}
         connected = bool(self._ws_feed.connected)
-        stale = bool(self._ws_feed.is_stale()) if hasattr(
-            self._ws_feed, "is_stale") else False
+        stale = (bool(self._ws_feed.is_stale())
+                 if connected and hasattr(self._ws_feed, "is_stale") else False)
         return {"connected": connected, "stale": stale,
                 "live": connected and not stale}
 

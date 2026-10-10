@@ -93,6 +93,20 @@ def test_disconnected_ws_is_not_healthy():
     assert svc.healthy is False
 
 
+def test_disconnected_ws_is_not_mislabeled_as_heartbeat_stale(caplog):
+    # Real Dhan socket ``is_stale`` returns True while disconnected. That is
+    # a generic non-live signal, not proof a connected heartbeat timed out.
+    svc = _service(FakeWs(connected=False, stale=True))
+    svc._health_tick_once()
+    status = svc.stats()
+    assert svc.healthy is False
+    assert status["ws_connected"] is False
+    assert status["ws_stale"] is False
+    assert status["ws_live"] is False
+    assert svc._ws_stale_active is False
+    assert "WS feed stale (heartbeat timeout)" not in caplog.text
+
+
 def test_connected_and_fresh_ws_is_healthy():
     svc = _service(FakeWs(connected=True, stale=False))
     svc._health_tick_once()
