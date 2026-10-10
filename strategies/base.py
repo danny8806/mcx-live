@@ -75,6 +75,7 @@ class StrategyBase:
             side=side,
             metadata={
                 "strategy_type": "supertrend",
+                "trigger_generation": self._trigger_generation,
                 "signal_candle_start": float(timestamp),
                 "signal_candle_open": None,
                 "signal_candle_high": float(high),
@@ -107,6 +108,7 @@ class StrategyBase:
             "signal_candle_high": float(high),
             "signal_candle_low": float(low),
             "signal_candle_close": close,
+            "trigger_generation": self._trigger_generation,
         }
         entry = Signal(
             signal_type=SignalType.LONG if side == "LONG" else SignalType.SHORT,

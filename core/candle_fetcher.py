@@ -485,6 +485,8 @@ class CandleFetcher:
                   f"instrument={name} timeframe={timeframe} "
                   f"rest_ms={rest_fetch_ms:.1f}", flush=True)
             return False
+        target_found = (expected_start_ts is None or any(
+            int(candle[0]) == int(expected_start_ts) for candle in closed))
         if stream_uninitialized:
             # If startup priming failed, establish a baseline for bars that
             # predate this worker, but still forward bars that closed after it
@@ -500,9 +502,13 @@ class CandleFetcher:
                         datetime.fromtimestamp(candle[0], IST), tf_minutes)
                     if bar:
                         self.on_candle_closed(bar)
-            return True
-        target_found = (expected_start_ts is None or any(
-            int(candle[0]) == int(expected_start_ts) for candle in closed))
+            # Returning success here used to clear a retry merely because
+            # some older closed bar existed in the response. If startup
+            # watermarking had failed and Dhan had not published the target
+            # close yet, that silently dropped the just-closed strategy bar.
+            # Keep the bounded retry alive until the requested native candle
+            # itself is present; already emitted bars remain deduped above.
+            return target_found
         callback_ms = 0.0
         for candle in closed:
             key = f"{name}:{timeframe}:{candle[0]}"

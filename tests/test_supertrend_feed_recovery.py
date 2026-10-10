@@ -84,6 +84,41 @@ def test_first_successful_fetch_forwards_only_bars_closed_after_startup():
     assert emitted[0].close == 109
 
 
+def test_unprimed_fetch_keeps_retry_when_only_an_older_native_bar_is_available():
+    start = datetime(2026, 10, 9, 9, 5, tzinfo=IST)
+    expected_start = datetime(2026, 10, 9, 9, 15, tzinfo=IST)
+    now = datetime(2026, 10, 9, 9, 31, tzinfo=IST)
+    older = [
+        datetime(2026, 10, 9, 9, 0, tzinfo=IST).timestamp(),
+        100, 105, 99, 104, 10,
+    ]
+    expected = [expected_start.timestamp(), 104, 108, 103, 107, 12]
+
+    class DelayedAdapter:
+        calls = 0
+
+        def fetch_historical_candles(self, _symbol, _interval, _from, _to):
+            self.calls += 1
+            return [older] if self.calls == 1 else [older, expected]
+
+    emitted = []
+    fetcher = CandleFetcher(
+        DelayedAdapter(), {"GOLDM": {}}, emitted.append, timeframes=["15m"])
+    fetcher._started_at_epoch = start.timestamp()
+
+    first_found = fetcher._check_native_timeframe(
+        "GOLDM", {}, "15m", now, expected_start_ts=int(expected_start.timestamp()))
+    assert first_found is False
+    assert len(emitted) == 1
+    assert emitted[0].start_ts == older[0]
+
+    second_found = fetcher._check_native_timeframe(
+        "GOLDM", {}, "15m", now, expected_start_ts=int(expected_start.timestamp()))
+    assert second_found is True
+    assert len(emitted) == 2
+    assert emitted[1].start_ts == expected[0]
+
+
 def test_stale_live_rest_candle_warms_indicator_but_does_not_run_signal():
     events = []
     strategy = SimpleNamespace(
