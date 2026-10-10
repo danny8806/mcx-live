@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { formatINR, formatTimestamp, pnlColor, safeINR, safeNum } from "../lib/utils";
 import { useDataSelector } from "../store/DataProvider";
-import { quoteIsFresh, quoteStatus, tickAge } from "../lib/market";
+import { marketSessionClosed, marketStatusLabel, quoteIsFresh, quoteStatus, tickAge } from "../lib/market";
 
 const activeOrderStates = new Set(["submitted", "acknowledged", "partially_filled", "partial", "partially filled", "pending", "open", "transit", "part_traded"]);
 
@@ -29,6 +29,7 @@ export default function LiveTrading() {
   const orders = useDataSelector<any[]>((s) => s.orders);
   const fills = useDataSelector<any[]>((s) => s.fills);
   const marketData = useDataSelector<any>((s) => s.marketData);
+  const marketStatus = useDataSelector<string>((s) => s.marketStatus);
   const gold = useDataSelector<any>((s) => s.goldOverview);
   const silver = useDataSelector<any>((s) => s.silverOverview);
   const connected = useDataSelector<boolean>((s) => s.connected);
@@ -70,11 +71,12 @@ export default function LiveTrading() {
   const workingOrders = orders.filter((order: any) => activeOrderStates.has(orderState(order)));
   const unclassifiedOrders = orders.filter((order: any) => !activeOrderStates.has(orderState(order)) && !new Set(["created", "filled", "rejected", "cancelled", "canceled", "expired", "complete", "completed"]).has(orderState(order)));
   const unmatchedBrokerPositions = (brokerPositions?.positions ?? []).filter((position: any) => position.status !== "MATCHED");
+  const marketClosed = marketSessionClosed(marketStatus);
 
   return <div className="live-floor">
     <section className="desk-hero">
       <div><div className="eyebrow">REAL-TIME EXECUTION</div><h2>Live SuperTrend desk</h2><p>GOLDM and SILVERM · completed 15-minute candles · market submission after candle close · no separate strategy SL.</p></div>
-      <div className="desk-hero-status"><StateTag kind={connected ? "good" : "bad"}>{connected ? "Dashboard socket connected" : "Dashboard socket disconnected"}</StateTag><StateTag kind={marketData?.ws_connected ? "good" : "warn"}>{marketData?.ws_connected ? "Market feed connected" : "Market feed disconnected"}</StateTag><StateTag kind={overview.execution_mode === "LIVE" ? "bad" : "neutral"}>{overview.execution_mode || "MODE UNKNOWN"}</StateTag></div>
+      <div className="desk-hero-status"><StateTag kind={connected ? "good" : "bad"}>{connected ? "Dashboard connected" : "Dashboard disconnected"}</StateTag><StateTag kind={marketData?.ws_connected ? marketClosed ? "neutral" : "good" : "warn"}>{marketData?.ws_connected ? `${marketStatusLabel(marketStatus)} · feed connected` : "Market feed disconnected"}</StateTag><StateTag kind={overview.execution_mode === "LIVE" ? "bad" : "neutral"}>{overview.execution_mode || "MODE UNKNOWN"}</StateTag></div>
     </section>
 
     {overview.kill_switch && <div className="desk-warning"><ShieldAlert size={20}/><div><b>Kill switch is active</b><small>Trading is halted according to the current runtime state.</small></div></div>}
@@ -109,7 +111,7 @@ export default function LiveTrading() {
         const ltp = getLtp(instrument);
         const linked = strategies.filter((strategy: any) => strategy.instrument === instrument);
         const fresh = quoteIsFresh(quote, Boolean(marketData?.ws_connected));
-        return <article className="instrument-card" key={instrument}><div className="instrument-card-head"><div><span className="instrument-symbol">{instrument}</span><small>{linked.length ? linked.map((strategy: any) => strategy.strategy_id).join(" · ") : "No strategy assigned"}</small></div><StateTag kind={fresh ? "good" : "warn"}>{quoteStatus(quote, Boolean(marketData?.ws_connected))}</StateTag></div><strong className="instrument-price tabular-nums">{ltp > 0 ? safeINR(ltp) : "—"}</strong><div className="instrument-foot"><span>Last tick <b>{quote?.receive_timestamp ? formatTimestamp(quote.receive_timestamp) : "—"}</b> · {tickAge(quote)}</span><span>{linked.length} strategy{linked.length === 1 ? "" : "ies"}</span></div></article>;
+        return <article className="instrument-card" key={instrument}><div className="instrument-card-head"><div><span className="instrument-symbol">{instrument}</span><small>{linked.length ? linked.map((strategy: any) => strategy.strategy_id).join(" · ") : "No strategy assigned"}</small></div><StateTag kind={fresh ? "good" : marketClosed ? "neutral" : "warn"}>{quoteStatus(quote, Boolean(marketData?.ws_connected), !marketClosed)}</StateTag></div><strong className="instrument-price tabular-nums">{ltp > 0 ? safeINR(ltp) : "—"}</strong><div className="instrument-foot"><span>Last tick <b>{quote?.receive_timestamp ? formatTimestamp(quote.receive_timestamp) : "—"}</b> · {tickAge(quote)}</span><span>{linked.length} strategy{linked.length === 1 ? "" : "ies"}</span></div></article>;
       }) : <div className="empty-state"><div><b>Instrument state is not confirmed.</b><small>No feed or strategy snapshot has arrived.</small></div></div>}</div>
     </section>
 

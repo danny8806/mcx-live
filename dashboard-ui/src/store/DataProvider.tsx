@@ -29,6 +29,7 @@ interface DataContextType {
   risk: any;
   healthComponents: any[];
   overallHealth: string;
+  marketStatus: string;
   reconciliation: any;
   brokerPnl: any;
   settings: any;
@@ -61,7 +62,7 @@ const DEFAULT_STATE: DataContextType = {
   strategies: [], positions: [], orders: [], fills: [], trades: [],
   pnl: null, pnlByInstrument: {},
   risk: null,
-  healthComponents: [], overallHealth: "unknown",
+  healthComponents: [], overallHealth: "unknown", marketStatus: "unknown",
   reconciliation: null, brokerPnl: null, settings: null, audit: [], alerts: [],
   equityCurve: [], marketData: null, wsEvents: [], wsState: null,
   refresh: () => {}, lastError: null,
@@ -117,6 +118,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [risk, setRisk] = useState<any>(null);
   const [healthComponents, setHealthComponents] = useState<any[]>([]);
   const [overallHealth, setOverallHealth] = useState("unknown");
+  const [marketStatus, setMarketStatus] = useState("unknown");
   const [reconciliation, setReconciliation] = useState<any>(null);
   const [brokerPnl, setBrokerPnl] = useState<any>(null);
   const [settings, setSettings] = useState<any>(null);
@@ -258,6 +260,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       const d = await api.healthSystem() as any;
       safe(setHealthComponents)(d?.components ?? []);
       safe(setOverallHealth)(d?.overall ?? "unknown");
+      safe(setMarketStatus)(String(d?.market_status ?? "unknown").toLowerCase());
     } catch (e: any) { setLastError(`health: ${e?.message || e}`); }
   }, [safe]);
 
@@ -436,12 +439,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const contextValue = useMemo<DataContextType>(() => ({
     connected, snapshotStatus, overview, goldOverview, silverOverview, strategies, positions,
     orders, fills, trades, pnl, pnlByInstrument, risk,
-    healthComponents, overallHealth, reconciliation, brokerPnl, settings, audit,
+    healthComponents, overallHealth, marketStatus, reconciliation, brokerPnl, settings, audit,
     alerts, equityCurve, marketData, wsEvents, wsState, refresh, lastError,
   }), [
     connected, snapshotStatus, overview, goldOverview, silverOverview, strategies, positions,
     orders, fills, trades, pnl, pnlByInstrument, risk,
-    healthComponents, overallHealth, reconciliation, brokerPnl, settings, audit,
+    healthComponents, overallHealth, marketStatus, reconciliation, brokerPnl, settings, audit,
     alerts, equityCurve, marketData, wsEvents, wsState, refresh, lastError,
   ]);
 

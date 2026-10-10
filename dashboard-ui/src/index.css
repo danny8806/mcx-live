@@ -254,3 +254,69 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible { 
   .settings-summary-card { padding: 13px; }.settings-summary-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.settings-summary-heading { align-items: flex-start; flex-direction: column; gap: 3px; }
   .settings-page { grid-template-columns: 1fr !important; }
 }
+
+/* Final readability and responsive pass for the live terminal. */
+:root {
+  --text-muted: #5d6e82;
+  --text-disabled: #738196;
+  --border: #d6e0eb;
+  --shadow-card: 0 2px 7px rgba(22, 39, 60, .045), 0 1px 2px rgba(22, 39, 60, .035);
+}
+body { min-width: 0; overflow-x: hidden; }
+.app-frame,.app-main,.app-content,.page-heading { min-width: 0; }
+.page-kicker,.eyebrow { color: #586b81; font-size: 11px; }
+.page-heading p,.live-floor-heading p { color: #53667d; font-size: 14px; }
+.nav-group-label { color: #9aabc0; font-size: 11px; }
+.nav-item { font-size: 14px; }
+.top-status { font-size: 12px; }
+.top-status.neutral { color: #586a7e; }
+.topbar-clock { color: #596c82; font-size: 12px; }
+.live-summary-card span,.desk-value > small,.position-card-pnl small,
+.instrument-card-head small,.instrument-foot,.source-note,.empty-state small,
+.strategy-profile-metrics small,.indicator-metrics small,
+.strategy-profile-title small,.indicator-card header small,
+.settings-profile header small,.settings-input-grid label,
+.settings-global-gate p,.settings-gate-controls label { color: #5e7085; }
+.live-summary-card span,.desk-value > small,.position-card-pnl small,
+.strategy-profile-metrics small,.indicator-metrics small { font-size: 12px; }
+.live-summary-card small,.instrument-foot,.source-note,.empty-state small,
+.strategy-parameters,.settings-input-grid small,.settings-gate-controls small,
+.indicator-card > footer { color: #62748a; font-size: 11px; }
+.settings-input-grid label,.settings-master-actions label,.settings-gate-controls label { font-size: 12px; }
+.settings-input-grid small,.settings-gate-controls small { font-size: 11px; }
+.trend-pill { font-size: 10px; }
+.trend-pill.unavailable { color: #9b3d2e; background: #fff0ec; }
+.indicator-data-warning { margin-top: 10px; padding: 9px 11px; border: 1px solid #efc4ba; border-radius: 8px; color: #923d30; background: #fff5f2; font-size: 12px; line-height: 1.45; }
+.settings-summary-heading small { color: #5f7085; font-size: 11px; }
+.strategy-execution-rules span { color: #5d7085; font-size: 10px; }
+.strategy-profile-metrics b,.indicator-metrics > .settings-summary-item strong { font-size: 13px; }
+.settings-profile,.strategy-profile-card,.indicator-card,.desk-section { border-color: #d9e2ec; }
+.desk-section-heading h3 { font-size: 18px; }
+.empty-state { color: #53667d; font-size: 13px; }
+.empty-state b { font-size: 13px; }
+.desk-disclaimer { color: #52657b; font-size: 11px; }
+.instrument-card-head small { font-size: 11px; }
+.settings-summary-item > strong { font-size: 13px; }
+
+@media (max-width: 420px) {
+  .app-topbar { gap: 5px; padding-inline: 8px; }
+  .topbar-statuses { gap: 3px; }
+  .top-status { padding: 5px 6px; }
+  .app-content { padding-inline: 10px; }
+  .desk-section,.settings-summary-card { padding: 12px; }
+  .instrument-grid,.strategy-card-grid,.settings-profile-grid,.indicator-card-grid { grid-template-columns: minmax(0,1fr); }
+  .settings-gate-controls { grid-template-columns: minmax(0,1fr); }
+  .settings-gate-controls label { min-height: 30px; }
+}
+@media (max-width: 760px) {
+  .app-topbar { width: 100%; overflow: hidden; }
+  .topbar-title { font-size: 0; }
+  .topbar-statuses { min-width: 0; gap: 3px; }
+  .top-status { font-size: 0; padding: 5px 6px; }
+  .top-status i { display: none; }
+  .top-status::after { font-size: 9px; font-weight: 750; letter-spacing: .04em; }
+  .top-status:nth-child(1)::after { content: "UI"; }
+  .top-status:nth-child(2)::after { content: "ENG"; }
+  .top-status:nth-child(3)::after { content: attr(data-short); }
+  .topbar-execution,.topbar-clock { display: none; }
+}

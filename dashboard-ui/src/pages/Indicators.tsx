@@ -1,5 +1,6 @@
 import { useDataSelector } from "../store/DataProvider";
 import { formatTimestamp, safeINR } from "../lib/utils";
+import { indicatorDisplayState } from "../store/strategySnapshotMerge.js";
 
 function Metric({ label, value }: { label: string; value: React.ReactNode }) {
   return <div className="settings-summary-item"><small>{label}</small><strong className="tabular-nums">{value}</strong></div>;
@@ -18,10 +19,12 @@ export default function Indicators() {
         {active.map((strategy) => {
           const config = strategy.supertrend ?? {};
           const value = config.value ?? {};
-          const trend = Number(value.trend);
-          const latestSignal = value.buy_signal ? "BUY flip" : value.sell_signal ? "SELL flip" : "No flip on latest candle";
+          const calculation = indicatorDisplayState(config);
+          const latestSignal = !value || value.trend == null
+            ? "Unavailable"
+            : value.buy_signal ? "BUY flip" : value.sell_signal ? "SELL flip" : "No flip on latest candle";
           return <article className="indicator-card" key={strategy.strategy_id}>
-            <header><div><strong>{strategy.instrument}</strong><small>{strategy.strategy_id} · 15m</small></div><span className={`trend-pill ${trend === 1 ? "bullish" : trend === -1 ? "bearish" : "neutral"}`}>{trend === 1 ? "UPTREND" : trend === -1 ? "DOWNTREND" : "WARMING UP"}</span></header>
+            <header><div><strong>{strategy.instrument}</strong><small>{strategy.strategy_id} · 15m</small></div><span className={`trend-pill ${calculation.kind}`}>{calculation.label}</span></header>
             <div className="indicator-metrics">
               <Metric label="ATR" value={value.atr == null ? "—" : safeINR(value.atr)} />
               <Metric label="Upper band" value={value.upper == null ? "—" : safeINR(value.upper)} />
@@ -33,6 +36,7 @@ export default function Indicators() {
               <Metric label="Candles processed" value={config.bars ?? strategy.bars_processed ?? "—"} />
             </div>
             <footer><span>Latest completed candle: {config.last_candle_end_ts ? formatTimestamp(config.last_candle_end_ts) : "Timestamp not exposed"}</span><span>Signal state: {latestSignal}</span></footer>
+            {calculation.kind === "unavailable" && <div className="indicator-data-warning" role="status">{calculation.message}</div>}
           </article>;
         })}
       </div>}

@@ -2,10 +2,11 @@ import { useState, useCallback } from "react";
 import { useDataSelector } from "../store/DataProvider";
 import { safeINR } from "../lib/utils";
 import { api } from "../lib/api";
-import { quoteIsFresh, quoteStatus, tickAge } from "../lib/market";
+import { marketSessionClosed, marketStatusLabel, quoteIsFresh, quoteStatus, tickAge } from "../lib/market";
 
 export default function MarketData() {
   const marketData = useDataSelector<any>((s) => s.marketData);
+  const marketStatus = useDataSelector<string>((s) => s.marketStatus);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [detail, setDetail] = useState<any>(null);
   const [busy, setBusy] = useState(false);
@@ -37,10 +38,12 @@ export default function MarketData() {
 
   const instruments = marketData.instruments ?? {};
   const adapterStats = marketData.adapter_stats ?? {};
+  const marketClosed = marketSessionClosed(marketStatus);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-      <div className="lift animate-fade-in-up" style={{ display: "flex", gap: "20px", alignItems: "center", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", padding: "8px 12px", fontSize: "10px", color: "var(--text-muted)" }}>
+      <div className="lift animate-fade-in-up" style={{ display: "flex", flexWrap: "wrap", gap: "12px 20px", alignItems: "center", background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", padding: "10px 14px", fontSize: "12px", color: "var(--text-secondary)" }}>
+        <span>Session: <strong style={{ color: marketClosed ? "var(--text-secondary)" : "var(--green)" }}>{marketStatusLabel(marketStatus)}</strong></span>
         <span>Feed: <span style={{ color: marketData.ws_connected ? "var(--green)" : "var(--red)", fontWeight: 600 }}>{marketData.ws_connected ? "CONNECTED" : "DISCONNECTED"}</span></span>
         <span>Session ticks: <span className="tabular-nums" style={{ color: "var(--text-primary)" }}>{String(adapterStats.tick_count ?? 0)}</span></span>
         {adapterStats.error_count ? <span>Errors: <span style={{ color: "var(--red)" }}>{adapterStats.error_count}</span></span> : null}
@@ -48,6 +51,7 @@ export default function MarketData() {
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
         {Object.entries(instruments).map(([name, data]: [string, any]) => {
           const isLive = quoteIsFresh(data, Boolean(marketData.ws_connected));
+          const quoteLabel = quoteStatus(data, Boolean(marketData.ws_connected), !marketClosed);
           const isExpanded = expanded === name;
           return (
             <div key={name} className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", padding: "12px", cursor: "pointer" }} onClick={() => toggleDetail(name)}>
@@ -58,7 +62,7 @@ export default function MarketData() {
                     className={isLive ? "animate-pulse-dot" : ""}
                     style={{ width: "5px", height: "5px", borderRadius: "50%", background: isLive ? "var(--green)" : "var(--red)", ["--dot" as any]: isLive ? "var(--green)" : "var(--red)" }}
                   />
-                  <span style={{ fontSize: "9px", color: isLive ? "var(--green)" : "var(--amber)" }}>{quoteStatus(data, Boolean(marketData.ws_connected))}</span>
+                  <span style={{ fontSize: "11px", color: isLive ? "var(--green)" : marketClosed ? "var(--text-muted)" : "var(--amber)" }}>{quoteLabel}</span>
                 </div>
               </div>
               <div className="tabular-nums" style={{ fontSize: "28px", fontWeight: 700, color: "var(--text-primary)", marginBottom: "12px" }}>

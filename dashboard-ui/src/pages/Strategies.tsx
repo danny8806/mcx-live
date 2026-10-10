@@ -2,6 +2,7 @@ import { useCallback, useState } from "react";
 import { useDataSelector } from "../store/DataProvider";
 import { api } from "../lib/api";
 import { formatINR, pnlColor, statusDot } from "../lib/utils";
+import { indicatorDisplayState } from "../store/strategySnapshotMerge.js";
 
 export default function Strategies() {
   const strategies = useDataSelector<any[]>((state) => state.strategies);
@@ -36,10 +37,10 @@ export default function Strategies() {
         const livePosition = ["LONG", "SHORT"].includes(String(strategy.position_side ?? "").toUpperCase());
         const indicator = strategy.supertrend ?? {};
         const value = indicator.value ?? {};
-        const trend = Number(value.trend);
+        const calculation = indicatorDisplayState(indicator);
         return <article className="strategy-profile-card" key={strategy.strategy_id}>
           <header><div className="strategy-profile-title"><i style={{ background: statusDot(strategy.state) }}/><div><strong>{strategy.instrument}</strong><small>{strategy.strategy_id} · 15-minute chart</small></div></div><span className={`strategy-state ${livePosition ? "in-position" : "flat"}`}>{livePosition ? strategy.position_side : strategy.state ?? "FLAT"}</span></header>
-          <div className="strategy-status-row"><span className={`trend-pill ${trend === 1 ? "bullish" : trend === -1 ? "bearish" : "neutral"}`}>{trend === 1 ? "UPTREND" : trend === -1 ? "DOWNTREND" : "WARMING UP"}</span><span className={gate.live_gate === "ON" ? "text-good" : "text-warn"}>Gate {gate.live_gate ?? "UNKNOWN"}</span><span>{strategy.enabled ? "Runtime enabled" : "Runtime paused"}</span></div>
+          <div className="strategy-status-row"><span className={`trend-pill ${calculation.kind}`}>{calculation.label}</span><span className={gate.live_gate === "ON" ? "text-good" : "text-warn"}>Gate {gate.live_gate ?? "UNKNOWN"}</span><span>{strategy.enabled ? "Runtime enabled" : "Runtime paused"}</span></div>
           <div className="strategy-profile-metrics">
             <div><small>Quantity</small><b>{strategy.quantity ?? "—"}</b></div>
             <div><small>ATR</small><b>{value.atr == null ? "—" : formatINR(value.atr)}</b></div>
@@ -49,6 +50,7 @@ export default function Strategies() {
             <div><small>Realized P&amp;L</small><b style={{ color: pnlColor(strategy.realized_net) }}>{formatINR(strategy.realized_net)}</b></div>
           </div>
           <div className="strategy-parameters">ATR {indicator.atr_period ?? "—"} · Multiplier {indicator.multiplier ?? "—"} · {String(indicator.source ?? "—").toUpperCase()} · {indicator.atr_method === "sma_tr" ? "SMA True Range" : indicator.atr_method ?? "—"}</div>
+          {calculation.kind === "unavailable" && <div className="indicator-data-warning" role="status">{calculation.message}</div>}
           {errors[strategy.strategy_id] && <div role="alert" className="strategy-error">{errors[strategy.strategy_id]}</div>}
           <footer><span>{strategy.pending_entry?.metadata?.is_reversal_entry ? "Reversal entry waiting for broker flat confirmation" : livePosition ? "Position open · no separate strategy SL" : "Waiting for completed candle flip"}</span><button className="secondary-button" disabled={busy !== null || livePosition} title={livePosition ? "The open position remains under its existing lifecycle" : undefined} onClick={() => void toggle(strategy)}>{busy === strategy.strategy_id ? "Applying…" : strategy.enabled ? "Pause signals" : "Resume strategy"}</button></footer>
         </article>;
