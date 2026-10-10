@@ -36,7 +36,6 @@
   --topbar-height: 66px;
   --shadow-card: 0 2px 8px rgba(29, 46, 68, .045), 0 1px 2px rgba(29, 46, 68, .04);
 }
-
 * { box-sizing: border-box; }
 html, body, #root { width: 100%; height: 100%; margin: 0; }
 body { min-width: 360px; background: var(--bg-root); color: var(--text-primary); font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }

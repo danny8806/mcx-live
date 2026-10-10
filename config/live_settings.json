@@ -234,8 +234,6 @@
   "risk": {
     "max_open_positions_per_strategy": 1,
     "max_open_positions_total": 8,
-    "max_daily_loss": 999999999.0,
-    "max_drawdown_pct": 100.0,
     "margin_per_trade_pct": 6.5,
     "kill_switch_enabled": false,
     "reversal_position_limit": 1,

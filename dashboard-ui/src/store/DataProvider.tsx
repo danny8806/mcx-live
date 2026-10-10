@@ -4,6 +4,10 @@ import {
 } from "react";
 import { api } from "../lib/api";
 import { connectDashboardSocket } from "../lib/realtime";
+import {
+  mergeRestAndRuntimeStrategies,
+  mergeRuntimeStrategies,
+} from "./strategySnapshotMerge.js";
 
 export type DataState = "loading" | "live" | "stale" | "empty" | "error";
 type SnapshotKey = "overview" | "strategies" | "positions" | "orders" | "fills" | "trades" | "marketData";
@@ -180,7 +184,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
       const d = await api.strategies() as any;
       if (!Array.isArray(d?.strategies)) throw new Error(d?.error || "Invalid strategy payload");
       setSnapshotStatus((previous) => ({ ...previous, strategies: "live" }));
-      if (wsActiveRef.current && Date.now() - wsEngineAtRef.current < 10_000) return;
+      if (wsActiveRef.current && Date.now() - wsEngineAtRef.current < 10_000) {
+        safe(setStrategies)((current) =>
+          mergeRestAndRuntimeStrategies(d.strategies, current));
+        return;
+      }
       safe(setStrategies)(d.strategies);
     } catch (e: any) {
       if (!(wsActiveRef.current && Date.now() - wsEngineAtRef.current < 10_000))
@@ -378,7 +386,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
             if (s?.risk && (s.risk.daily_pnl !== undefined || s.risk.kill_switch_active !== undefined)) {
             }
             if (s?.strategies) {
-              const list = Object.entries(s.strategies).map(([name, snap]: [string, any]) => ({
+              const runtimeStrategies = Object.entries(s.strategies).map(([name, snap]: [string, any]) => ({
                 strategy_id: snap.strategy_id ?? name,
                 instrument: snap.instrument ?? "",
                 strategy_type: snap.strategy_type ?? "unknown",
@@ -404,7 +412,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
                 // the charges figure as soon as the WS connected.
                 realized_charges: snap.realized_charges ?? 0,
               }));
-              safe(setStrategies)(list);
+              safe(setStrategies)((previous) =>
+                mergeRuntimeStrategies(runtimeStrategies, previous));
               setSnapshotStatus((previous) => ({ ...previous, strategies: "live" }));
             }
             if (s?.positions) {

@@ -50,8 +50,8 @@ export default function Risk() {
       </div>
 
       <div className="split-grid-2">
-        {[{ title: "LIMITS", rows: [["Max Positions (Total)", `${risk.open_positions} / ${risk.max_positions_total}`], ["Max Positions (Per Strategy)", String(risk.max_positions_per_strategy)], ["Max Daily Loss", formatINR(risk.max_daily_loss)], ["Max Drawdown", `${risk.max_drawdown_pct}%`], ["Daily Loss Remaining", formatINR(risk.daily_loss_remaining)]] },
-          { title: "STATUS", rows: [["Open Positions", String(risk.open_positions)], ["Peak Equity", formatINR(risk.peak_equity)], ["Kill Switch", risk.kill_switch_active ? "ACTIVE" : "OFF"], ["Drawdown Limit", `${risk.max_drawdown_pct}%`]] }
+        {[{ title: "POSITION LIMITS", rows: [["Open Positions (Total)", `${risk.open_positions} / ${risk.max_positions_total}`], ["Max Positions (Per Strategy)", String(risk.max_positions_per_strategy)]] },
+          { title: "STATUS", rows: [["Open Positions", String(risk.open_positions)], ["Peak Equity", formatINR(risk.peak_equity)], ["Kill Switch", risk.kill_switch_active ? "ACTIVE" : "OFF"], ["Daily Loss / Drawdown Caps", "Not configured"]] }
         ].map(({ title, rows }) => (
           <div key={title} className="lift animate-fade-in-up" style={{ background: "var(--bg-panel)", border: "1px solid var(--border)", borderRadius: "8px", padding: "12px" }}>
             <div style={{ fontSize: "10px", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "8px" }}>{title}</div>

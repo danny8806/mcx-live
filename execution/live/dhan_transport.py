@@ -113,6 +113,7 @@ _STATUS_RANK = {"submitted": 0, "rejected": 1, "cancelled": 1, "expired": 1, "fi
 _MAX_CONFIRMED_ABSENCE_RETRIES = 2
 _MAX_CORRELATION_LOOKUP_RETRIES = 2
 _MAX_DEFINITIVE_REJECTION_RETRIES = 3
+MAX_LIVE_ORDER_QUANTITY = 100
 
 
 class DhanRestTransport(LiveBrokerClient):
@@ -237,7 +238,9 @@ class DhanRestTransport(LiveBrokerClient):
                            correlation_id: Optional[str] = None,
                            _confirmed_absence_retries: int = 0,
                            _rejection_retries: int = 0,
-                           _attempt_history: Optional[list] = None) -> dict:
+                           _attempt_history: Optional[list] = None,
+                           after_market_order: bool = False,
+                           amo_time: str = "OPEN") -> dict:
         if _attempt_history is None:
             _attempt_history = []
         side_u = str(side).upper()
@@ -257,6 +260,9 @@ class DhanRestTransport(LiveBrokerClient):
         quantity = int(quantity)
         if quantity <= 0:
             raise ValueError("quantity must be positive")
+        if quantity > MAX_LIVE_ORDER_QUANTITY:
+            raise ValueError(
+                f"quantity exceeds live safety cap ({MAX_LIVE_ORDER_QUANTITY})")
         # §9.4 — NaN/Inf values must never reach the Dhan payload (a NaN JSON
         # breaks the order request); also we never leak a nonzero price onto a
         # MARKET order or a nonzero trigger onto a non-SLM one.
@@ -280,12 +286,20 @@ class DhanRestTransport(LiveBrokerClient):
         if self._circuit_gate_enabled and order_type_u == "LIMIT":
             self._enforce_circuit_gate(instrument, float(price or 0.0),
                                        order_type_u)
-        # §9.4 — exact payload: exactly ONE of price/trigger is nonzero per
-        # order type; MARKET carries both zero (never leaks caller junk).
+        # Dhan's documented MARKET request encodes price/triggerPrice as empty
+        # strings. Sending numeric 0.0 is rejected by some order paths with
+        # DH-906 Invalid Price. Keep internal MARKET price values at zero, but
+        # serialize the wire payload exactly as the API example specifies.
         if order_type_u == "MARKET":
             limit_price, trigger = 0.0, 0.0
+            payload_price, payload_trigger = "", ""
         else:  # LIMIT
             limit_price, trigger = float(price), 0.0
+            payload_price, payload_trigger = limit_price, trigger
+        amo_time_u = str(amo_time or "OPEN").upper()
+        if after_market_order and amo_time_u not in (
+                "PRE_OPEN", "OPEN", "OPEN_30", "OPEN_60"):
+            raise ValueError(f"unsupported Dhan amoTime: {amo_time}")
         # §9.4 — the engine-owned correlation id; minted here only when the
         # caller didn't provide one (keeps signal->order->broker lineage).
         correlation_id = correlation_id or f"MCX-{uuid.uuid4().hex[:12]}"
@@ -299,11 +313,13 @@ class DhanRestTransport(LiveBrokerClient):
             "securityId": sec["security_id"],
             "quantity": quantity,
             "disclosedQuantity": 0,
-            "price": limit_price,
-            "triggerPrice": trigger,
-            "afterMarketOrder": False,
+            "price": payload_price,
+            "triggerPrice": payload_trigger,
+            "afterMarketOrder": bool(after_market_order),
             "correlationId": correlation_id,
         }
+        if after_market_order:
+            payload["amoTime"] = amo_time_u
         # §8/§55 — the POST is OUTSIDE the lock and fired with
         # retry_network=False: a network exception leaves the broker outcome
         # UNKNOWN, and re-POSTing could create a duplicate order.  Any failure
@@ -374,11 +390,12 @@ class DhanRestTransport(LiveBrokerClient):
                     rejected, side_u, quantity, instrument, order_type_u,
                     limit_price, trigger, correlation_id,
                     _confirmed_absence_retries, _rejection_retries,
-                    _attempt_history)
+                    _attempt_history, after_market_order, amo_time_u)
             return self._resolve_unknown_placement(
                 correlation_id, side_u, quantity, instrument,
                 order_type_u, limit_price, trigger, exc,
-                confirmed_absence_retries=_confirmed_absence_retries)
+                confirmed_absence_retries=_confirmed_absence_retries,
+                after_market_order=after_market_order, amo_time=amo_time_u)
         self._audit(_AUDIT_ACTION.get(order_type_u, "PLACE_ORDER"),
                     "/orders", "POST", payload, response=resp, http_status=200,
                     correlation_id=correlation_id)
@@ -387,7 +404,8 @@ class DhanRestTransport(LiveBrokerClient):
                 correlation_id, side_u, quantity, instrument,
                 order_type_u, limit_price, trigger,
                 RuntimeError(f"Dhan returned malformed placement body: {resp!r}"),
-                confirmed_absence_retries=_confirmed_absence_retries)
+                confirmed_absence_retries=_confirmed_absence_retries,
+                after_market_order=after_market_order, amo_time=amo_time_u)
         resp = _coerce_status_body(resp)
         broker_order_id = resp.get("orderId") or resp.get("order_id")
         raw_status = resp.get("orderStatus") or resp.get("order_status") or "PENDING"
@@ -426,7 +444,7 @@ class DhanRestTransport(LiveBrokerClient):
                     terminal, side_u, quantity, instrument, order_type_u,
                     limit_price, trigger, correlation_id,
                     _confirmed_absence_retries, _rejection_retries,
-                    _attempt_history)
+                    _attempt_history, after_market_order, amo_time_u)
             return self._placement_attempt_metadata(
                 terminal, _rejection_retries + 1, _rejection_retries,
                 _attempt_history)
@@ -438,7 +456,8 @@ class DhanRestTransport(LiveBrokerClient):
                 correlation_id, side_u, quantity, instrument,
                 order_type_u, limit_price, trigger,
                 RuntimeError(f"Dhan placement response has no order id: {resp}"),
-                confirmed_absence_retries=_confirmed_absence_retries)
+                confirmed_absence_retries=_confirmed_absence_retries,
+                after_market_order=after_market_order, amo_time=amo_time_u)
         with self._lock:
             existing = self._orders.get(str(broker_order_id))
             if existing is None:
@@ -471,7 +490,7 @@ class DhanRestTransport(LiveBrokerClient):
                     prior, side_u, quantity, instrument, order_type_u,
                     limit_price, trigger, correlation_id,
                     _confirmed_absence_retries, _rejection_retries,
-                    _attempt_history)
+                    _attempt_history, after_market_order, amo_time_u)
             return self._placement_attempt_metadata(
                 prior, _rejection_retries + 1, _rejection_retries,
                 _attempt_history)
@@ -486,7 +505,7 @@ class DhanRestTransport(LiveBrokerClient):
                     terminal, side_u, quantity, instrument, order_type_u,
                     limit_price, trigger, correlation_id,
                     _confirmed_absence_retries, _rejection_retries,
-                    _attempt_history)
+                    _attempt_history, after_market_order, amo_time_u)
             return self._placement_attempt_metadata(
                 terminal, _rejection_retries + 1, _rejection_retries,
                 _attempt_history)
@@ -508,7 +527,8 @@ class DhanRestTransport(LiveBrokerClient):
             instrument: str, order_type_u: str, limit_price: float,
             trigger: float, correlation_id: str,
             confirmed_absence_retries: int, rejection_retries: int,
-            history: list) -> dict:
+            history: list, after_market_order: bool = False,
+            amo_time: str = "OPEN") -> dict:
         """Retry only a broker-confirmed rejection, at most three times.
 
         Each retry has a distinct Dhan correlation id and re-enters the full
@@ -521,7 +541,13 @@ class DhanRestTransport(LiveBrokerClient):
                 rejected, rejection_retries + 1, rejection_retries, history)
         retry_number = rejection_retries + 1
         suffix = f"-R{retry_number}"
-        next_correlation_id = f"{str(correlation_id)[:30-len(suffix)]}{suffix}"
+        # Keep every retry attached directly to the original logical request.
+        # Deriving the next id from the prior retry produced chained values
+        # such as ``CID-R1-R2`` and made broker reconciliation harder to read.
+        root_correlation_id = (history[0].get("correlation_id")
+                               if history else correlation_id)
+        next_correlation_id = (
+            f"{str(root_correlation_id)[:30-len(suffix)]}{suffix}")
         return self.place_market_order(
             side=side_u, quantity=quantity, instrument=instrument,
             order_type=order_type_u,
@@ -531,12 +557,16 @@ class DhanRestTransport(LiveBrokerClient):
             _confirmed_absence_retries=confirmed_absence_retries,
             _rejection_retries=retry_number,
             _attempt_history=history,
+            after_market_order=after_market_order,
+            amo_time=amo_time,
         )
 
     def _resolve_unknown_placement(self, correlation_id, side_u, quantity,
                                    instrument, order_type_u, limit_price,
                                    trigger, origin: BaseException,
-                                   confirmed_absence_retries: int = 0) -> dict:
+                                   confirmed_absence_retries: int = 0,
+                                   after_market_order: bool = False,
+                                   amo_time: str = "OPEN") -> dict:
         """Recover a placement whose broker outcome is unknown.
 
         Called when the ``POST /orders`` network response was lost.  The order
@@ -646,7 +676,8 @@ class DhanRestTransport(LiveBrokerClient):
                 side=side_u, quantity=quantity, instrument=instrument,
                 order_type=order_type_u, price=limit_price,
                 trigger_price=trigger, correlation_id=correlation_id,
-                _confirmed_absence_retries=confirmed_absence_retries + 1)
+                _confirmed_absence_retries=confirmed_absence_retries + 1,
+                after_market_order=after_market_order, amo_time=amo_time)
         raise RuntimeError(
             f"place_order not delivered after "
             f"{_MAX_CONFIRMED_ABSENCE_RETRIES + 1} attempts; Dhan confirmed no "

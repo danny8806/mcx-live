@@ -4,6 +4,12 @@ SKIP_DIRS = {
     ".git", "__pycache__", ".pytest_cache", "node_modules", "reports",
     "replay_output", "tests", "tools", "scripts", "data/db", "live/data/db",
     "dashboard-ui/dist", ".vscode", ".idea", "logs", "nginx/certs",
+    # Local backtests and generated reports are not runtime inputs. Excluding
+    # them keeps deployment sync lean and prevents datasets/reports reaching
+    # the live host.
+    "backtest_results", "backtest_results_pine_15m", "backtest_results_repeat",
+    "backtest_results_supertrend_15m", "backtest_sniper_720m",
+    "backtest_tv_15m_strategies", "output", "outputs", "final_reports",
 }
 SKIP_ROOT_PREFIXES = ("p6_", "live_verify", "vps_", "verify_", "check_")
 SKIP_ROOT_NAMES = {"deploy_restart.py"}

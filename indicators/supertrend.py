@@ -14,6 +14,8 @@ from typing import Optional
 _SOURCES = {"open", "high", "low", "close", "hl2", "hlc3", "ohlc4"}
 _ATR_METHODS = {"sma_tr", "wilder"}
 _FIRST_TR = {"high_low", "na"}
+MAX_ATR_PERIOD = 500
+MAX_HISTORY = 10_000
 
 
 @dataclass(frozen=True)
@@ -34,7 +36,9 @@ class SuperTrend:
     def __init__(self, atr_period: int = 10, multiplier: float = 3.0,
                  source: str = "hl2", atr_method: str = "sma_tr",
                  first_tr: str = "high_low", max_history: int = 10000):
-        self.max_history = max(atr_period * 10, int(max_history))
+        self._requested_max_history = max(3, int(max_history))
+        self.max_history = min(MAX_HISTORY, self._requested_max_history)
+        self._history_truncated = False
         self._bars: list[tuple[float, float, float, float, float]] = []
         self.configure(atr_period, multiplier, source, atr_method,
                        first_tr=first_tr, replay=False)
@@ -47,8 +51,8 @@ class SuperTrend:
         src = str(source).lower()
         method = str(atr_method).lower()
         initial_tr = str(first_tr or getattr(self, "first_tr", "high_low")).lower()
-        if period < 1:
-            raise ValueError("atr_period must be at least 1")
+        if period < 1 or period > MAX_ATR_PERIOD:
+            raise ValueError(f"atr_period must be between 1 and {MAX_ATR_PERIOD}")
         if not isfinite(mult) or mult <= 0:
             raise ValueError("multiplier must be a positive finite number")
         if src not in _SOURCES:
@@ -62,6 +66,8 @@ class SuperTrend:
         self.source_name = src
         self.atr_method = method
         self.first_tr = initial_tr
+        self.max_history = min(MAX_HISTORY, max(period + 2,
+                                                self._requested_max_history))
         self._values: list[SuperTrendValue] = []
         self._recompute() if replay and self._bars else None
 
@@ -84,16 +90,21 @@ class SuperTrend:
         ts = float(end_ts if end_ts is not None else len(self._bars))
         if self._bars and ts == self._bars[-1][0]:
             self._bars[-1] = (ts, *values)
+            # Recalculate the corrected tail from the retained prior state.
+            # Replaying the whole (possibly truncated) buffer here would reset
+            # trend state and make a REST correction produce a different line.
+            self._values.pop()
+            self._append_value(len(self._bars) - 1)
         elif self._bars and ts < self._bars[-1][0]:
             raise ValueError("SuperTrend candles must arrive in timestamp order")
         else:
             self._bars.append((ts, *values))
-        if len(self._bars) == len(self._values) + 1:
             self._append_value(len(self._bars) - 1)
-        else:
-            # A duplicate candle can be corrected by REST. Recalculate only
-            # this uncommon correction path; normal 15m updates are O(period).
-            self._recompute()
+            excess = len(self._bars) - self.max_history
+            if excess > 0:
+                del self._bars[:excess]
+                del self._values[:excess]
+                self._history_truncated = True
         return self._values[-1]
 
     def _source(self, o: float, h: float, l: float, c: float) -> float:
@@ -169,6 +180,8 @@ class SuperTrend:
             "multiplier": self.multiplier, "source": self.source_name,
             "atr_method": self.atr_method, "first_tr": self.first_tr,
             "bars": len(self._bars),
+            "max_history": self.max_history,
+            "history_truncated": self._history_truncated,
             "last_candle_end_ts": self._bars[-1][0] if self._bars else None,
             "value": current,
         }

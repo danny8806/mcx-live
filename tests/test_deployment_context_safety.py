@@ -15,6 +15,21 @@ def test_vps_diagnostics_never_sync_to_deployment_host_or_image():
     assert not should_skip("config/live_settings.json")
 
 
+def test_generated_backtests_and_reports_never_sync_to_vps():
+    for path in (
+        "backtest_results/summary.json",
+        "backtest_results_pine_15m/silverm_trades.csv",
+        "backtest_results_repeat/goldm_events.csv",
+        "backtest_results_supertrend_15m/summary.json",
+        "backtest_sniper_720m/results/silverm_summary.json",
+        "backtest_tv_15m_strategies/results/report.pdf",
+        "output/tmp.json",
+        "outputs/result.csv",
+        "final_reports/report.pdf",
+    ):
+        assert should_skip(path), f"generated artifact entered deploy sync: {path}"
+
+
 def test_dockerignore_excludes_root_diagnostic_artifacts():
     root = Path(__file__).resolve().parents[1]
     rules = set((root / ".dockerignore").read_text().splitlines())

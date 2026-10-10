@@ -29,6 +29,8 @@ _LIVE_GATES = {"ON", "OFF", "CLOSE_ONLY", "EMERGENCY_STOP", "LOCKED"}
 _SUPERTREND_FIELDS = {"atr_period", "multiplier", "source", "atr_method"}
 _SUPERTREND_SOURCES = {"open", "high", "low", "close", "hl2", "hlc3", "ohlc4"}
 _SUPERTREND_ATR_METHODS = {"sma_tr", "wilder"}
+_MAX_LIVE_ORDER_QUANTITY = 100
+_MAX_SUPERTREND_ATR_PERIOD = 500
 
 
 def init(engine, event_bus, *, config_path=None, resolved_config_path=None,
@@ -148,9 +150,10 @@ def _validate_update(body: dict) -> dict:
         params = dict(params)
         if "atr_period" in params:
             value = params["atr_period"]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < 1 or value > _MAX_SUPERTREND_ATR_PERIOD):
                 raise HTTPException(status_code=422,
-                                    detail="SuperTrend ATR period must be a positive integer")
+                                    detail=f"SuperTrend ATR period must be between 1 and {_MAX_SUPERTREND_ATR_PERIOD}")
         if "multiplier" in params:
             value = params["multiplier"]
             if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -170,9 +173,10 @@ def _validate_update(body: dict) -> dict:
         update["supertrend"] = params
     if "quantity" in update:
         value = update["quantity"]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or value < 1 or value > _MAX_LIVE_ORDER_QUANTITY):
             raise HTTPException(status_code=422,
-                                detail="quantity must be a positive whole number")
+                                detail=f"quantity must be a whole number between 1 and {_MAX_LIVE_ORDER_QUANTITY}")
     if "live_gate" in update:
         update["live_gate"] = str(update["live_gate"]).upper()
         if update["live_gate"] not in _LIVE_GATES:

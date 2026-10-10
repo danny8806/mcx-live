@@ -31,13 +31,14 @@ def _get_risk_sync():
             "open_positions": len(open_pos),
             "max_positions_per_strategy": risk_config.get("max_open_positions_per_strategy", 1),
             "max_positions_total": risk_config.get("max_positions_total", 8),
-            "max_daily_loss": risk_config.get("max_daily_loss", 50000),
-            "max_drawdown_pct": risk_config.get("max_drawdown_pct", 5),
+            "max_daily_loss": risk_config.get("max_daily_loss"),
+            "max_drawdown_pct": risk_config.get("max_drawdown_pct"),
             "equity": equity,
             "used_margin": used_margin,
             "available_margin": equity - used_margin,
             "margin_utilization": (used_margin / equity * 100) if equity > 0 else 0,
-            "daily_loss_remaining": risk_config.get("max_daily_loss", 50000) + risk.get("daily_pnl", 0),
+            "daily_loss_remaining": (risk_config["max_daily_loss"] + risk.get("daily_pnl", 0)
+                                     if risk_config.get("max_daily_loss") is not None else None),
             "risk_config": risk_config,
             "timestamp": time.time(),
         }

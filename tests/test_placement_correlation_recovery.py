@@ -423,7 +423,50 @@ def test_market_fallback_submission_uses_same_safe_delivery_retry():
     assert len(http.posts) == 2
     assert len(http.gets) == 3
     assert all(payload["orderType"] == "MARKET" for _, payload in http.posts)
-    assert all(payload["price"] == payload["triggerPrice"] == 0.0
+    assert all(payload["price"] == payload["triggerPrice"] == ""
+               for _, payload in http.posts)
+
+
+def test_market_amo_uses_documented_empty_price_fields():
+    http = Http()
+    result = _transport(http).place_market_order(
+        side="BUY", quantity=1, instrument="GOLDM", order_type="MARKET",
+        correlation_id="CORR-AMO", after_market_order=True, amo_time="OPEN")
+
+    assert result["broker_order_id"] == "B1"
+    payload = http.posts[0][1]
+    assert payload["orderType"] == "MARKET"
+    assert payload["price"] == ""
+    assert payload["triggerPrice"] == ""
+    assert payload["afterMarketOrder"] is True
+    assert payload["amoTime"] == "OPEN"
+
+
+def test_market_amo_options_survive_confirmed_absence_retry():
+    class RetryHttp(Http):
+        def __init__(self):
+            super().__init__(lookup_exc=DhanNotFound("no order"))
+            self._post_count = 0
+
+        def _post(self, path, payload, retry_network=True):
+            self.posts.append((path, dict(payload)))
+            self._post_count += 1
+            if self._post_count == 1:
+                raise TimeoutError("AMO response lost")
+            return {"orderId": "B-AMO-RETRY", "orderStatus": "PENDING"}
+
+    http = RetryHttp()
+    result = _transport(http).place_market_order(
+        side="BUY", quantity=1, instrument="GOLDM", order_type="MARKET",
+        correlation_id="CORR-AMO-RETRY", after_market_order=True,
+        amo_time="OPEN_30")
+
+    assert result["broker_order_id"] == "B-AMO-RETRY"
+    assert len(http.posts) == 2
+    assert len(http.gets) == 3
+    assert all(payload["afterMarketOrder"] is True
+               for _, payload in http.posts)
+    assert all(payload["amoTime"] == "OPEN_30"
                for _, payload in http.posts)
 
 
