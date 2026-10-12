@@ -43,6 +43,13 @@ class NativeCandleRouter:
         # instruments config: {"GOLDM": {"security_id": "569003"}, ...}
         self._instruments = instruments or {}
         self._lock = threading.RLock()
+        # Acceptance and callback execution happen on different threads in
+        # some recovery/live overlap paths. Keep a sequence so an accepted
+        # older candle cannot be overtaken by a newer candle after this lock
+        # is released and before the distributor is called.
+        self._delivery_condition = threading.Condition(self._lock)
+        self._accepted_sequence = 0
+        self._next_delivery_sequence = 0
         # (security_id, timeframe) -> last accepted candle_end_ts
         self._last_end_ts: dict[tuple, float] = {}
         self._published_count: int = 0
@@ -89,7 +96,7 @@ class NativeCandleRouter:
         stream_key = (identity[0], identity[1])
         end_ts = identity[2]
 
-        with self._lock:
+        with self._delivery_condition:
             last = self._last_end_ts.get(stream_key)
 
             # §7 — duplicate candles are deduplicated (published once).
@@ -109,9 +116,20 @@ class NativeCandleRouter:
 
             self._last_end_ts[stream_key] = end_ts
             self._published_count += 1
+            sequence = self._accepted_sequence
+            self._accepted_sequence += 1
+            while sequence != self._next_delivery_sequence:
+                self._delivery_condition.wait()
 
-        if self._distributor is not None:
-            self._distributor(bar)
+        try:
+            if self._distributor is not None:
+                self._distributor(bar)
+        finally:
+            # Even a failing downstream callback must release the next
+            # accepted bar; the caller still receives the original error.
+            with self._delivery_condition:
+                self._next_delivery_sequence += 1
+                self._delivery_condition.notify_all()
         return True
 
     def on_candle_closed(self, bar: Bar) -> bool:

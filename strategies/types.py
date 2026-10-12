@@ -91,15 +91,14 @@ class SignalExecutionContext:
 
     Frozen at signal creation so execution and reconciliation always read the
     signal's OWN candle/indicator/position state — never mutable strategy state
-    that may have advanced.  Freezing is purely additive: no execution path
-    reads the context yet, so attaching it never changes behavior.  Persisting
-    the context across restarts lands with the persistence convergence phase.
+    that may have advanced. Persistence stores this snapshot with the signal.
     """
     timestamp: float = 0.0
     open: Optional[float] = None
     high: Optional[float] = None
     low: Optional[float] = None
     close: Optional[float] = None
+    volume: Optional[float] = None
     indicator_values: dict[str, Any] = field(default_factory=dict)
     position_side: Optional[str] = None   # held side when the signal was created
     position_stop: Optional[float] = None # live stop when the signal was created
@@ -113,6 +112,7 @@ def freeze_signal_context(
     high: Optional[float] = None,
     low: Optional[float] = None,
     close: Optional[float] = None,
+    volume: Optional[float] = None,
     indicator_values: Optional[dict[str, Any]] = None,
     position_side: Optional[str] = None,
     position_stop: Optional[float] = None,
@@ -131,6 +131,7 @@ def freeze_signal_context(
         high = bar.high if high is None else high
         low = bar.low if low is None else low
         close = bar.close if close is None else close
+        volume = getattr(bar, "volume", None) if volume is None else volume
         open_ = getattr(bar, "open", None) if open_ is None else open_
         if timestamp is None:
             timestamp = getattr(bar, "start_ts", 0.0)
@@ -142,6 +143,7 @@ def freeze_signal_context(
         high=float(high) if high is not None else None,
         low=float(low) if low is not None else None,
         close=float(close) if close is not None else None,
+        volume=float(volume) if volume is not None else None,
         indicator_values=dict(indicator_values or {}),
         position_side=position_side,
         position_stop=float(position_stop) if position_stop is not None else None,

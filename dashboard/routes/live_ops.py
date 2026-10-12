@@ -649,10 +649,41 @@ def _get_signals_sync(limit: int = 30):
             "SELECT signal_id, strategy_id, instrument, security_id, timeframe, "
             "side, signal_type, signal_timestamp, candle_timestamp, open, high, "
             "low, close, volume, trigger_price, quantity, signal_reason, "
-            "execution_mode, created_at FROM signals WHERE execution_mode='LIVE'"
+            "signal_metadata, indicator_data, execution_mode, created_at "
+            "FROM signals WHERE execution_mode='LIVE'"
             + strategy_clause + " ORDER BY id DESC LIMIT ?",
             params,
         )
+    strategies = (getattr(_live_env(), "strategies", {}) or {})
+    for row in rows:
+        metadata = json_loads(row.pop("signal_metadata", None)) or {}
+        indicators = json_loads(row.pop("indicator_data", None)) or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if not isinstance(indicators, dict):
+            indicators = {}
+        strategy = strategies.get(row.get("strategy_id"))
+        candle_start = metadata.get("signal_candle_start")
+        if not row.get("signal_timestamp") and candle_start is not None:
+            row["signal_timestamp"] = candle_start
+        if row.get("candle_timestamp") is None and candle_start is not None:
+            row["candle_timestamp"] = candle_start
+        if row.get("security_id") is None:
+            row["security_id"] = getattr(strategy, "security_id", None)
+        if row.get("timeframe") is None:
+            row["timeframe"] = (metadata.get("strategy_timeframe")
+                                 or getattr(strategy, "signal_timeframe", None))
+        for field, key in (("open", "signal_candle_open"),
+                           ("high", "signal_candle_high"),
+                           ("low", "signal_candle_low"),
+                           ("close", "signal_candle_close"),
+                           ("volume", "signal_candle_volume")):
+            if row.get(field) is None and metadata.get(key) is not None:
+                row[field] = metadata[key]
+        row["signal_source"] = (metadata.get("signal_source")
+                                or metadata.get("trigger_source"))
+        row["strategy_type"] = metadata.get("strategy_type")
+        row["indicator_values"] = indicators
     last_ts = None
     for r in rows:
         ts = _epoch(r.get("signal_timestamp"))

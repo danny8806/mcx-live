@@ -29,6 +29,8 @@ class PersistenceFlowMixin:
         # every candle column NULL and the blobs absent.
         ctx = getattr(signal, "context", None)
         metadata = getattr(signal, "metadata", None) or {}
+        strategy = (getattr(env, "strategies", {}) or {}).get(
+            getattr(signal, "strategy_id", ""))
         # Persist metadata needed to reconstruct the current signal and any
         # broker-confirmed reversal handoff.
         # Nested Signal objects are represented by their ids; their full rows
@@ -56,17 +58,30 @@ class PersistenceFlowMixin:
                 key: value for key, value in metadata.items()
                 if key.startswith("supertrend_")
             }
+        candle_timestamp = (ctx.timestamp if ctx is not None
+                            else metadata.get("signal_candle_start"))
+        signal_timestamp = (ctx.timestamp if ctx is not None and ctx.timestamp
+                            else signal.timestamp or candle_timestamp)
         env.persistence.save_signal({
             "signal_id": signal.signal_id, "strategy_id": signal.strategy_id,
             "instrument": signal.instrument, "side": signal.signal_type.value,
-            "signal_type": signal_type, "timestamp": signal.timestamp,
+            "security_id": getattr(strategy, "security_id", None),
+            "timeframe": (metadata.get("strategy_timeframe")
+                          or getattr(strategy, "signal_timeframe", None)),
+            "signal_type": signal_type, "timestamp": signal_timestamp,
             "trigger_price": signal.trigger_price, "stop_price": None,
             "quantity": signal.quantity,
-            "candle_timestamp": ctx.timestamp if ctx is not None else None,
-            "open": ctx.open if ctx is not None else None,
-            "high": ctx.high if ctx is not None else None,
-            "low": ctx.low if ctx is not None else None,
-            "close": ctx.close if ctx is not None else None,
+            "candle_timestamp": candle_timestamp,
+            "open": (ctx.open if ctx is not None else
+                     metadata.get("signal_candle_open")),
+            "high": (ctx.high if ctx is not None else
+                     metadata.get("signal_candle_high")),
+            "low": (ctx.low if ctx is not None else
+                    metadata.get("signal_candle_low")),
+            "close": (ctx.close if ctx is not None else
+                      metadata.get("signal_candle_close")),
+            "volume": (ctx.volume if ctx is not None else
+                       metadata.get("signal_candle_volume")),
             "signal_reason": metadata.get("reason") or metadata.get("trigger_reason"),
             "candle_data": candle_blob,
             "indicator_data": indicator_blob,

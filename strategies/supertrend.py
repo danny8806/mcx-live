@@ -7,7 +7,7 @@ from typing import Optional
 from core.timeframe_engine import Bar
 from indicators.supertrend import SuperTrend
 from strategies.base import StrategyBase
-from strategies.types import Signal, SignalType, StrategyState
+from strategies.types import Signal, SignalType, StrategyState, freeze_signal_context
 
 
 class SuperTrendStrategyInstance(StrategyBase):
@@ -79,6 +79,7 @@ class SuperTrendStrategyInstance(StrategyBase):
             self.state = StrategyState.ENTRY_TRIGGERED
             signal.metadata.update(self._supertrend_metadata(
                 value, bar, calculation_ms))
+            self._freeze_signal_inputs(signal, value, bar)
             return signal
 
         if self.position_side == side:
@@ -115,7 +116,24 @@ class SuperTrendStrategyInstance(StrategyBase):
             self.pending_exit_trigger = None
             signal.metadata.update(self._supertrend_metadata(
                 value, bar, calculation_ms))
+            self._freeze_signal_inputs(signal, value, bar)
+            if paired is not None:
+                paired.metadata.update(self._supertrend_metadata(
+                    value, bar, calculation_ms))
+                self._freeze_signal_inputs(paired, value, bar)
         return signal
+
+    @staticmethod
+    def _freeze_signal_inputs(signal, value, bar) -> None:
+        """Keep the exact completed candle and indicator inputs with the signal."""
+        indicator_values = {
+            "supertrend_atr": value.atr,
+            "supertrend_upper": value.upper,
+            "supertrend_lower": value.lower,
+            "supertrend_trend": value.trend,
+        }
+        freeze_signal_context(
+            signal, bar=bar, indicator_values=indicator_values)
 
     @staticmethod
     def _supertrend_metadata(value, bar, calculation_ms: float = 0.0) -> dict:
@@ -131,6 +149,7 @@ class SuperTrendStrategyInstance(StrategyBase):
             "signal_candle_high": bar.high,
             "signal_candle_low": bar.low,
             "signal_candle_close": bar.close,
+            "signal_candle_volume": bar.volume,
             "signal_source": "completed_native_15m_candle",
             "indicator_calculation_ms": round(float(calculation_ms), 3),
         }

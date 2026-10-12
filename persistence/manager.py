@@ -554,15 +554,18 @@ class PersistenceManager:
         with self._tx() as conn:
             conn.execute("""
                 INSERT INTO signals (
-                    signal_id, strategy_id, instrument, side, signal_type,
+                    signal_id, strategy_id, instrument, security_id, timeframe,
+                    side, signal_type,
                     signal_timestamp, trigger_price, stop_price, quantity,
                     candle_timestamp, open, high, low, close, volume,
                     signal_reason,
                     candle_data, indicator_data, signal_metadata, execution_mode
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(signal_id) DO UPDATE SET
                     strategy_id=excluded.strategy_id,
                     instrument=excluded.instrument,
+                    security_id=COALESCE(excluded.security_id, signals.security_id),
+                    timeframe=COALESCE(excluded.timeframe, signals.timeframe),
                     side=COALESCE(excluded.side, signals.side),
                     signal_type=COALESCE(excluded.signal_type, signals.signal_type),
                     signal_timestamp=COALESCE(excluded.signal_timestamp,
@@ -590,6 +593,8 @@ class PersistenceManager:
                 signal_data.get("signal_id"),
                 signal_data.get("strategy_id"),
                 signal_data.get("instrument"),
+                signal_data.get("security_id"),
+                signal_data.get("timeframe"),
                 signal_data.get("side"),
                 signal_data.get("signal_type"),
                 signal_data.get("timestamp"),
