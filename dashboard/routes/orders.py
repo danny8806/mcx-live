@@ -1,6 +1,7 @@
 """Orders routes."""
 from __future__ import annotations
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -8,6 +9,18 @@ from fastapi import APIRouter
 router = APIRouter()
 _engine = None
 _bus = None
+
+
+def _attempt_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError):
+            return []
+    return []
 
 def init(engine, event_bus):
     global _engine, _bus
@@ -63,7 +76,12 @@ def _db_order_rows() -> list[dict]:
                 "average_fill_price": row.get("average_fill_price"),
                 "created_at": _ts_to_epoch(row.get("created_at")),
                 "updated_at": _ts_to_epoch(row.get("updated_at")),
-                "reason": None,
+                "reason": row.get("reason"),
+                "submission_outcome": row.get("submission_outcome"),
+                "submission_attempt_count": row.get("submission_attempt_count", 0),
+                "rejection_retry_count": row.get("rejection_retry_count", 0),
+                "submission_attempts": _attempt_list(row.get("submission_attempts")),
+                "correlation_id": row.get("correlation_id"),
             })
         return out
     except Exception:
@@ -121,6 +139,13 @@ def _list_orders_sync(strategy: Optional[str] = None, instrument: Optional[str] 
                 "created_at": order.created_at,
                 "updated_at": order.updated_at,
                 "reason": order.reason,
+                "broker_order_id": getattr(order, "_broker_order_id", None),
+                "order_role": getattr(order, "order_role", None),
+                "correlation_id": getattr(order, "correlation_id", None),
+                "submission_outcome": getattr(order, "submission_outcome", "NOT_SENT"),
+                "submission_attempt_count": getattr(order, "submission_attempt_count", 0),
+                "rejection_retry_count": getattr(order, "rejection_retry_count", 0),
+                "submission_attempts": getattr(order, "submission_attempts", []),
             }
             if strategy and order.strategy_id != strategy:
                 continue
@@ -134,7 +159,10 @@ def _list_orders_sync(strategy: Optional[str] = None, instrument: Optional[str] 
                 # Runtime status is authoritative; SQLite retains the price
                 # plan and Dhan identity that a restored memory order can lack.
                 for field in ("price", "planned_entry_price", "trigger_price",
-                              "broker_order_id", "order_role"):
+                              "broker_order_id", "order_role", "reason",
+                              "submission_outcome", "submission_attempt_count",
+                              "rejection_retry_count", "submission_attempts",
+                              "correlation_id"):
                     if existing.get(field) is None:
                         existing[field] = row.get(field)
                 continue
@@ -177,6 +205,13 @@ def _get_order_sync(order_id: str):
             "created_at": order.created_at,
             "updated_at": order.updated_at,
             "reason": order.reason,
+            "broker_order_id": getattr(order, "_broker_order_id", None),
+            "order_role": getattr(order, "order_role", None),
+            "correlation_id": getattr(order, "correlation_id", None),
+            "submission_outcome": getattr(order, "submission_outcome", "NOT_SENT"),
+            "submission_attempt_count": getattr(order, "submission_attempt_count", 0),
+            "rejection_retry_count": getattr(order, "rejection_retry_count", 0),
+            "submission_attempts": getattr(order, "submission_attempts", []),
         }
     except Exception as e:
         return {"error": str(e)}

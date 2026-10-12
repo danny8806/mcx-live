@@ -13,6 +13,9 @@ def test_missing_snapshot_order_is_hydrated_from_canonical_db_row():
         "quantity": 1, "order_type": "LIMIT", "price": 228000.0,
         "trigger_price": 228000.0, "state": "submitted",
         "filled_quantity": 0, "average_fill_price": 0.0,
+        "reason": None, "submission_outcome": "BROKER_RESPONSE_RECEIVED",
+        "submission_attempt_count": 2, "rejection_retry_count": 1,
+        "submission_attempts": '[{"attempt":1},{"attempt":2}]',
         "signal_id": "REV-ENTRY-SIGNAL", "trade_id": "TRADE-NEW",
         "broker_order_id": "DHAN-ORDER-1", "order_role": "REVERSAL_ENTRY",
         "reversal_parent_signal_id": "REV-EXIT-SIGNAL",
@@ -27,6 +30,10 @@ def test_missing_snapshot_order_is_hydrated_from_canonical_db_row():
     assert order.state.value == "submitted"
     assert order._broker_order_id == "DHAN-ORDER-1"
     assert order.reversal_parent_signal_id == "REV-EXIT-SIGNAL"
+    assert order.submission_outcome == "BROKER_RESPONSE_RECEIVED"
+    assert order.submission_attempt_count == 2
+    assert order.rejection_retry_count == 1
+    assert order.submission_attempts == [{"attempt": 1}, {"attempt": 2}]
 
 
 def test_existing_snapshot_order_wins_over_database_copy():
@@ -47,3 +54,28 @@ def test_existing_snapshot_order_wins_over_database_copy():
 
     assert count == 0
     assert engine.get_order("LIVE-1").state == OrderState.FILLED
+
+
+def test_order_submission_evidence_survives_snapshot_restore():
+    engine = LiveExecutionEngine.__new__(LiveExecutionEngine)
+    engine._orders = {}
+    engine._fills = []
+    engine._current_prices = {}
+    engine._price_lock = __import__("threading").Lock()
+    engine._lock = __import__("threading").RLock()
+    engine._broker_fill_map = {}
+    engine.broker = type("Broker", (), {"update_price": lambda *_args: None})()
+
+    engine.restore({"orders": [{
+        "order_id": "LIVE-1", "strategy_id": "gold_02",
+        "instrument": "GOLDM", "side": "SELL", "quantity": 1,
+        "order_type": "MARKET", "state": "rejected",
+        "submission_outcome": "NOT_SENT", "submission_attempt_count": 0,
+        "rejection_retry_count": 0, "submission_attempts": [],
+        "reason": "LIVE_GATE_CLOSED",
+    }]})
+
+    order = engine.get_order("LIVE-1")
+    assert order.submission_outcome == "NOT_SENT"
+    assert order.submission_attempt_count == 0
+    assert order.reason == "LIVE_GATE_CLOSED"

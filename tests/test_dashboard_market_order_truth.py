@@ -42,7 +42,9 @@ def test_order_view_keeps_runtime_status_and_hydrates_durable_price(monkeypatch)
         side="BUY", quantity=1, order_type="LIMIT", price=None,
         state=SimpleNamespace(value="filled"), filled_quantity=1,
         average_fill_price=146100.0, created_at=1.0, updated_at=2.0,
-        reason=None,
+        reason="LIVE_GATE_CLOSED", submission_outcome="NOT_SENT",
+        submission_attempt_count=0, rejection_retry_count=0,
+        submission_attempts=[], correlation_id="MCX-test",
     )
     engine = SimpleNamespace(execution_engine=SimpleNamespace(_orders={"LOCAL-1": runtime}))
     monkeypatch.setattr(orders, "_engine", engine)
@@ -50,6 +52,9 @@ def test_order_view_keeps_runtime_status_and_hydrates_durable_price(monkeypatch)
         "order_id": "LOCAL-1", "price": 146101.0,
         "planned_entry_price": 146101.0, "trigger_price": 146099.0,
         "broker_order_id": "DHAN-1", "order_role": "ENTRY", "state": "submitted",
+        "reason": None, "submission_outcome": "BROKER_RESPONSE_RECEIVED",
+        "submission_attempt_count": 1, "rejection_retry_count": 0,
+        "submission_attempts": [], "correlation_id": "MCX-test",
     }])
 
     payload = orders._list_orders_sync()
@@ -59,3 +64,6 @@ def test_order_view_keeps_runtime_status_and_hydrates_durable_price(monkeypatch)
     assert row["price"] == 146101.0
     assert row["broker_order_id"] == "DHAN-1"
     assert row["planned_entry_price"] == 146101.0
+    assert row["submission_outcome"] == "NOT_SENT"
+    assert row["reason"] == "LIVE_GATE_CLOSED"
+    assert row["submission_attempt_count"] == 0

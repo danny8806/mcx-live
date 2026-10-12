@@ -4,6 +4,7 @@ from application.environment_factory import EnvironmentFactoryMixin
 from core.timeframe_engine import Bar
 from execution.live.dhan_transport import DhanRestTransport
 from execution.live.engine import LiveExecutionEngine
+from execution.broker_router import BrokerEventRouter
 from execution.models import OrderState
 from execution.price_model import PricePreset
 from strategies.supertrend import SuperTrendStrategyInstance
@@ -132,3 +133,59 @@ def test_broker_flat_reversal_entry_carries_generation_through_live_guard():
     assert calls[0][0] == "/orders"
     assert calls[0][1]["orderType"] == "MARKET"
     assert calls[0][1]["quantity"] == 1
+
+
+def test_live_router_maps_only_the_broker_native_id_after_submission():
+    strategy = _strategy()
+    signal = None
+    for index, close in enumerate([100, 98, 96, 94]):
+        signal = strategy.on_bar(_bar(index, close))
+    assert signal is not None
+
+    http = _RecordingDhanHttp()
+    broker = DhanRestTransport(
+        client_id="TEST-CLIENT", http=http,
+        instruments={"SILVERM": {
+            "security_id": "TEST-SECURITY", "exchange_segment": "MCX_COMM",
+        }},
+        gate_enabled=True,
+    )
+    engine = LiveExecutionEngine(broker=broker, price_preset=PricePreset())
+    router = BrokerEventRouter()
+    engine.broker_router = router
+
+    order = engine.create_order(signal, multiplier=5, trade_id="trade-map")
+    assert router.resolve(order.order_id) is None
+
+    submitted = engine.submit_order(order)
+    assert submitted.state == OrderState.SUBMITTED
+    assert router.resolve(order.order_id) is None
+    mapping = router.resolve("DHAN-ORDER-1")
+    assert mapping is not None
+    assert mapping.order_id == order.order_id
+
+
+def test_master_gate_rejection_is_not_sent_and_has_no_broker_mapping():
+    from execution.broker_router import BrokerEventRouter
+    from execution.live.broker_client import StubLiveBroker
+    from strategies.types import Signal, SignalType
+
+    signal = Signal(
+        signal_type=SignalType.LONG, instrument="SILVERM",
+        strategy_id="silver_01", timestamp=1, trigger_price=100,
+        stop_price=0, quantity=1,
+        metadata={"strategy_type": "supertrend", "market_on_signal_close": True,
+                  "trigger_state": "FIRED"},
+    )
+    router = BrokerEventRouter()
+    engine = LiveExecutionEngine(
+        broker=StubLiveBroker(gate_enabled=False), price_preset=PricePreset())
+    engine.broker_router = router
+    order = engine.create_order(signal, trade_id="trade-gate")
+    submitted = engine.submit_order(order)
+
+    assert submitted.state == OrderState.REJECTED
+    assert submitted.reason == "LIVE_GATE_CLOSED: live trading master gate is OFF"
+    assert submitted.submission_outcome == "NOT_SENT"
+    assert submitted.submission_attempt_count == 0
+    assert router.resolve(order.order_id) is None

@@ -15,6 +15,7 @@ confusable with simulated ones even before it hits the (separate) live DB.
 from __future__ import annotations
 
 import math
+import json
 import threading
 import time
 import uuid
@@ -179,8 +180,6 @@ class LiveExecutionEngine:
             order.planned_entry_price = plan.price
             self._plans[order.order_id] = plan
         self._orders[order.order_id] = order
-        if self.broker_router is not None:
-            self.broker_router.register_from_order(order)
         return order
 
     def price_plan(self, order_id: str) -> Optional[ExecutionPricePlan]:
@@ -351,10 +350,9 @@ class LiveExecutionEngine:
             order.updated_at = self._now()
             return order
 
-        # §40 — the REAL broker order id (BROKER-*) must resolve back to this
-        # order. register_from_order() keys the mapping by the internal
-        # LIVE- id; register the broker-native id too so late broker events
-        # (status polls / fills) route through the explicit mapping.
+        # Register only the broker-native ID returned by the adapter. The
+        # local LIVE-* ID is not evidence of broker acceptance and must never
+        # be stored in the broker-ID namespace.
         broker_order_id = result.get("broker_order_id")
         order.submission_outcome = "BROKER_RESPONSE_RECEIVED"
         order.submission_attempt_count = int(
@@ -646,6 +644,10 @@ class LiveExecutionEngine:
                     "created_at": o.created_at,
                     "updated_at": o.updated_at,
                     "reason": o.reason,
+                    "submission_outcome": o.submission_outcome,
+                    "submission_attempt_count": o.submission_attempt_count,
+                    "rejection_retry_count": o.rejection_retry_count,
+                    "submission_attempts": list(o.submission_attempts),
                     "entry_signal_id": o.entry_signal_id,
                     "trade_id": o.trade_id,
                     "trigger_price": o.trigger_price,
@@ -735,6 +737,10 @@ class LiveExecutionEngine:
                 average_fill_price=o_data.get("average_fill_price", 0.0),
                 fill_ids=list(o_data.get("fill_ids", [])),
                 reason=o_data.get("reason"),
+                submission_outcome=o_data.get("submission_outcome", "NOT_SENT"),
+                submission_attempt_count=int(o_data.get("submission_attempt_count") or 0),
+                rejection_retry_count=int(o_data.get("rejection_retry_count") or 0),
+                submission_attempts=list(o_data.get("submission_attempts") or []),
                 entry_signal_id=o_data.get("entry_signal_id"),
                 trade_id=o_data.get("trade_id"),
             )
@@ -803,6 +809,15 @@ class LiveExecutionEngine:
                         state=state,
                         filled_quantity=int(row.get("filled_quantity") or 0),
                         average_fill_price=float(row.get("average_fill_price") or 0.0),
+                        reason=row.get("reason"),
+                        submission_outcome=str(row.get("submission_outcome") or "NOT_SENT"),
+                        submission_attempt_count=int(row.get("submission_attempt_count") or 0),
+                        rejection_retry_count=int(row.get("rejection_retry_count") or 0),
+                        submission_attempts=(
+                            json.loads(row.get("submission_attempts"))
+                            if isinstance(row.get("submission_attempts"), str)
+                            and row.get("submission_attempts") else
+                            list(row.get("submission_attempts") or [])),
                         entry_signal_id=row.get("signal_id") or row.get("entry_signal_id"),
                         trade_id=row.get("trade_id"),
                         lifecycle_id=row.get("lifecycle_id") or row.get("trade_id"),

@@ -211,6 +211,17 @@ class BrokerEventRouter:
             return 0
         restored = 0
         for row in rows:
+            # Old live builds wrote the internal LIVE-* id into the column
+            # reserved for a broker-native id at order creation. It is not a
+            # Dhan acknowledgement and must not be trusted for event routing.
+            broker_order_id = str(row.get("broker_order_id") or "")
+            order_id = str(row.get("order_id") or "")
+            execution_mode = str(row.get("execution_mode") or "").upper()
+            if (execution_mode == "LIVE" and broker_order_id == order_id
+                    and broker_order_id.startswith("LIVE-")):
+                log.warning("[BrokerRouter] skipped local-id alias stored as a live "
+                            "broker mapping: %s", broker_order_id)
+                continue
             if self._mapping_validator is not None:
                 try:
                     if not self._mapping_validator(row):

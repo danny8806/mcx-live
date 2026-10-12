@@ -49,10 +49,10 @@ export default function Orders() {
               <span style={{ color: "var(--text-muted)" }}>{o.order_type}</span>
               <span className="tabular-nums" title={o.price != null ? "Order limit price" : o.planned_entry_price != null ? "Planned price; actual order price unavailable" : "Price unavailable"} style={{ color: "var(--text-muted)" }}>{o.price != null ? o.price : o.planned_entry_price != null ? `${o.planned_entry_price} plan` : "—"}</span>
               <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{o.average_fill_price != null ? o.average_fill_price : "—"}</span>
-              <span title={o.reason || ""} style={{
+              <span title={[o.reason, o.submission_outcome ? `Submission: ${o.submission_outcome}` : null, `Attempts: ${o.submission_attempt_count ?? 0}`, `Retries: ${o.rejection_retry_count ?? 0}`].filter(Boolean).join(" · ")} style={{
                 color: stateColor(o.state),
                 fontWeight: 600, fontSize: "9px",
-              }}>{o.state}</span>
+              }}>{o.state}{["NOT_SENT", "OUTCOME_UNKNOWN"].includes(o.submission_outcome) ? ` · ${o.submission_outcome}` : ""}</span>
             </div>
           ))}
         </div>
