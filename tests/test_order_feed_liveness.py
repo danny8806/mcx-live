@@ -33,9 +33,10 @@ class FakePoller:
     def __init__(self, running=True):
         self.running = running
         self._lock = threading.RLock()
+        self.errors = {}
 
     def stats(self):
-        return {}
+        return {"errors": dict(self.errors)}
 
     def snapshot(self):
         return {}
@@ -74,6 +75,11 @@ def _service(ws, poller_running=True):
                   "health_checks": 0, "worker_deaths": 0}
     svc._last_cycle = {}
     svc._consecutive_errors = {}
+    svc._rest_error_counts = {}
+    svc._rest_error_baseline_initialized = False
+    svc._last_rest_error_at = 0.0
+    svc._rest_degraded_window = 5.0
+    svc._rest_degraded = False
     svc._clock = lambda: 10000.0
     return svc
 
@@ -146,6 +152,25 @@ def test_stats_are_green_when_the_feed_is_actually_live():
     s = svc.stats()
     assert s["ws_live"] is True
     assert s["service_healthy"] is True
+
+
+def test_recent_rest_poll_error_degrades_health_then_recovers():
+    now = [10000.0]
+    svc = _service(FakeWs(connected=True, stale=False))
+    svc._clock = lambda: now[0]
+    svc._health_tick_once()  # baseline error counters
+    assert svc.healthy is True
+
+    svc._poller.errors = {"orders": 1}
+    now[0] += 1
+    svc._health_tick_once()
+    assert svc.healthy is False
+    assert svc.stats()["rest_degraded"] is True
+
+    now[0] += 6
+    svc._health_tick_once()
+    assert svc.healthy is True
+    assert svc.stats()["rest_degraded"] is False
 
 
 def test_disabled_ws_does_not_degrade_health():

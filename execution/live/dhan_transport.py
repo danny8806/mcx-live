@@ -52,6 +52,14 @@ _AUDIT_ACTION = {
 }
 
 
+class OrderStatusSnapshot(dict):
+    """Order rows plus poll errors, without dropping successful rows."""
+
+    def __init__(self, *args, poll_errors=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.poll_errors = list(poll_errors or [])
+
+
 def _coerce_status_body(body: object) -> dict:
     """Dhan answers ``GET /orders/{id}`` with a JSON ARRAY containing the one
     order object (live-verified 2026-09-11); a dict body is tolerated too."""
@@ -101,10 +109,18 @@ def _is_raw_terminal(raw_status: object) -> bool:
     )
 
 
-# Monotonicity ranking for status ingest: a stale/late order-alert frame must
-# never regress the transport book (TRADED -> PENDING).  Filled is the highest
-# stage; the abnormal-terminal stages sit above plain submitted.
-_STATUS_RANK = {"submitted": 0, "rejected": 1, "cancelled": 1, "expired": 1, "filled": 2}
+# Raw-state rank keeps a delayed PENDING response from regressing a later
+# PART_TRADED/terminal state, while allowing PART_TRADED -> CANCELLED after a
+# remainder cancellation is confirmed.
+def _raw_status_rank(raw_status: object) -> int:
+    raw = str(raw_status or "").strip().upper()
+    if raw in ("TRADED",):
+        return 3
+    if raw in ("REJECTED", "CANCELLED", "CANCELED", "EXPIRED"):
+        return 2
+    if raw == "PART_TRADED":
+        return 1
+    return 0
 
 # A lost POST response is retried only after Dhan's correlation endpoint has
 # authoritatively confirmed that no order exists. Ambiguous lookups never
@@ -165,6 +181,9 @@ class DhanRestTransport(LiveBrokerClient):
         self.audit = audit_store
 
         self._lock = threading.Lock()
+        # Bounded lock striping avoids retaining one extra lock forever for
+        # every historical order while still serializing same-order operations.
+        self._order_io_locks = tuple(threading.Lock() for _ in range(64))
         self._orders: dict[str, dict] = {}   # broker_order_id -> book record
         self._fills: dict[str, dict] = {}    # broker_fill_id -> fill record
         self._fill_seq: dict[str, int] = {}  # broker_order_id -> fill counter
@@ -174,6 +193,10 @@ class DhanRestTransport(LiveBrokerClient):
         cg = (dhan_config or {}).get("circuit_gate") or {}
         self._circuit_gate_enabled = bool(cg.get("enabled", False))
         self._circuit_gate_fail_closed = bool(cg.get("fail_closed", False))
+
+    def _order_io_lock(self, broker_order_id: str) -> threading.Lock:
+        """Return a bounded per-order lock stripe for broker I/O."""
+        return self._order_io_locks[hash(str(broker_order_id)) % len(self._order_io_locks)]
 
     # ── construction helpers ───────────────────────────────────────────
 
@@ -737,12 +760,18 @@ class DhanRestTransport(LiveBrokerClient):
                     "correlation_id": cid}
         oid = body.get("orderId") or body.get("order_id")
         oid = str(oid)
+        raw_status = str(body.get("orderStatus") or body.get("order_status")
+                         or "PENDING").strip().upper()
+        if raw_status not in {
+            "PENDING", "TRANSIT", "NEW", "OPEN", "PART_TRADED", "TRADED",
+            "REJECTED", "CANCELLED", "CANCELED", "EXPIRED",
+        }:
+            return {"status": "unresolved", "correlation_id": cid,
+                    "reason": f"unknown broker order status {raw_status!r}"}
         with self._lock:
             rec = self._orders.get(oid)
         if rec is not None:
             return dict(rec)
-        raw_status = (body.get("orderStatus") or body.get("order_status")
-                      or "PENDING")
         return {
             "broker_order_id": oid,
             "status": _normalize_status(raw_status),
@@ -778,17 +807,19 @@ class DhanRestTransport(LiveBrokerClient):
         Idempotent: a settled/cancelled order answers without a network call.
         """
         bid = str(broker_order_id)
-        with self._lock:
-            rec = self._orders.get(bid)
+        with self._order_io_lock(bid):
+            with self._lock:
+                rec = self._orders.get(bid)
+                rec_snapshot = dict(rec) if rec is not None else None
             # C9 — settle-short-circuit must key on the RAW terminal status.
             # Before this fix the normalized 'filled' from PART_TRADED skipped
             # the DELETE while a live remainder kept filling at Dhan.
-            if rec is not None and _is_raw_terminal(rec.get("raw_status")):
+            if rec_snapshot is not None and _is_raw_terminal(rec_snapshot.get("raw_status")):
                 return {
                     "broker_order_id": bid,
                     "ok": True,
-                    "status": rec.get("status"),
-                    "raw_status": rec.get("raw_status"),
+                    "status": rec_snapshot.get("status"),
+                    "raw_status": rec_snapshot.get("raw_status"),
                 }
             try:
                 resp = self._http_delete(f"/orders/{bid}")
@@ -800,38 +831,47 @@ class DhanRestTransport(LiveBrokerClient):
                 # settlement is authoritative — answer ok, never chain an auth
                 # renewal on an order-error body.
                 inner = str(exc)
-                if rec is not None and _is_raw_terminal(rec.get("raw_status")):
+                with self._lock:
+                    latest = self._orders.get(bid)
+                    latest = dict(latest) if latest is not None else None
+                if latest is not None and _is_raw_terminal(latest.get("raw_status")):
                     return {
                         "broker_order_id": bid,
                         "ok": True,
-                        "status": rec.get("status"),
-                        "raw_status": rec.get("raw_status"),
+                        "status": latest.get("status"),
+                        "raw_status": latest.get("raw_status"),
                         "note": "already settled (broker answered order error)",
                     }
                 self._audit("CANCEL", f"/orders/{bid}", "DELETE", error=exc,
-                            correlation_id=(rec or {}).get("correlation_id"))
+                            correlation_id=(rec_snapshot or {}).get("correlation_id"))
                 raise
             self._audit("CANCEL", f"/orders/{bid}", "DELETE", response=resp,
                         http_status=200,
-                        correlation_id=(rec or {}).get("correlation_id"))
+                        correlation_id=(rec_snapshot or {}).get("correlation_id"))
             # DELETE acknowledgement is not proof that the order stopped
             # working. Re-read broker state before releasing its replacement.
             try:
                 status_body = _coerce_status_body(self._http._get(f"/orders/{bid}"))
             except Exception as exc:
                 self._audit("CANCEL_VERIFY", f"/orders/{bid}", "GET", error=exc,
-                            correlation_id=(rec or {}).get("correlation_id"))
+                            correlation_id=(rec_snapshot or {}).get("correlation_id"))
                 raise RuntimeError("Dhan cancel status could not be verified") from exc
             self._audit("CANCEL_VERIFY", f"/orders/{bid}", "GET",
                         response=status_body, http_status=200,
-                        correlation_id=(rec or {}).get("correlation_id"))
+                        correlation_id=(rec_snapshot or {}).get("correlation_id"))
             raw_status = status_body.get("orderStatus") or status_body.get("order_status")
             if not raw_status:
                 raise RuntimeError("Dhan cancel status missing from verification")
             new_status = _normalize_status(raw_status)
-            if rec is not None:
-                rec["status"] = new_status
-                rec["raw_status"] = str(raw_status).upper()
+            with self._lock:
+                rec = self._orders.get(bid)
+                if rec is not None:
+                    if _raw_status_rank(raw_status) >= _raw_status_rank(
+                            rec.get("raw_status")):
+                        rec["status"] = new_status
+                        rec["raw_status"] = str(raw_status).upper()
+                    new_status = rec.get("status") or new_status
+                    raw_status = rec.get("raw_status") or raw_status
             return {
                 "broker_order_id": resp.get("orderId") or bid,
                 "ok": new_status in ("cancelled", "rejected", "expired"),
@@ -1014,62 +1054,59 @@ class DhanRestTransport(LiveBrokerClient):
         segment = sec.get("exchange_segment", "MCX_COMM")
         secid = str(sec["security_id"])
         payload = {segment: [int(secid)]}
-        with self._lock:
+        try:
+            body = self._http._post(
+                "/marketfeed/quote", payload,
+                extra_headers={"client-id": self.client_id},
+            ) or {}
+            origin_status = 200
+        except TypeError:
+            # HTTP layers that don't expose the per-request header knob
+            # (fakes) fall back to the plain call.
             try:
-                body = self._http._post(
-                    "/marketfeed/quote", payload,
-                    extra_headers={"client-id": self.client_id},
-                ) or {}
+                body = self._http._post("/marketfeed/quote", payload) or {}
                 origin_status = 200
-            except TypeError:
-                # HTTP layers that don't expose the per-request header knob
-                # (fakes) fall back to the plain call.
-                try:
-                    body = self._http._post("/marketfeed/quote", payload) or {}
-                    origin_status = 200
-                except Exception as exc:
-                    self._audit("CIRCUIT_QUOTE", "/marketfeed/quote", "POST",
-                                payload, error=exc)
-                    return {}
             except Exception as exc:
                 self._audit("CIRCUIT_QUOTE", "/marketfeed/quote", "POST",
                             payload, error=exc)
                 return {}
-            self._audit("CIRCUIT_QUOTE", "/marketfeed/quote", "POST", payload,
-                        response=body, http_status=origin_status)
-            if not isinstance(body, dict):
-                return {}
-            # Nested documented shape: data[segment][securityId] = row.
-            row = None
-            data = body.get("data") if isinstance(body, dict) else None
-            if isinstance(data, dict):
-                seg_block = data.get(segment)
-                if isinstance(seg_block, dict):
-                    row = seg_block.get(secid) or seg_block.get(int(secid))
-            if not isinstance(row, dict):
-                # Tolerate a flattened response keyed by securityId.
-                row = (body.get(secid) if isinstance(body, dict)
-                       else None) or {}
-            if not isinstance(row, dict):
-                row = {}
-            upper = (row.get("upper_circuit_limit")
-                     or row.get("upperCircuitLimit")
-                     or row.get("upper_ckt_limit") or row.get("upperCircuit"))
-            lower = (row.get("lower_circuit_limit")
-                     or row.get("lowerCircuitLimit")
-                     or row.get("lower_ckt_limit") or row.get("lowerCircuit"))
-            ltp = (row.get("last_price") or row.get("lastTradedPrice")
-                   or row.get("ltp") or row.get("closePrice")
-                   or row.get("lastPrice"))
-            oi = row.get("oi") or row.get("openInterest") or row.get("open_interest")
-            return {
-                "security_id": secid,
-                "ltp": float(ltp) if ltp not in (None, "") else None,
-                "upper_circuit_limit": float(upper) if upper not in (None, "") else None,
-                "lower_circuit_limit": float(lower) if lower not in (None, "") else None,
-                "open_interest": float(oi) if oi not in (None, "") else None,
-                "raw": body,
-            }
+        except Exception as exc:
+            self._audit("CIRCUIT_QUOTE", "/marketfeed/quote", "POST",
+                        payload, error=exc)
+            return {}
+        self._audit("CIRCUIT_QUOTE", "/marketfeed/quote", "POST", payload,
+                    response=body, http_status=origin_status)
+        if not isinstance(body, dict):
+            return {}
+        # Nested documented shape: data[exchangeSegment][securityId] = row.
+        row = None
+        data = body.get("data")
+        if isinstance(data, dict):
+            seg_block = data.get(segment)
+            if isinstance(seg_block, dict):
+                row = seg_block.get(secid) or seg_block.get(int(secid))
+        if not isinstance(row, dict):
+            row = body.get(secid) or {}
+        if not isinstance(row, dict):
+            row = {}
+        upper = (row.get("upper_circuit_limit")
+                 or row.get("upperCircuitLimit")
+                 or row.get("upper_ckt_limit") or row.get("upperCircuit"))
+        lower = (row.get("lower_circuit_limit")
+                 or row.get("lowerCircuitLimit")
+                 or row.get("lower_ckt_limit") or row.get("lowerCircuit"))
+        ltp = (row.get("last_price") or row.get("lastTradedPrice")
+               or row.get("ltp") or row.get("closePrice")
+               or row.get("lastPrice"))
+        oi = row.get("oi") or row.get("openInterest") or row.get("open_interest")
+        return {
+            "security_id": secid,
+            "ltp": float(ltp) if ltp not in (None, "") else None,
+            "upper_circuit_limit": float(upper) if upper not in (None, "") else None,
+            "lower_circuit_limit": float(lower) if lower not in (None, "") else None,
+            "open_interest": float(oi) if oi not in (None, "") else None,
+            "raw": body,
+        }
 
     def _enforce_circuit_gate(self, instrument: str, price: float,
                               order_type: str) -> None:
@@ -1100,23 +1137,22 @@ class DhanRestTransport(LiveBrokerClient):
         including ones this system never created — are returned for
         reconciliation; only orders carrying OUR correlation id are ever
         adopted into the book."""
-        with self._lock:
-            try:
-                rows = self._http._get("/orders") or []
-            except Exception as exc:
-                self._audit("DAY_ORDER_BOOK", "/orders", "GET", error=exc)
-                return []
-            self._audit("DAY_ORDER_BOOK", "/orders", "GET", response=rows,
-                        http_status=200)
-            if not isinstance(rows, list):
-                rows = [rows]
-            out = []
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                raw = (row.get("orderStatus") or row.get("order_status") or "PENDING")
-                sec_id = str(row.get("securityId") or "")
-                out.append({
+        try:
+            rows = self._http._get("/orders")
+        except Exception as exc:
+            self._audit("DAY_ORDER_BOOK", "/orders", "GET", error=exc)
+            raise RuntimeError("Dhan day order book query failed") from exc
+        self._audit("DAY_ORDER_BOOK", "/orders", "GET", response=rows,
+                    http_status=200)
+        if not isinstance(rows, list):
+            raise ValueError("Dhan day order book response is not a list")
+        out = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Dhan day order book contains a malformed row")
+            raw = (row.get("orderStatus") or row.get("order_status") or "PENDING")
+            sec_id = str(row.get("securityId") or "")
+            out.append({
                     "broker_order_id": str(row.get("orderId")
                                            or row.get("order_id") or ""),
                     "status": _normalize_status(raw),
@@ -1137,8 +1173,8 @@ class DhanRestTransport(LiveBrokerClient):
                     "security_id": sec_id,
                     "reason": (row.get("omsErrorDescription")
                                or row.get("errorMessage") or row.get("reason") or None),
-                })
-            return out
+            })
+        return out
 
     def adopt_order(self, row: dict) -> Optional[dict]:
         """Seed the transport book from a broker day-order-book row that THIS
@@ -1205,13 +1241,15 @@ class DhanRestTransport(LiveBrokerClient):
             raise ValueError("LIMIT orders require a positive price")
         limit_price = float(price or 0.0) if order_type_u == "LIMIT" else 0.0
         bid = str(broker_order_id)
-        with self._lock:
-            rec = self._orders.get(bid)
+        with self._order_io_lock(bid):
+            with self._lock:
+                rec = self._orders.get(bid)
+                rec_snapshot = dict(rec) if rec is not None else None
             payload = {
                 "dhanClientId": self.client_id,
                 "orderId": bid,
                 "orderType": order_type_u,
-                "quantity": int(quantity) if quantity else int(rec.get("quantity") or 0),
+                "quantity": int(quantity) if quantity else int((rec_snapshot or {}).get("quantity") or 0),
                 "price": limit_price,
                 "triggerPrice": float(trigger_price or 0.0),
                 "validity": validity,
@@ -1219,15 +1257,21 @@ class DhanRestTransport(LiveBrokerClient):
             resp = self._http_put(f"/orders/{bid}", payload)
             self._audit("MODIFY", f"/orders/{bid}", "PUT", payload,
                         response=resp, http_status=200,
-                        correlation_id=(rec or {}).get("correlation_id"))
+                        correlation_id=(rec_snapshot or {}).get("correlation_id"))
             raw_status = resp.get("orderStatus") or resp.get("order_status") or "PENDING"
             new_status = _normalize_status(raw_status)
-            if rec is not None:
-                rec["status"] = new_status
-                rec["raw_status"] = str(raw_status).upper()
-                rec["requested_order_type"] = order_type_u
-                rec["requested_price"] = limit_price
-                rec["requested_trigger_price"] = float(trigger_price or 0.0)
+            with self._lock:
+                rec = self._orders.get(bid)
+                if rec is not None:
+                    if _raw_status_rank(raw_status) >= _raw_status_rank(
+                            rec.get("raw_status")):
+                        rec["status"] = new_status
+                        rec["raw_status"] = str(raw_status).upper()
+                    new_status = rec.get("status") or new_status
+                    raw_status = rec.get("raw_status") or raw_status
+                    rec["requested_order_type"] = order_type_u
+                    rec["requested_price"] = limit_price
+                    rec["requested_trigger_price"] = float(trigger_price or 0.0)
             return {
                 "broker_order_id": resp.get("orderId") or bid,
                 "ok": new_status not in ("cancelled", "rejected", "expired"),
@@ -1237,125 +1281,120 @@ class DhanRestTransport(LiveBrokerClient):
 
     def tradebook(self) -> list:
         """Today's exchange tradebook (``GET /trades``)."""
-        with self._lock:
-            try:
-                rows = self._http._get("/trades") or []
-            except Exception as exc:
-                self._audit("TRADEBOOK", "/trades", "GET", error=exc)
-                return []
-            self._audit("TRADEBOOK", "/trades", "GET", response=rows,
-                        http_status=200)
-            if not isinstance(rows, list):
-                return []
-            return [dict(r) for r in rows]
+        try:
+            rows = self._http._get("/trades")
+        except Exception as exc:
+            self._audit("TRADEBOOK", "/trades", "GET", error=exc)
+            raise RuntimeError("Dhan tradebook query failed") from exc
+        self._audit("TRADEBOOK", "/trades", "GET", response=rows,
+                    http_status=200)
+        if not isinstance(rows, list):
+            raise ValueError("Dhan tradebook response is not a list")
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError("Dhan tradebook contains a malformed row")
+        return [dict(row) for row in rows]
 
     def order_trades(self, order_id: str) -> list:
         """Exchange trades for one order (``GET /trades/{order-id}``)."""
-        with self._lock:
-            try:
-                rows = self._http._get(f"/trades/{str(order_id)}") or []
-            except Exception as exc:
-                self._audit("ORDER_TRADES", f"/trades/{order_id}", "GET",
-                            error=exc)
-                return []
+        try:
+            rows = self._http._get(f"/trades/{str(order_id)}")
+        except Exception as exc:
             self._audit("ORDER_TRADES", f"/trades/{order_id}", "GET",
-                        response=rows, http_status=200)
-            # Dhan's documented response example for /trades/{order-id} is a
-            # single trade object, while deployments may return a list when an
-            # order has multiple partial executions. Normalize both shapes so
-            # the audit/reconciliation path does not silently drop the
-            # documented object form.
-            if isinstance(rows, dict):
-                rows = [rows]
-            if not isinstance(rows, list):
-                return []
-            return [dict(r) for r in rows if isinstance(r, dict)]
+                        error=exc)
+            raise RuntimeError(f"Dhan trades query failed for order {order_id}") from exc
+        self._audit("ORDER_TRADES", f"/trades/{order_id}", "GET",
+                    response=rows, http_status=200)
+        # Dhan's documented response example is a single object, while some
+        # deployments return a list for partial executions.
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            raise ValueError("Dhan order trades response is not an object or list")
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError("Dhan order trades contains a malformed row")
+        return [dict(row) for row in rows]
 
     def order_by_correlation(self, correlation_id: str) -> Optional[dict]:
         """Resolve a broker order by our correlation id
         (``GET /orders/external/{correlation-id}``)."""
-        with self._lock:
-            try:
-                body = self._http._get(f"/orders/external/{correlation_id}") or {}
-            except Exception as exc:
-                self._audit("ORDER_BY_CORRELATION",
-                            f"/orders/external/{correlation_id}", "GET",
-                            error=exc, correlation_id=correlation_id)
-                return None
+        try:
+            body = self._http._get(f"/orders/external/{correlation_id}")
+        except Exception as exc:
             self._audit("ORDER_BY_CORRELATION",
                         f"/orders/external/{correlation_id}", "GET",
-                        response=body, http_status=200,
-                        correlation_id=correlation_id)
+                        error=exc, correlation_id=correlation_id)
+            raise RuntimeError("Dhan correlation lookup failed") from exc
+        self._audit("ORDER_BY_CORRELATION",
+                    f"/orders/external/{correlation_id}", "GET",
+                    response=body, http_status=200,
+                    correlation_id=correlation_id)
+        if isinstance(body, list):
+            body = body[0] if body else None
+        if not isinstance(body, dict):
+            raise ValueError("Dhan correlation lookup returned malformed data")
+        if not (body.get("orderId") or body.get("order_id")):
+            return None
+        raw_status = str(body.get("orderStatus") or body.get("order_status")
+                         or "PENDING").strip().upper()
+        if raw_status not in {
+            "PENDING", "TRANSIT", "NEW", "OPEN", "PART_TRADED", "TRADED",
+            "REJECTED", "CANCELLED", "CANCELED", "EXPIRED",
+        }:
+            raise ValueError(f"unknown Dhan order status: {raw_status!r}")
             return {
                 "broker_order_id": body.get("orderId") or body.get("order_id"),
-                "status": _normalize_status(
-                    body.get("orderStatus") or body.get("order_status") or "PENDING"),
-                "raw_status": str(body.get("orderStatus") or body.get("order_status")
-                                  or "PENDING").upper(),
+            "status": _normalize_status(raw_status),
+            "raw_status": raw_status,
                 "side": (body.get("transactionType") or body.get("transaction_type")
                          or "").upper(),
                 "quantity": int(body.get("quantity") or 0),
                 "correlation_id": correlation_id,
             }
 
-    def verify_static_ip(self) -> dict:
+    def verify_static_ip(self, request_ip: Optional[str] = None) -> dict:
         """Static-IP whitelist readiness (``GET /ip/getIP``).
 
-        Dhan requires the request IP to be static-IP whitelisted for the
-        order APIs.  Field names on this endpoint are not yet verified
-        against a real account, so the parse is defensive: any key that
-        *looks* like an IP / an enable-flag is accepted, and the raw body is
-        preserved for forensics.  ``whitelisted`` is only True when an
-        explicit enabled flag or an active status is observed; it is never
-        assumed from a bare IP echo.
+        The documented response supplies configured primary/secondary IPs,
+        not the caller's egress IP. A match is only reported when the caller
+        provides that egress IP.
         """
-        with self._lock:
-            try:
-                body = self._http._get("/ip/getIP") or {}
-            except Exception as exc:
-                self._audit("STATIC_IP", "/ip/getIP", "GET", error=exc)
-                return {"available": False, "whitelisted": False, "ip": None,
-                        "reason": "getIP error"}
-            self._audit("STATIC_IP", "/ip/getIP", "GET", response=body,
-                        http_status=200)
-            if not isinstance(body, dict):
-                body = {}
-            ip = (body.get("ip") or body.get("IP") or body.get("ipAddress")
-                  or body.get("requestIp") or body.get("detectedIP") or None)
-            enabled_raw = (body.get("isEnabled") if "isEnabled" in body
-                           else body.get("enabled")
-                           if "enabled" in body else body.get("isActive")
-                           if "isActive" in body else body.get("status")
-                           if "status" in body else body.get("ordersAllowed")
-                           if "ordersAllowed" in body else body.get("ipMatchStatus"))
-            status_u = str(enabled_raw or "").upper()
-            if isinstance(enabled_raw, bool):
-                observed = enabled_raw
-            else:
-                observed = (status_u in ("TRUE", "1", "ACTIVE", "ACTIVATED",
-                                         "ENABLED", "WHITELISTED", "PRIMARY_MATCH"))
-            return {
-                "available": True,
-                "whitelisted": bool(observed),
-                "ip": ip,
-                "raw": body,
-            }
+        try:
+            body = self._http._get("/ip/getIP")
+        except Exception as exc:
+            self._audit("STATIC_IP", "/ip/getIP", "GET", error=exc)
+            raise RuntimeError("Dhan static-IP lookup failed") from exc
+        self._audit("STATIC_IP", "/ip/getIP", "GET", response=body,
+                    http_status=200)
+        if not isinstance(body, dict):
+            raise ValueError("Dhan static-IP response is not an object")
+        configured = [str(body[key]).strip() for key in ("primaryIP", "secondaryIP")
+                      if body.get(key) and str(body[key]).strip()]
+        if request_ip is None:
+            whitelisted = None
+            reason = "caller egress IP was not supplied"
+        else:
+            whitelisted = str(request_ip).strip() in configured
+            reason = None if whitelisted else "caller egress IP is not configured"
+        return {"available": True, "whitelisted": whitelisted,
+                "request_ip": str(request_ip).strip() if request_ip else None,
+                "configured_ips": configured, "reason": reason, "raw": body}
 
     def kill_switch_status(self) -> dict:
         """Broker kill-switch (``GET /killswitch``) — ACTIVATE blocks new
         orders broker-side."""
-        with self._lock:
-            try:
-                body = self._http._get("/killswitch") or {}
-            except Exception as exc:
-                self._audit("KILLSWITCH", "/killswitch", "GET", error=exc)
-                return {"available": False, "active": False, "reason": "killswitch error"}
-            self._audit("KILLSWITCH", "/killswitch", "GET", response=body,
-                        http_status=200)
-            raw = (body.get("killSwitchStatus") or body.get("kill_switch_status")
-                   or body.get("status") or "")
-            active = str(raw).upper() in ("ACTIVATE", "ACTIVE", "TRIGGERED", "ON")
-            return {"available": True, "active": active, "raw": raw}
+        try:
+            body = self._http._get("/killswitch")
+        except Exception as exc:
+            self._audit("KILLSWITCH", "/killswitch", "GET", error=exc)
+            raise RuntimeError("Dhan kill-switch lookup failed") from exc
+        self._audit("KILLSWITCH", "/killswitch", "GET", response=body,
+                    http_status=200)
+        if not isinstance(body, dict):
+            raise ValueError("Dhan kill-switch response is not an object")
+        raw = (body.get("killSwitchStatus") or body.get("kill_switch_status")
+               or body.get("status") or "")
+        active = str(raw).upper() in ("ACTIVATE", "ACTIVE", "TRIGGERED", "ON")
+        return {"available": True, "active": active, "raw": raw}
 
     def update_price(self, instrument: str, price: float) -> None:
         pass
@@ -1367,50 +1406,66 @@ class DhanRestTransport(LiveBrokerClient):
         exchange-reported average fill price.  Idempotent under repeated polls.
         """
         with self._lock:
-            out: dict = {}
-            for bid in list(self._orders.keys()):
-                rec = self._orders.get(bid)
+            order_ids = list(self._orders)
+        out: dict = {}
+        poll_errors: list[dict] = []
+        for bid in order_ids:
+            with self._order_io_lock(bid):
+                with self._lock:
+                    rec = self._orders.get(bid)
+                    rec = dict(rec) if rec is not None else None
                 if rec is None:
                     continue
-                # Cached-terminal skip: rejected/cancelled/expired orders were
-                # already confirmed by the broker; the cached record is
-                # authoritative and re-polling them forever is pure waste.
-                # Every poll previously fired one GET per such order, so as
-                # the day's flow settles the poll count collapses.
                 cached_status = str(rec.get("status") or "").lower()
-                if cached_status in ("rejected", "cancelled", "expired"):
-                    out[bid] = self._record_for(bid)
-                    continue
-                if (cached_status == "filled"
-                        and str(rec.get("raw_status") or "").upper() == "TRADED"
-                        and int(rec.get("quantity") or 0) > 0
-                        and int(rec.get("last_accounted_qty") or 0)
-                        >= int(rec.get("quantity") or 0)):
-                    # Canonically-terminal fully-accounted fill (raw TRADED):
-                    # every traded delta (with a known price) was already
-                    # emitted, so the network call cannot teach us anything
-                    # new.  PART_TRADED stays polled — it is still in-flight
-                    # (a multi-lot remainder can fill).  Kept in the book so
-                    # _own_net_positions (EMERGENCY sizing) still sees it.
-                    out[bid] = self._record_for(bid)
+                if cached_status in ("rejected", "cancelled", "expired") or (
+                    cached_status == "filled"
+                    and str(rec.get("raw_status") or "").upper() == "TRADED"
+                    and int(rec.get("quantity") or 0) > 0
+                    and int(rec.get("last_accounted_qty") or 0)
+                    >= int(rec.get("quantity") or 0)
+                ):
+                    with self._lock:
+                        if bid in self._orders:
+                            out[bid] = self._record_for(bid)
                     continue
                 try:
                     body = self._http._get(f"/orders/{bid}")
                 except Exception as exc:
                     self._audit("ORDER_STATUS", f"/orders/{bid}", "GET",
-                                error=exc,
-                                correlation_id=rec.get("correlation_id"))
-                    # A broker hiccup must not kill the poll: keep the last
-                    # known status; the next poll re-attempts.
+                                error=exc, correlation_id=rec.get("correlation_id"))
+                    poll_errors.append({"broker_order_id": bid, "error": str(exc)})
+                    with self._lock:
+                        if bid in self._orders:
+                            out[bid] = self._record_for(bid)
                     continue
                 self._audit("ORDER_STATUS", f"/orders/{bid}", "GET",
                             response=body, http_status=200,
                             correlation_id=rec.get("correlation_id"))
                 body = _coerce_status_body(body)
-                rec = self._orders[bid]
-                raw_status = body.get("orderStatus") or rec.get("raw_status") or "PENDING"
-                # Real Dhan field is "filledQty" (live-verified); the other
-                # spellings are tolerated defensively.
+                if not body:
+                    error = ValueError("Dhan order-status response is empty or malformed")
+                    self._audit("ORDER_STATUS_DECODE", f"/orders/{bid}",
+                                "GET", response=body, error=error,
+                                correlation_id=rec.get("correlation_id"))
+                    poll_errors.append({"broker_order_id": bid, "error": str(error)})
+                    with self._lock:
+                        if bid in self._orders:
+                            out[bid] = self._record_for(bid)
+                    continue
+                raw_status = str(body.get("orderStatus") or "").strip().upper()
+                if raw_status not in {
+                    "PENDING", "TRANSIT", "NEW", "OPEN", "PART_TRADED",
+                    "TRADED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED",
+                }:
+                    error = ValueError(f"unknown or missing Dhan order status: {raw_status!r}")
+                    self._audit("ORDER_STATUS_DECODE", f"/orders/{bid}",
+                                "GET", response=body, error=error,
+                                correlation_id=rec.get("correlation_id"))
+                    poll_errors.append({"broker_order_id": bid, "error": str(error)})
+                    with self._lock:
+                        if bid in self._orders:
+                            out[bid] = self._record_for(bid)
+                    continue
                 traded_raw = next((body[name] for name in
                                    ("filledQty", "tradedQuantity", "tradedQty")
                                    if body.get(name) is not None), 0)
@@ -1420,70 +1475,57 @@ class DhanRestTransport(LiveBrokerClient):
                 try:
                     traded_qty = int(traded_raw)
                     avg_price = float(avg_raw)
-                    if (traded_qty < 0 or avg_price < 0
-                            or not math.isfinite(avg_price)):
+                    if traded_qty < 0 or avg_price < 0 or not math.isfinite(avg_price):
                         raise ValueError("negative/non-finite fill data")
                 except (TypeError, ValueError, OverflowError) as exc:
-                    # One malformed status row must not abort polling every
-                    # other live order. Keep this order's last known truth and
-                    # retry it on the next cycle.
                     self._audit("ORDER_STATUS_DECODE", f"/orders/{bid}",
                                 "GET", response=body, error=exc,
                                 correlation_id=rec.get("correlation_id"))
+                    poll_errors.append({"broker_order_id": bid, "error": str(exc)})
+                    with self._lock:
+                        if bid in self._orders:
+                            out[bid] = self._record_for(bid)
                     continue
-                rec["raw_status"] = str(raw_status).upper()
-                rec["status"] = _normalize_status(raw_status)
-                # The broker's order-level detail (rejection reason: funds,
-                # settlement, product, rate-limit) stays with the order so the
-                # book and the engine's reason string carry the real message.
-                rec["reason"] = (body.get("omsErrorDescription")
-                                 or body.get("errorMessage")
-                                 or body.get("reason")
-                                 or rec.get("reason") or None)
-                previously_reported = int(rec.get("filled_quantity") or 0)
-                previous_accounted = int(rec.get("last_accounted_qty") or 0)
-                previous_average = float(rec.get("average_fill_price") or 0.0)
-                # REST snapshots can arrive out of order around a partial
-                # fill. Never regress cumulative quantity or apply a stale
-                # average to a later fill delta.
-                if traded_qty < previously_reported:
-                    traded_qty = previously_reported
-                    avg_price = previous_average
-                rec["filled_quantity"] = traded_qty
-                delta = traded_qty - previous_accounted
-                # Dhan's averageTradedPrice is the cumulative average for the
-                # order, not the price of the latest delta. Recover the
-                # weighted average price of the newly observed delta so
-                # applying multiple PART_TRADED updates preserves the broker's
-                # cumulative average instead of reusing it as every fill price.
-                delta_average = avg_price
-                if delta > 0 and previous_accounted > 0 and avg_price > 0:
-                    delta_average = (
-                        avg_price * traded_qty
-                        - previous_average * previous_accounted
-                    ) / delta
-                if avg_price > 0:
-                    rec["average_fill_price"] = avg_price
-                if delta > 0 and delta_average > 0 and math.isfinite(delta_average):
-                    seq = self._fill_seq.get(bid, 0) + 1
-                    self._fill_seq[bid] = seq
-                    broker_fill_id = f"{bid}:fill:{seq}"
-                    self._fills[broker_fill_id] = {
-                        "broker_fill_id": broker_fill_id,
-                        "broker_order_id": bid,
-                        "status": "filled",
-                        "side": rec.get("side"),
-                        "quantity": delta,
-                        "price": delta_average,
-                        "timestamp": self._clock(),
-                        "instrument": rec.get("instrument"),
-                    }
-                    rec["last_accounted_qty"] = traded_qty
-                # A filled poll without a known price advances nothing: the
-                # delta stays pending and the next poll re-attempts with a
-                # price, so a late averageTradedPrice never slips a fill.
-                out[bid] = self._record_for(bid)
-            return out
+                with self._lock:
+                    rec = self._orders.get(bid)
+                    if rec is None:
+                        continue
+                    incoming_raw = str(raw_status).upper()
+                    if _raw_status_rank(incoming_raw) >= _raw_status_rank(
+                            rec.get("raw_status")):
+                        rec["raw_status"] = incoming_raw
+                        rec["status"] = _normalize_status(incoming_raw)
+                        rec["reason"] = (body.get("omsErrorDescription")
+                                         or body.get("errorMessage")
+                                         or body.get("reason") or rec.get("reason") or None)
+                    previous_reported = int(rec.get("filled_quantity") or 0)
+                    previous_accounted = int(rec.get("last_accounted_qty") or 0)
+                    previous_average = float(rec.get("average_fill_price") or 0.0)
+                    if traded_qty < previous_reported:
+                        traded_qty = previous_reported
+                        avg_price = previous_average
+                    rec["filled_quantity"] = traded_qty
+                    delta = traded_qty - previous_accounted
+                    delta_average = avg_price
+                    if delta > 0 and previous_accounted > 0 and avg_price > 0:
+                        delta_average = (avg_price * traded_qty
+                                         - previous_average * previous_accounted) / delta
+                    if avg_price > 0:
+                        rec["average_fill_price"] = avg_price
+                    if delta > 0 and delta_average > 0 and math.isfinite(delta_average):
+                        seq = self._fill_seq.get(bid, 0) + 1
+                        self._fill_seq[bid] = seq
+                        fill_id = f"{bid}:fill:{seq}"
+                        self._fills[fill_id] = {
+                            "broker_fill_id": fill_id, "broker_order_id": bid,
+                            "status": "filled", "side": rec.get("side"),
+                            "quantity": delta, "price": delta_average,
+                            "timestamp": self._clock(),
+                            "instrument": rec.get("instrument"),
+                        }
+                        rec["last_accounted_qty"] = traded_qty
+                    out[bid] = self._record_for(bid)
+        return OrderStatusSnapshot(out, poll_errors=poll_errors)
 
     def order_status(self, broker_order_id: str) -> dict:
         """Single-order Dhan status (``GET /orders/{id}``).
@@ -1494,17 +1536,25 @@ class DhanRestTransport(LiveBrokerClient):
         :meth:`order_statuses` without touching the native order book: it
         never manufactures fills or deltas, it only reports the broker's word.
         """
-        with self._lock:
+        with self._order_io_lock(str(broker_order_id)):
             try:
                 body = self._http._get(f"/orders/{broker_order_id}")
             except Exception as exc:
                 self._audit("ORDER_STATUS", f"/orders/{broker_order_id}", "GET",
                             error=exc, correlation_id=None)
-                return {"broker_order_id": broker_order_id, "status": "unknown"}
+                raise RuntimeError(
+                    f"Dhan order status query failed for {broker_order_id}") from exc
             self._audit("ORDER_STATUS", f"/orders/{broker_order_id}", "GET",
                         response=body, http_status=200)
             body = _coerce_status_body(body)
-            raw_status = str(body.get("orderStatus") or "PENDING").upper()
+            if not body:
+                raise ValueError(f"Dhan order status response empty for {broker_order_id}")
+                raw_status = str(body.get("orderStatus") or "").strip().upper()
+                if raw_status not in {
+                    "PENDING", "TRANSIT", "NEW", "OPEN", "PART_TRADED",
+                    "TRADED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED",
+                }:
+                    raise ValueError(f"unknown or missing Dhan order status: {raw_status!r}")
             rec = {
                 "broker_order_id": broker_order_id,
                 "status": _normalize_status(raw_status),
@@ -1566,6 +1616,8 @@ class DhanRestTransport(LiveBrokerClient):
             raise ValueError("Dhan positions response is not a list")
         out: list[dict] = []
         for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Dhan positions contains a malformed row")
             sec_id = str(row.get("securityId") or "")
             instrument = None
             for inst, cfg in self.instruments.items():
@@ -1574,19 +1626,34 @@ class DhanRestTransport(LiveBrokerClient):
                     break
             if instrument is None:
                 continue
-            net = int(row.get("netQty") or row.get("netQuantity") or 0)
+            try:
+                net_raw = (row.get("netQty") if row.get("netQty") is not None
+                           else row.get("netQuantity") or 0)
+                net = int(net_raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Dhan position quantity is malformed") from exc
             if net == 0:
                 continue
             side = "LONG" if net > 0 else "SHORT"
             qty = abs(net)
-            avg = float(row.get("buyAvg" if side == "LONG" else "sellAvg") or 0.0)
+            try:
+                avg = float(row.get("buyAvg" if side == "LONG" else "sellAvg") or 0.0)
+                if not math.isfinite(avg):
+                    raise ValueError("non-finite average")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Dhan position average price is malformed") from exc
             # Broker-reported P&L (live field names verified capture) — kept
             # so the live dashboard can render broker truth, not re-derived.
-            realized = float(row.get("realizedProfit")
-                             or row.get("realized_profit") or 0.0)
-            unrealized = float(row.get("unrealizedProfit")
-                               or row.get("unrealized_profit")
-                               or row.get("unRealizedProfit") or 0.0)
+            try:
+                realized = float(row.get("realizedProfit")
+                                 or row.get("realized_profit") or 0.0)
+                unrealized = float(row.get("unrealizedProfit")
+                                   or row.get("unrealized_profit")
+                                   or row.get("unRealizedProfit") or 0.0)
+                if not math.isfinite(realized) or not math.isfinite(unrealized):
+                    raise ValueError("non-finite P&L")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Dhan position P&L is malformed") from exc
             # Dhan's GET /positions carries NO last-traded price.  Use the
             # authoritative LTP from the market-quote cache when the instrument
             # has one; leave it None rather than inventing 0.0.
@@ -1637,10 +1704,9 @@ class DhanRestTransport(LiveBrokerClient):
             raw = str(record.get("raw_status") or record.get("status") or "").upper()
             if raw:
                 new_normal = _normalize_status(raw)
-                cur_normal = rec.get("status") or "submitted"
                 # Monotonic ingest: a reordered/stale alert (e.g. an old
                 # PENDING redelivered after TRADED) never regresses the book.
-                if _STATUS_RANK.get(new_normal, 0) >= _STATUS_RANK.get(cur_normal, 0):
+                if _raw_status_rank(raw) >= _raw_status_rank(rec.get("raw_status")):
                     rec["raw_status"] = raw
                     rec["status"] = new_normal
             traded_qty = record.get("filled_quantity")
@@ -1657,64 +1723,72 @@ class DhanRestTransport(LiveBrokerClient):
             return True
 
     def account_status(self) -> dict:
-        with self._lock:
-            try:
-                funds = self._http._get("/fundlimit") or {}
-            except Exception as exc:
-                self._audit("FUNDLIMIT", "/fundlimit", "GET", error=exc)
-                return {"mode": "LIVE", "equity": 0.0, "available_margin": 0.0,
-                        "source": "fundlimit(error)"}
-            self._audit("FUNDLIMIT", "/fundlimit", "GET", response=funds,
-                        http_status=200)
-            # The Dhan API ships an (upstream-typo'd) "availabelBalance" field.
-            avail = float(
-                funds.get("availabelBalance")
-                or funds.get("availableBalance")
-                or 0.0)
+        try:
+            funds = self._http._get("/fundlimit")
+        except Exception as exc:
+            self._audit("FUNDLIMIT", "/fundlimit", "GET", error=exc)
+            raise RuntimeError("Dhan fund-limit query failed") from exc
+        self._audit("FUNDLIMIT", "/fundlimit", "GET", response=funds,
+                    http_status=200)
+        if not isinstance(funds, dict):
+            raise ValueError("Dhan fund-limit response is not an object")
+        try:
+            avail = float(funds.get("availabelBalance")
+                          if funds.get("availabelBalance") is not None
+                          else funds.get("availableBalance") or 0.0)
             utilized = float(funds.get("utilizedAmount") or 0.0)
-            # Dhan includes realizedProfit on flat (netQty=0) rows.  Keep
-            # those realized values; only unrealized P&L is position-scoped.
-            realized = 0.0
-            unrealized = 0.0
+            if not math.isfinite(avail) or not math.isfinite(utilized):
+                raise ValueError("non-finite funds")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Dhan fund-limit values are malformed") from exc
+        try:
+            pos_rows = self._http._get("/positions")
+        except Exception as exc:
+            self._audit("POSITIONS", "/positions", "GET", error=exc)
+            raise RuntimeError("Dhan account positions query failed") from exc
+        self._audit("POSITIONS", "/positions", "GET", response=pos_rows,
+                    http_status=200)
+        if not isinstance(pos_rows, list):
+            raise ValueError("Dhan account positions response is not a list")
+        # Dhan includes realizedProfit on flat (netQty=0) rows. Keep those
+        # realized values; only unrealized P&L is position-scoped.
+        realized = 0.0
+        unrealized = 0.0
+        for row in pos_rows:
+            if not isinstance(row, dict):
+                raise ValueError("Dhan account positions contains a malformed row")
             try:
-                pos_rows = self._http._get("/positions") or []
-            except Exception as exc:
-                pos_rows = []
-                self._audit("POSITIONS", "/positions", "GET", error=exc)
-            else:
-                self._audit("POSITIONS", "/positions", "GET",
-                            response=pos_rows, http_status=200)
-            for row in pos_rows if isinstance(pos_rows, list) else []:
-                if not isinstance(row, dict):
-                    continue
+                realized += float(row.get("realizedProfit")
+                                  or row.get("realized_profit") or 0.0)
+                if not math.isfinite(realized):
+                    raise ValueError("non-finite realized P&L")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Dhan realized P&L is malformed") from exc
+            try:
+                net_qty = int(row.get("netQty") or row.get("netQuantity") or 0)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Dhan position quantity is malformed") from exc
+            if net_qty:
                 try:
-                    realized += float(row.get("realizedProfit")
-                                      or row.get("realized_profit") or 0.0)
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    net_qty = int(row.get("netQty") or row.get("netQuantity") or 0)
-                except (TypeError, ValueError):
-                    net_qty = 0
-                if net_qty:
-                    try:
-                        unrealized += float(row.get("unrealizedProfit")
-                                            or row.get("unrealized_profit")
-                                            or row.get("unRealizedProfit") or 0.0)
-                    except (TypeError, ValueError):
-                        pass
-            return {
-                "mode": "LIVE",
-                "equity": avail + utilized,
-                "available_margin": avail,
-                "used_margin": utilized,
-                "realized_pnl": round(realized, 2),
-                "unrealized_pnl": round(unrealized, 2),
-                "net_pnl": round(realized + unrealized, 2),
-                "realized_pnl_source": "dhan_positions_realized_profit",
-                "dhan_client_id": self.client_id,
-                "source": "fundlimit+positions",
-            }
+                    unrealized += float(row.get("unrealizedProfit")
+                                        or row.get("unrealized_profit")
+                                        or row.get("unRealizedProfit") or 0.0)
+                    if not math.isfinite(unrealized):
+                        raise ValueError("non-finite unrealized P&L")
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("Dhan unrealized P&L is malformed") from exc
+        return {
+            "mode": "LIVE",
+            "equity": avail + utilized,
+            "available_margin": avail,
+            "used_margin": utilized,
+            "realized_pnl": round(realized, 2),
+            "unrealized_pnl": round(unrealized, 2),
+            "net_pnl": round(realized + unrealized, 2),
+            "realized_pnl_source": "dhan_positions_realized_profit",
+            "dhan_client_id": self.client_id,
+            "source": "fundlimit+positions",
+        }
 
     def disconnect(self) -> None:
         if self._owns_http:

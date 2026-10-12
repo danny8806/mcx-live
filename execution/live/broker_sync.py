@@ -120,6 +120,11 @@ class BrokerSyncService:
         self._last_cycle: dict[str, float] = {}
         self._consecutive_errors: dict[str, int] = {
             "orders": 0, "positions": 0, "account": 0, "reconcile": 0}
+        self._rest_error_counts: dict[str, int] = {}
+        self._rest_error_baseline_initialized = False
+        self._last_rest_error_at = 0.0
+        self._rest_degraded_window = 5.0
+        self._rest_degraded = False
 
         # ── service-level stats ───────────────────────────────────────
         self._stats: dict[str, int] = {
@@ -342,6 +347,26 @@ class BrokerSyncService:
                 self._running = False
                 self._stop_event.set()
                 return
+            try:
+                poller_stats = self._poller.stats()
+                current_errors = dict(poller_stats.get("errors") or {})
+            except Exception:
+                current_errors = {}
+            now = self._clock()
+            previous_errors = getattr(self, "_rest_error_counts", {})
+            if not getattr(self, "_rest_error_baseline_initialized", False):
+                self._rest_error_counts = current_errors
+                self._rest_error_baseline_initialized = True
+            else:
+                if any(int(current_errors.get(task, 0) or 0)
+                       > int(previous_errors.get(task, 0) or 0)
+                       for task in current_errors):
+                    self._last_rest_error_at = now
+                self._rest_error_counts = current_errors
+            self._rest_degraded = bool(
+                getattr(self, "_last_rest_error_at", 0.0)
+                and now - getattr(self, "_last_rest_error_at", 0.0)
+                < getattr(self, "_rest_degraded_window", 5.0))
             # WS feed health (when enabled)
             ws_ok = True
             if self._ws_enabled and self._ws_feed is not None:
@@ -384,7 +409,8 @@ class BrokerSyncService:
             # Overall health: a dead order feed degrades the service even while
             # the REST poller worker is alive. Fills still arrive over REST, so
             # this is degraded, not stopped.
-            self._healthy = worker_alive and ws_ok
+            self._healthy = worker_alive and ws_ok and not getattr(
+                self, "_rest_degraded", False)
         # Notify outside the sync lock; the event pipeline may persist the
         # transition and must never hold the broker-health lock while doing so.
         if ws_status_event is not None:
@@ -509,6 +535,9 @@ class BrokerSyncService:
             poller_stats["worker_alive"] = bool(self._poller.running)
             poller_stats.update(self._stats)
             poller_stats["service_healthy"] = self._healthy
+            poller_stats["rest_degraded"] = getattr(self, "_rest_degraded", False)
+            poller_stats["last_rest_error_at"] = getattr(
+                self, "_last_rest_error_at", 0.0) or None
             poller_stats["ws_enabled"] = self._ws_enabled
             live = self._ws_liveness()
             poller_stats["ws_connected"] = live["connected"]
@@ -522,6 +551,8 @@ class BrokerSyncService:
         live = self._ws_liveness()
         poller_snap["service"] = {
             "healthy": self._healthy,
+            "rest_degraded": getattr(self, "_rest_degraded", False),
+            "last_rest_error_at": getattr(self, "_last_rest_error_at", 0.0) or None,
             "ws_enabled": self._ws_enabled,
             "ws_connected": live["connected"],
             "ws_stale": live["stale"],

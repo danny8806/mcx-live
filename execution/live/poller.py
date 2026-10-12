@@ -373,11 +373,18 @@ class LiveBrokerPoller:
         if not hasattr(broker, "order_statuses"):
             return []
         try:
-            statuses = broker.order_statuses() or {}
+            statuses = broker.order_statuses()
+            if statuses is None:
+                statuses = {}
         except Exception as e:
             self._errors["orders"] += 1
             log.error("[LivePoller:%s] order_statuses failed: %s", self.env.name, e)
             return []
+        status_errors = list(getattr(statuses, "poll_errors", []) or [])
+        if status_errors:
+            self._errors["orders"] += len(status_errors)
+            log.error("[LivePoller:%s] some Dhan order statuses could not be read: %s",
+                      self.env.name, status_errors)
         # F2 — terminalize durable pending rows whose entry the broker ended
         # without a fill (rejected/cancelled).  Entry-role orders only; exit /
         # reversal-exit orders never own a pending row.  Idempotent: rows

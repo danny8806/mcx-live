@@ -168,6 +168,28 @@ def test_transport_confirms_order_state_after_documented_202_cancel_ack():
     assert result["raw_status"] == "CANCELLED"
 
 
+def test_stale_cancel_verification_does_not_regress_partial_fill_state():
+    class Http:
+        def _delete(self, _path):
+            return {}
+
+        def _get(self, _path):
+            return [{"orderId": "B-PART", "orderStatus": "PENDING",
+                     "filledQty": 1, "averageTradedPrice": 100}]
+
+    broker = DhanRestTransport(client_id="TEST", http=Http())
+    broker._orders["B-PART"] = {
+        "broker_order_id": "B-PART", "status": "filled", "raw_status": "PART_TRADED",
+        "quantity": 2, "filled_quantity": 1, "last_accounted_qty": 1,
+        "average_fill_price": 100.0,
+    }
+
+    result = broker.cancel_order("B-PART")
+
+    assert result["ok"] is False
+    assert result["raw_status"] == "PART_TRADED"
+
+
 class _DhanHttp:
     def __init__(self):
         self.puts = []
@@ -310,9 +332,10 @@ def test_bad_fill_numbers_do_not_abort_polling_other_orders():
 
     statuses = broker.order_statuses()
 
-    assert "B-BAD" not in statuses
+    assert statuses["B-BAD"]["status"] == "submitted"
     assert statuses["B-GOOD"]["filled_quantity"] == 1
     assert len(statuses["B-GOOD"]["fills"]) == 1
+    assert statuses.poll_errors[0]["broker_order_id"] == "B-BAD"
 
 
 def test_stale_lower_cumulative_quantity_does_not_regress_fill_truth():
@@ -388,3 +411,147 @@ def test_account_pnl_keeps_dhan_realized_profit_for_flat_positions():
     assert account["unrealized_pnl"] == 75
     assert account["net_pnl"] == -9140
     assert account["realized_pnl_source"] == "dhan_positions_realized_profit"
+
+
+def test_broker_read_failures_are_not_reported_as_empty_books_or_zero_account():
+    class Http:
+        def _get(self, path):
+            raise OSError(f"offline: {path}")
+
+    broker = DhanRestTransport(client_id="TEST", http=Http())
+
+    with pytest.raises(RuntimeError, match="day order book"):
+        broker.day_order_book()
+    with pytest.raises(RuntimeError, match="tradebook"):
+        broker.tradebook()
+    with pytest.raises(RuntimeError, match="fund-limit"):
+        broker.account_status()
+
+
+def test_malformed_position_payload_does_not_turn_into_flat_or_zero_pnl():
+    class Http:
+        def _get(self, path):
+            if path == "/positions":
+                return [{"securityId": "123", "netQty": "unknown"}]
+            if path == "/fundlimit":
+                return {"availabelBalance": 1000, "utilizedAmount": 0}
+            raise AssertionError(path)
+
+    broker = DhanRestTransport(
+        client_id="TEST", http=Http(),
+        instruments={"GOLDM": {"security_id": "123"}},
+    )
+
+    with pytest.raises(ValueError, match="quantity is malformed"):
+        broker.positions()
+    with pytest.raises(ValueError, match="quantity is malformed"):
+        broker.account_status()
+
+
+def test_unknown_order_status_is_reported_and_does_not_mutate_known_state():
+    class Http:
+        def _get(self, path):
+            return {"orderId": "B-UNKNOWN", "orderStatus": "MYSTERY",
+                    "filledQty": 0}
+
+    broker = DhanRestTransport(client_id="TEST", http=Http())
+    broker._orders["B-UNKNOWN"] = {
+        "broker_order_id": "B-UNKNOWN", "status": "submitted", "raw_status": "PENDING",
+        "quantity": 1, "filled_quantity": 0, "last_accounted_qty": 0,
+        "average_fill_price": 0.0,
+    }
+
+    statuses = broker.order_statuses()
+
+    assert statuses["B-UNKNOWN"]["raw_status"] == "PENDING"
+    assert "unknown or missing" in statuses.poll_errors[0]["error"]
+
+
+def test_order_status_poll_preserves_good_rows_and_exposes_failed_status_reads():
+    class Http:
+        def _get(self, path):
+            if path == "/orders/B-FAIL":
+                raise TimeoutError("slow Dhan response")
+            if path == "/orders/B-OK":
+                return {"orderId": "B-OK", "orderStatus": "TRADED",
+                        "filledQty": 1, "averageTradedPrice": 99}
+            raise AssertionError(path)
+
+    broker = DhanRestTransport(client_id="TEST", http=Http())
+    for bid in ("B-FAIL", "B-OK"):
+        broker._orders[bid] = {
+            "broker_order_id": bid, "status": "submitted", "raw_status": "PENDING",
+            "quantity": 1, "filled_quantity": 0, "last_accounted_qty": 0,
+            "average_fill_price": 0.0, "side": "BUY", "instrument": "GOLDM",
+        }
+
+    statuses = broker.order_statuses()
+
+    assert statuses["B-FAIL"]["status"] == "submitted"  # last known state retained
+    assert statuses["B-OK"]["filled_quantity"] == 1
+    assert len(statuses["B-OK"]["fills"]) == 1
+    assert statuses.poll_errors == [{
+        "broker_order_id": "B-FAIL", "error": "slow Dhan response"}]
+
+
+def test_order_status_rest_wait_does_not_hold_transport_state_lock():
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class Http:
+        def _get(self, path):
+            started.set()
+            assert release.wait(timeout=2)
+            return {"orderId": "B-SLOW", "orderStatus": "PENDING",
+                    "filledQty": 0, "averageTradedPrice": 0}
+
+    broker = DhanRestTransport(client_id="TEST", http=Http())
+    broker._orders["B-SLOW"] = {
+        "broker_order_id": "B-SLOW", "status": "submitted", "raw_status": "PENDING",
+        "quantity": 1, "filled_quantity": 0, "last_accounted_qty": 0,
+        "average_fill_price": 0.0, "side": "BUY", "instrument": "GOLDM",
+    }
+    worker = threading.Thread(target=broker.order_statuses)
+    worker.start()
+    assert started.wait(timeout=1)
+    # This takes the transport state lock and must return while HTTP is blocked.
+    assert broker.fills() == []
+    release.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+
+
+def test_late_pending_rest_response_cannot_regress_a_broker_confirmed_fill():
+    class Http:
+        def _get(self, path):
+            assert path == "/orders/B-MONO"
+            return {"orderId": "B-MONO", "orderStatus": "PENDING",
+                    "filledQty": 0, "averageTradedPrice": 0}
+
+    broker = DhanRestTransport(client_id="TEST", http=Http())
+    broker._orders["B-MONO"] = {
+        "broker_order_id": "B-MONO", "status": "filled", "raw_status": "TRADED",
+        "quantity": 1, "filled_quantity": 1, "last_accounted_qty": 1,
+        "average_fill_price": 100.0, "side": "BUY", "instrument": "GOLDM",
+    }
+
+    status = broker.order_statuses()["B-MONO"]
+
+    assert status["status"] == "filled"
+    assert status["raw_status"] == "TRADED"
+    assert status["filled_quantity"] == 1
+
+
+def test_static_ip_helper_matches_documented_primary_and_secondary_fields():
+    class Http:
+        def _get(self, path):
+            assert path == "/ip/getIP"
+            return {"primaryIP": "203.0.113.10", "secondaryIP": "203.0.113.11"}
+
+    broker = DhanRestTransport(client_id="TEST", http=Http())
+
+    assert broker.verify_static_ip("203.0.113.11")["whitelisted"] is True
+    assert broker.verify_static_ip("198.51.100.5")["whitelisted"] is False
+    assert broker.verify_static_ip()["whitelisted"] is None
