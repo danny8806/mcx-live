@@ -33,6 +33,7 @@ _parent = str(Path(__file__).resolve().parent.parent)
 if _parent not in sys.path:
     sys.path.insert(0, _parent)
 
+from dashboard.api_contract import normalize_api_error_status  # noqa: E402
 from dashboard.event_bus import EventBus  # noqa: E402
 from dashboard.ws_manager import ConnectionManager  # noqa: E402
 from dashboard.routes import (  # noqa: E402
@@ -310,6 +311,7 @@ def create_live_app(live_engine=None) -> FastAPI:
             pass
 
     app = FastAPI(title="GoldSilver LIVE App", version="1.1.0", lifespan=lifespan)
+    app.middleware("http")(normalize_api_error_status)
     _cors_origins = os.getenv("CORS_ORIGINS", "").split(",") if os.getenv("CORS_ORIGINS") else [
         "http://localhost:5173", "http://localhost:5174",
         "http://127.0.0.1:5173", "http://127.0.0.1:5174",

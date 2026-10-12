@@ -1,4 +1,6 @@
 from dashboard.routes import live_ops
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 
 def test_live_ops_orders_expose_local_gate_block_without_fabricating_broker_attempt(
@@ -42,18 +44,33 @@ def test_live_ops_orders_expose_local_gate_block_without_fabricating_broker_atte
     monkeypatch.setattr(live_ops, "_watcher_records", lambda _env: {})
     monkeypatch.setattr(live_ops, "_product_type", lambda: "MARGIN")
     monkeypatch.setattr(live_ops, "_security_id_for", lambda _instrument: "571445")
+    for name in ("_get_funds_sync", "_sync_snapshot", "_candles_sync",
+                 "_get_signals_sync", "_get_positions_sync", "_get_pnl_sync",
+                 "_get_recon_sync", "_get_telegram_sync", "_global_timeline_sync"):
+        if hasattr(live_ops, name):
+            monkeypatch.setattr(live_ops, name, lambda *args, **kwargs: {})
 
-    result = live_ops._get_orders_sync()
+    app = FastAPI()
+    app.include_router(live_ops.router)
+    response = TestClient(app).get("/api/live/orders")
 
+    assert response.status_code == 200
     assert "reason, submission_outcome" in captured_sql[0]
     assert "submission_attempt_count, rejection_retry_count, submission_attempts" in captured_sql[0]
-    order = result["orders"][0]
+    order = response.json()["orders"][0]
     assert order["reason"] == "LIVE_GATE_CLOSED"
     assert order["submission_outcome"] == "NOT_SENT"
     assert order["submission_attempt_count"] == 0
     assert order["rejection_retry_count"] == 0
     assert order["submission_attempts"] == [{"attempt": 0, "stage": "local_gate"}]
     assert order["broker_order_id"] is None
+
+    dashboard = TestClient(app).get("/api/live/dashboard")
+    assert dashboard.status_code == 200
+    dashboard_order = dashboard.json()["orders"]["orders"][0]
+    assert dashboard_order["reason"] == "LIVE_GATE_CLOSED"
+    assert dashboard_order["submission_outcome"] == "NOT_SENT"
+    assert dashboard_order["submission_attempt_count"] == 0
 
 
 def test_live_ops_orders_normalize_corrupt_attempt_history(monkeypatch):
@@ -70,9 +87,12 @@ def test_live_ops_orders_normalize_corrupt_attempt_history(monkeypatch):
     monkeypatch.setattr(live_ops, "_product_type", lambda: "MARGIN")
     monkeypatch.setattr(live_ops, "_security_id_for", lambda _instrument: "483080")
 
-    result = live_ops._get_orders_sync()
+    app = FastAPI()
+    app.include_router(live_ops.router)
+    response = TestClient(app).get("/api/live/orders")
 
-    order = result["orders"][0]
+    assert response.status_code == 200
+    order = response.json()["orders"][0]
     assert order["submission_attempts"] == []
     assert order["submission_attempt_count"] == 0
     assert order["rejection_retry_count"] == 0
