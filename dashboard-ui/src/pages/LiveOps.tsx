@@ -304,9 +304,14 @@ export default function LiveOps() {
             <span className="tabular-nums" style={{ color: o.filled_quantity && o.filled_quantity >= o.quantity ? "var(--green)" : "var(--text-secondary)" }}>{o.filled_quantity ?? 0}</span>
             <span className="tabular-nums" style={{ color: "var(--text-secondary)" }}>{o.remaining_quantity ?? "—"}</span>
             <span style={{ color: "var(--text-muted)" }}>{o.order_type}{o.order_role && o.order_role !== "ENTRY" && o.order_role !== "PENDING_ENTRY" ? ` · ${o.order_role}` : ""}</span>
-            <span style={{ color: StateColor(o.state), fontWeight: 600 }}>{o.state}</span>
+            <span
+              title={[o.reason, o.submission_outcome ? `Submission: ${o.submission_outcome}` : null, `Attempts: ${o.submission_attempt_count ?? 0}`, `Retries: ${o.rejection_retry_count ?? 0}`].filter(Boolean).join(" · ")}
+              style={{ color: StateColor(o.state), fontWeight: 600 }}
+            >
+              {o.state}{["NOT_SENT", "OUTCOME_UNKNOWN"].includes(o.submission_outcome) ? ` · ${o.submission_outcome}` : ""}
+            </span>
             <span style={{ fontSize: "9px", color: "var(--text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-              {o.watcher_status ? `${o.watcher_status}${o.rest_verified ? " ✓rest" : " (no rest)"}${o.last_error ? ` ✗${o.last_error_code || ""}` : ""}` : "not watched"}
+              {o.watcher_status ? `${o.watcher_status}${o.rest_verified ? " ✓rest" : " (no rest)"}${o.last_error ? ` ✗${o.last_error_code || ""}` : ""}` : (o.reason || "not watched")}
               {o.submitted_at ? ` · sub ${formatTimestamp(secs(o.submitted_at) as number)}` : ""}
               {o.product_type ? ` · ${o.product_type}` : ""}
             </span>

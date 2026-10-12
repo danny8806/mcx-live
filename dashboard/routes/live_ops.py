@@ -720,6 +720,24 @@ def _watcher_records(env) -> dict[str, dict]:
 
 def _enrich_order_row(row: dict, w: Optional[dict]) -> dict:
     out = dict(row)
+    # Keep the placement decision evidence on the primary LIVE order read
+    # model.  The general /api/orders route exposes these fields, but this
+    # route powers the Live Ops dashboard and must not reduce a locally
+    # blocked order to an unexplained "rejected" status.
+    out["reason"] = row.get("reason")
+    out["submission_outcome"] = row.get("submission_outcome") or "NOT_SENT"
+    try:
+        out["submission_attempt_count"] = int(
+            row.get("submission_attempt_count") or 0)
+    except (TypeError, ValueError):
+        out["submission_attempt_count"] = 0
+    try:
+        out["rejection_retry_count"] = int(
+            row.get("rejection_retry_count") or 0)
+    except (TypeError, ValueError):
+        out["rejection_retry_count"] = 0
+    attempts = json_loads(row.get("submission_attempts"))
+    out["submission_attempts"] = attempts if isinstance(attempts, list) else []
     out["broker_order_id"] = row.get("broker_order_id") or (w or {}).get("broker_order_id")
     out["exchange_order_id"] = (w or {}).get("exchange_order_id")
     out["correlation_id"] = row.get("correlation_id") or (w or {}).get("correlation_id")
@@ -776,7 +794,9 @@ def _get_orders_sync(limit: int = 40, instrument: Optional[str] = None,
            "price, planned_entry_price, planned_sl, planned_order_type, "
            "order_intent, state, filled_quantity, average_fill_price, "
            "execution_mode, created_at, updated_at, order_role, trigger_price, "
-           "protected_order_id, correlation_id FROM orders WHERE execution_mode='LIVE'")
+           "protected_order_id, correlation_id, reason, submission_outcome, "
+           "submission_attempt_count, rejection_retry_count, submission_attempts "
+           "FROM orders WHERE execution_mode='LIVE'")
     params: list = []
     if instrument:
         sql += " AND instrument=?"
