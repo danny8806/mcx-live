@@ -152,7 +152,7 @@
   },
   "live": {
     "live_trading_enabled": true,
-    "gate": "ON",
+    "gate": "OFF",
     "broker": "dhan",
     "reconcile_interval_seconds": 0.5,
     "tradebook_reconcile_interval_seconds": 30.0,
