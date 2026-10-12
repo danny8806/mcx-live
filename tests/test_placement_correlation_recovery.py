@@ -64,7 +64,7 @@ def _transport(http, **kw):
         instruments={"GOLDM": {"security_id": "1",
                                "exchange_segment": "MCX_COMM",
                                "symbol": "GOLDM"}},
-        instrument_strategies={"GOLDM": ["gold_01"]},
+        instrument_strategies={"GOLDM": ["gold_02"]},
         gate_enabled=True,
         clock=lambda: 1000.0,
         product_type="MARGIN",
@@ -495,7 +495,7 @@ def test_engine_parks_unresolved_placement_as_submitted():
     eng.submission_guard = None
     eng._now = lambda: 1000.0
 
-    order = Order(order_id="O1", strategy_id="gold_01", instrument="GOLDM",
+    order = Order(order_id="O1", strategy_id="gold_02", instrument="GOLDM",
                   side="BUY", quantity=10, order_type="LIMIT", price=100.0,
                   order_role="ENTRY", trade_id="T1",
                   lifecycle_id="L1", parent_signal_id="S1",
@@ -527,7 +527,7 @@ def test_engine_still_rejects_a_definitive_broker_rejection():
     eng.submission_guard = None
     eng._now = lambda: 1000.0
 
-    order = Order(order_id="O2", strategy_id="gold_01", instrument="GOLDM",
+    order = Order(order_id="O2", strategy_id="gold_02", instrument="GOLDM",
                   side="BUY", quantity=10, order_type="LIMIT", price=100.0,
                   order_role="ENTRY", trade_id="T1",
                   lifecycle_id="L1", parent_signal_id="S2",
@@ -565,7 +565,7 @@ def test_engine_order_state_follows_dhan_placement_result(broker_result, expecte
     eng.broker_router = None
     eng.submission_guard = None
     eng._now = lambda: 1000.0
-    order = Order(order_id="O-RESPONSE", strategy_id="gold_01", instrument="GOLDM",
+    order = Order(order_id="O-RESPONSE", strategy_id="gold_02", instrument="GOLDM",
                   side="BUY", quantity=1, order_type="LIMIT", price=100.0,
                   order_role="ENTRY", trade_id="T-RESPONSE",
                   lifecycle_id="T-RESPONSE", parent_signal_id="S-RESPONSE",
@@ -624,7 +624,7 @@ def test_unresolved_order_keeps_the_pending_row_entry_sent():
 
     class Sig:
         signal_id = "P1"
-        strategy_id = "gold_01"
+        strategy_id = "gold_02"
         instrument = "GOLDM"
         side = "BUY"
         trigger_price = 100.0

@@ -993,30 +993,6 @@ class TradeLifecycleManager:
             return new_trade
 
     # ═══════════════════════════════════════════
-    # STOP LOSS — closes existing trade, NO new trade
-    # ═══════════════════════════════════════════
-
-    def apply_stop_loss(self, trade_id: str, exit_price: float,
-                        exit_reason: str = "STOP_LOSS") -> bool:
-        """Mark a trade as stopped out. Does NOT create a new trade.
-
-        exit_signal_id remains NULL (SL doesn't require a signal).
-        """
-        with self._lock:
-            trade = self._trades.get(trade_id)
-            if not trade:
-                return False
-            trade.exit_type = ExitType.STOP_LOSS.value
-            trade.exit_reason = exit_reason
-            trade.exit_price = exit_price
-            trade.exit_timestamp = time.time()
-            # exit_signal_id stays NULL — SL doesn't need a signal
-            self._record_event(trade_id, "STOP_LOSS_APPLIED",
-                               payload={"exit_price": exit_price, "exit_reason": exit_reason})
-            self._persist_trade(trade)
-            return True
-
-    # ═══════════════════════════════════════════
     # EVENT LOG
     # ═══════════════════════════════════════════
 

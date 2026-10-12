@@ -268,14 +268,13 @@ class DhanRestTransport(LiveBrokerClient):
             _attempt_history = []
         side_u = str(side).upper()
         # INVARIANT 10 — the last gate before the wire, checked FIRST.  This
-        # system has NO broker-side protective stop: a stop-loss is the local
-        # position-owned monitor minting an ordinary LIMIT/MARKET exit.  A
-        # resting stop-limit / SLM must never reach Dhan from any caller.
+        # Current SuperTrend execution has no stop-loss order. Reject stop
+        # order types so an obsolete caller cannot place one with Dhan.
         order_type_u = (order_type or "MARKET").upper()
         if order_type_u in ("STOP_LOSS", "STOP_LOSS_MARKET"):
             raise ValueError(
-                "BROKER_SL_RETIRED: broker-side protective stop orders are "
-                "disabled; the stop is the local position-owned SL monitor")
+                "BROKER_SL_RETIRED: stop orders are unsupported by the current "
+                "SuperTrend execution")
         if not self.gate_enabled:
             raise BrokerGateClosed("LIVE_GATE_CLOSED: live trading master gate is OFF")
         if side_u not in ("BUY", "SELL"):
@@ -1233,8 +1232,8 @@ class DhanRestTransport(LiveBrokerClient):
         # either (INVARIANT 10).
         if order_type_u in ("STOP_LOSS", "STOP_LOSS_MARKET"):
             raise ValueError(
-                "BROKER_SL_RETIRED: broker-side protective stop orders are "
-                "disabled; the stop is the local position-owned SL monitor")
+                "BROKER_SL_RETIRED: stop orders are unsupported by the current "
+                "SuperTrend execution")
         if order_type_u not in ("MARKET", "LIMIT"):
             raise ValueError(f"unsupported Dhan orderType: {order_type_u}")
         if order_type_u == "LIMIT" and not (price is not None and float(price) > 0):

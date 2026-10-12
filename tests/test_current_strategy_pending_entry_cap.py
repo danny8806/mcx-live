@@ -90,7 +90,7 @@ def test_restore_rejects_legacy_strategy_position_even_with_same_profile_id():
     env = SimpleNamespace(strategies={"gold_02": strategy})
     signal = {
         "strategy_id": "gold_02", "instrument": "GOLDM",
-        "signal_metadata": json.dumps({"strategy_type": "dema_atr"}),
+        "signal_metadata": json.dumps({"strategy_type": "retired_strategy"}),
     }
     persistence = SimpleNamespace(get_signal=lambda _signal_id: signal)
     position = {"strategy_id": "gold_02", "instrument": "GOLDM",
@@ -102,7 +102,7 @@ def test_restore_rejects_legacy_strategy_position_even_with_same_profile_id():
 def test_position_restore_filter_quarantines_legacy_row_and_enters_safe_mode():
     strategy = SimpleNamespace(strategy_type="supertrend")
     signal = {"strategy_id": "gold_02", "instrument": "GOLDM",
-              "signal_metadata": json.dumps({"strategy_type": "dema_atr"})}
+              "signal_metadata": json.dumps({"strategy_type": "retired_strategy"})}
     safe_mode_calls = []
     env = SimpleNamespace(
         strategies={"gold_02": strategy},
@@ -129,7 +129,7 @@ def test_order_restore_accepts_current_market_order_and_quarantines_unknown_orde
     }
     old_signal = {
         "strategy_id": "gold_02", "instrument": "GOLDM",
-        "signal_metadata": json.dumps({"strategy_type": "dema_atr"}),
+        "signal_metadata": json.dumps({"strategy_type": "retired_strategy"}),
     }
     safe_mode_calls = []
     env = SimpleNamespace(

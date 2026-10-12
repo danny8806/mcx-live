@@ -55,7 +55,6 @@ files = [
     "dashboard/routes/broker_evidence.py",
     "dashboard/routes/live_ops.py",
     "dashboard/routes/reversals.py",
-    "dashboard/routes/replay.py",
     "portfolio/account.py",
     "analytics/routes.py",
     "config/live_settings.json",

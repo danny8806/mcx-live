@@ -7,9 +7,7 @@ SKIP_DIRS = {
     # Local backtests and generated reports are not runtime inputs. Excluding
     # them keeps deployment sync lean and prevents datasets/reports reaching
     # the live host.
-    "backtest_results", "backtest_results_pine_15m", "backtest_results_repeat",
-    "backtest_results_supertrend_15m", "backtest_sniper_720m",
-    "backtest_tv_15m_strategies", "output", "outputs", "final_reports",
+    "output", "outputs", "final_reports",
     "verification",
 }
 SKIP_ROOT_PREFIXES = ("p6_", "live_verify", "vps_", "verify_", "check_")
@@ -27,6 +25,8 @@ def should_skip(path: str) -> bool:
     if not rel:
         return False
     parts = rel.split("/")
+    if any(part.startswith("backtest_") for part in parts):
+        return True
     if parts[0] == "tools":
         return True
     if len(parts) == 1 and (

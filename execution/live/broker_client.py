@@ -255,8 +255,8 @@ class StubLiveBroker(LiveBrokerClient):
             # then place a real resting stop in production.
             if ot in ("STOP_LOSS", "STOP_LOSS_MARKET"):
                 raise ValueError(
-                    "BROKER_SL_RETIRED: broker-side protective stop orders are "
-                    "disabled; the stop is the local position-owned SL monitor")
+                    "BROKER_SL_RETIRED: stop orders are unsupported by the current "
+                    "SuperTrend execution")
             if self.defer_fills:
                 # Async broker simulation: the order is accepted; the fill is
                 # materialized later by ack_order() / stale-status polling.
@@ -281,8 +281,9 @@ class StubLiveBroker(LiveBrokerClient):
         """Async-only: complete a previously SUBMITTED order into a FILLED one.
 
         Returns False for unknown orders; idempotent for orders already filled
-        (a repeated ack never double-fills).  There is no broker-side trigger
-        to cross any more — the only stop is the local position-owned monitor.
+        (a repeated ack never double-fills). The current strategy submits
+        orders directly after a completed signal candle; it does not use a
+        separate stop order.
         """
         with self._lock:
             rec = self._orders.get(broker_order_id)

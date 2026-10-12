@@ -444,12 +444,9 @@ class PositionManager:
                 if sep:
                     self._generation_counters[(sid, instrument)] = int(generation or 0)
 
-            # Restore open positions.
-            # BUG FIX: Always key by pos.position_id (the UUID), NOT by
-            # the dict key (pid) from the state file.  Older state files
-            # used strategy names (e.g. "silver_02") as dict keys, but
-            # close_position() looks up by position_id (UUID).  Using the
-            # wrong key causes "Position not found" in heal/reconciliation.
+            # Restore open positions by position_id because close_position()
+            # resolves positions through that UUID, never through a serialized
+            # dictionary key from a prior state format.
             for pid, pos_data in data.get("open_positions", {}).items():
                 exit_fills = []
                 for f_data in pos_data.get("exit_fills", []):

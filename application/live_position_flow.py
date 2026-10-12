@@ -161,9 +161,9 @@ class LivePositionFlowMixin:
                             if getattr(env, "execution_engine", None) is not None
                             else None)
             is_fallback = str(getattr(filled_order, "order_role", "")).upper() == "FALLBACK_MARKET"
-            # The NEW position's stop is the local position-owned monitor, so
-            # "protected" is simply "this position is ARMED (or explicitly
-            # unavailable) with a stop level".  There is no broker SL id.
+            # The current strategy has no separate stop order or local stop
+            # monitor. The reversal completes after the broker confirms the
+            # new entry fill.
             fields = {
                 "new_entry_order_id": getattr(fill, "order_id", None),
                 "new_entry_fill_price": getattr(

@@ -53,7 +53,6 @@ def test_exclusive_runtime_builds_only_the_two_15m_supertrend_strategies(tmp_pat
             silver_st.atr_method, silver_st.first_tr) == (
                 36, 4.9, "low", "sma_tr", "na")
     assert not hasattr(engine.live.strategies["gold_02"], "fast_indicator")
-    assert not hasattr(engine.live.strategies["silver_01"], "slow_htf_state")
     assert engine.live.strategies["gold_02"].subscriptions == ["GOLDM:15m"]
     assert engine.live.strategies["silver_01"].subscriptions == ["SILVERM:15m"]
     # The live-only runtime owns its own data graph. With no Dhan credentials
@@ -64,7 +63,7 @@ def test_exclusive_runtime_builds_only_the_two_15m_supertrend_strategies(tmp_pat
     assert engine.live.indicator_engine is None
     assert set(engine.live.indicators) == {"gold_02_supertrend", "silver_01_supertrend"}
     assert set(engine.strategy_gates()) == {"gold_02", "silver_01"}
-    assert engine.control_strategy("silver_02", "resume")["success"] is False
+    assert engine.control_strategy("retired_profile", "resume")["success"] is False
 
 
 def test_persisted_rollover_contract_is_applied_before_runtime_feeds_are_built(tmp_path):

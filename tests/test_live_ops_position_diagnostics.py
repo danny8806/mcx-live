@@ -37,7 +37,7 @@ def test_position_diagnostics_deduplicate_dhan_instrument_mapping(monkeypatch):
     env = SimpleNamespace(
         poller=_Poller([
             broker_row,
-            {**broker_row, "strategy_id": "silver_02"},
+            {**broker_row, "strategy_id": "unassigned_profile"},
         ]),
         position_manager=SimpleNamespace(snapshot=lambda: {
             "open_positions": {
@@ -71,7 +71,7 @@ def test_position_diagnostics_aggregate_local_strategy_owners(monkeypatch):
                 "p1": _position("silver_01", "LONG", 1,
                                  average_entry_price=100, unrealized_pnl=4,
                                  sl_state="ARMED"),
-                "p2": _position("silver_02", "LONG", 1,
+                "p2": _position("unassigned_profile", "LONG", 1,
                                  average_entry_price=102, unrealized_pnl=6,
                                  sl_state="ARMED"),
             }
@@ -83,7 +83,7 @@ def test_position_diagnostics_aggregate_local_strategy_owners(monkeypatch):
 
     assert row["status"] == "MATCHED"
     assert row["strategy_id"] is None
-    assert row["local_owners"] == ["silver_01", "silver_02"]
+    assert row["local_owners"] == ["silver_01", "unassigned_profile"]
     assert row["local"]["side"] == row["dhan"]["side"] == "LONG"
     assert row["local"]["quantity"] == row["dhan"]["quantity"] == 2
     assert row["local"]["average_entry_price"] == 101
@@ -94,7 +94,7 @@ def test_position_diagnostics_do_not_hide_conflicting_broker_rows(monkeypatch):
     env = SimpleNamespace(
         poller=_Poller([
             _position("silver_01", "LONG", 1),
-            _position("silver_02", "SHORT", 1),
+            _position("unassigned_profile", "SHORT", 1),
         ]),
         position_manager=SimpleNamespace(snapshot=lambda: {
             "open_positions": {"p1": _position("silver_01", "LONG", 1)}
@@ -124,7 +124,7 @@ def test_sync_reports_flattened_poller_broker_position_count(monkeypatch):
         snapshot=lambda: {
             "running": True,
             "positions": [_position("silver_01", "LONG", 1),
-                          _position("silver_02", "LONG", 1)],
+                          _position("unassigned_profile", "LONG", 1)],
             "accounts": {"available_margin": 100},
             "position_mismatches": [],
         },

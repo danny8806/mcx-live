@@ -15,7 +15,7 @@ def test_order_persistence_includes_assigned_broker_order_id():
             return SimpleNamespace(persistence=_Persistence())
 
     order = SimpleNamespace(
-        order_id="LIVE-EXIT", strategy_id="gold_01", instrument="GOLDPETAL",
+        order_id="LIVE-EXIT", strategy_id="gold_02", instrument="GOLDM",
         side="SELL", quantity=1, order_type="MARKET", price=0.0,
         trigger_price=None, planned_entry_price=14897.0, planned_sl=None,
         planned_order_type="LIMIT", order_role="EMERGENCY_EXIT",

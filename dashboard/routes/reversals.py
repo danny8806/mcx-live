@@ -4,7 +4,7 @@ Each row is a durable reversal lifecycle record: the OLD-position exit
 (REVERSAL_EXIT, ORDER_A) and the NEW opposite entry (REVERSAL_ENTRY,
 ORDER_B) with the SAME reversal trigger price.  The chain render is NEVER
 marked complete until the old position is provably flat AND the new entry
-fill is broker-confirmed AND the new protective SL is placed.
+fill is broker-confirmed.
 """
 from __future__ import annotations
 import asyncio

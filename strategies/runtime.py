@@ -1,6 +1,6 @@
 """StrategyRuntime — fully isolated per-strategy runtime container.
 
-The engine owns exactly four StrategyRuntime objects (one per strategy).
+The engine owns exactly two StrategyRuntime objects (one per strategy).
 Every piece of mutable per-strategy state lives on the runtime:
 
     - strategy            SuperTrend strategy state and indicator

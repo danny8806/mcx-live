@@ -400,9 +400,8 @@ class LiveBrokerPoller:
         # serialize this local state transition with concurrent submit/fill
         # callbacks. Network I/O above remains outside the lock.
         # Keep broker-order state application and the resulting fill-to-position
-        # transition in one critical section. Releasing the lock between these
         # steps exposes an intermediate state (broker order FILLED, local
-        # position not yet created/closed) to candle and SL callbacks.
+        # position not yet created/closed) to concurrent strategy callbacks.
         fills_to_persist = []
         with self._state_lock:
             broker_fills = engine.apply_broker_statuses(statuses)
@@ -428,9 +427,8 @@ class LiveBrokerPoller:
             self._upgrade_dbs_order_row(fill)
         # Phase 6 — persist any order whose state flipped to REJECTED, CANCELLED
         # or EXPIRED during apply_broker_statuses (no fill is produced for
-        # those, so _upgrade_dbs_order_row is never reached).  EXPIRED matters:
-        # a DAY-validity exit that never filled is the classic "SL order died
-        # and the position is still open" case.
+        # those, so _upgrade_dbs_order_row is never reached). This keeps local
+        # order state aligned with broker terminal responses.
         # Dhan-linked state: when an ENTRY order is rejected/cancelled by the
         # broker, reset the strategy state back to FLAT so it is never stuck
         # in ENTRY_TRIGGERED with no Dhan fill to confirm the position.

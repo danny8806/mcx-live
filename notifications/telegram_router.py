@@ -310,7 +310,7 @@ class TelegramRouter:
         self._emit("EXIT", close_data or {}, text, source="LOCAL")
 
     def on_reversal_complete(self, reversal_data: dict) -> None:
-        """Notify only after the old exit, new fill, and new local SL are confirmed."""
+        """Notify after the old exit and new entry fill are broker-confirmed."""
         text = format_reversal_complete(reversal_data or {})
         self._emit("REVERSAL", reversal_data or {}, text, source="LOCAL")
 

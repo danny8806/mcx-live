@@ -33,7 +33,7 @@ def test_position_poll_collapses_dhan_instrument_fanout_to_one_net():
     broker = SimpleNamespace(positions=lambda: [
         {"strategy_id": "silver_01", "instrument": "SILVERM",
          "side": "LONG", "quantity": 1},
-        {"strategy_id": "silver_02", "instrument": "SILVERM",
+        {"strategy_id": "unassigned_profile", "instrument": "SILVERM",
          "side": "LONG", "quantity": 1},
     ])
     env = SimpleNamespace(name="LIVE", broker=broker,
@@ -52,7 +52,7 @@ def test_position_poll_reports_instrument_net_mismatch_once():
     broker = SimpleNamespace(positions=lambda: [
         {"strategy_id": "silver_01", "instrument": "SILVERM",
          "side": "LONG", "quantity": 2},
-        {"strategy_id": "silver_02", "instrument": "SILVERM",
+        {"strategy_id": "unassigned_profile", "instrument": "SILVERM",
          "side": "LONG", "quantity": 2},
     ])
     env = SimpleNamespace(name="LIVE", broker=broker,

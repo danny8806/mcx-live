@@ -634,9 +634,9 @@ class FillFlowMixin:
 
         Books realized P&L ONLY on the portion that exited, releases margin
         proportionally, records the leg (persistence, reconciliation ledger,
-        lifecycle exit-fill) and reduces the open position — without closing
-        the trade, the position or the protective SL.  The strategy position
-        state stays armed for the remaining quantity.
+        lifecycle exit-fill) and reduces the open position without closing
+        the trade. The remaining quantity stays open until a later broker
+        fill or current-strategy opposite signal closes it.
         """
         runtime = None
         if getattr(env, "runtimes", None) is not None:
@@ -795,13 +795,10 @@ class FillFlowMixin:
                                      position) -> None:
         """Settle an entry fill into the strategy's execution state.
 
-        The pending-breakout model transitions the strategy optimistically
-        inside ``_tick_entry_trigger`` before the order is even submitted
-        (position_side/state set at trigger-cross).  The Appendix I
-        local-trigger model does NO strategy state transition at signal
-        time — the LIMIT intentionally rests flat at the broker — so the fill
-        arriving from the broker is the moment the strategy becomes an open
-        position.  This mirror-step is idempotent, so it is safe for both.
+        The current SuperTrend strategy submits a MARKET order after a
+        completed signal candle. The strategy becomes an open position only
+        when the broker fill is applied. This mirror-step is idempotent so
+        duplicate broker callbacks cannot create a second transition.
         """
         strat = env.strategies.get(strategy_id)
         if strat is None:

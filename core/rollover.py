@@ -11,7 +11,7 @@ Policy (operator-chosen)
 * ROLLOVER WINDOW opens at ``last_session - trigger_days`` trading days
   (default 2).  From then on new entries in the EXPIRING series are blocked
   (resting entries are cancelled at window open) and the metal waits to go
-  flat — the open trade exits naturally (SL/TP/reversal).
+  flat — the open trade exits on the current strategy's opposite signal.
 * Once flat inside the window the system resolves the next series from the
   Dhan scrip master (symbol + security_id + expiry) and PERSISTS the override;
   the contract is switched at the next engine boot (full re-warmup in the new

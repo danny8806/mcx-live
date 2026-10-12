@@ -47,7 +47,7 @@ def test_identical_dhan_strategy_fanout_rows_match_one_local_net_position():
         {"instrument": "SILVERM", "side": "LONG", "quantity": 1,
          "ltp": 105.0, "strategy_id": "silver_01"},
         {"instrument": "SILVERM", "side": "LONG", "quantity": 1,
-         "ltp": 105.0, "strategy_id": "silver_02"},
+         "ltp": 105.0, "strategy_id": "unassigned_profile"},
     ]
     position = _position()
     engine, _ = _engine(rows, [position])

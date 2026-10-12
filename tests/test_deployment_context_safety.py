@@ -22,7 +22,7 @@ def test_generated_backtests_and_reports_never_sync_to_vps():
         "backtest_results_pine_15m/silverm_trades.csv",
         "backtest_results_repeat/goldm_events.csv",
         "backtest_results_supertrend_15m/summary.json",
-        "backtest_sniper_720m/results/silverm_summary.json",
+        "backtest_legacy/results/trades.json",
         "backtest_tv_15m_strategies/results/report.pdf",
         "output/tmp.json",
         "outputs/result.csv",
