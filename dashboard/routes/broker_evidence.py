@@ -116,7 +116,7 @@ async def get_broker_event(event_id: str):
     if store is None:
         return {"error": "Broker audit store unavailable"}
     row = await _paged_async(lambda: store.get(event_id), store)
-    if row.get("items"):
+    if row.get("items") and row["items"][0] is not None:
         return row["items"][0]
     return {"error": "event not found"}
 
@@ -161,7 +161,7 @@ async def get_alert_event(event_id: str):
     if ledger is None:
         return {"error": "Alert ledger unavailable"}
     row = await _paged_async(lambda: ledger.get(event_id), ledger)
-    if row.get("items"):
+    if row.get("items") and row["items"][0] is not None:
         return row["items"][0]
     return {"error": "event not found"}
 

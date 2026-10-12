@@ -3,11 +3,32 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 router = APIRouter()
 _engine = None
 _bus = None
 _persistence = None
+
+
+def _active_instrument_names() -> set[str]:
+    """Current strategy instruments; legacy config must not widen this API."""
+    if _engine is None:
+        return set()
+    return {
+        str(getattr(strategy, "instrument", "") or "").upper()
+        for strategy in (_engine.strategies or {}).values()
+        if str(getattr(strategy, "instrument", "") or "").strip()
+    }
+
+
+def _require_active_instrument(instrument: str) -> str:
+    inst = str(instrument or "").strip().upper()
+    if inst not in _active_instrument_names():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Instrument {inst or '(empty)'} not found in the active strategy runtime",
+        )
+    return inst
 
 def init(engine, event_bus, persistence=None):
     global _engine, _bus, _persistence
@@ -118,7 +139,7 @@ def _get_instrument_pnl_sync(instrument: str):
     if not _engine:
         return {"error": "Engine not initialized"}
     try:
-        inst = instrument.upper()
+        inst = _require_active_instrument(instrument)
         env = _env_for()
         if env is not None and getattr(env, "persistence", None) is not None:
             from dashboard.history_pnl import trade_history_pnl
@@ -183,6 +204,8 @@ def _get_instrument_pnl_sync(instrument: str):
             "position_count": len([p for p in positions if p.is_open]),
             "timestamp": time.time(),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         return {"error": str(e)}
 
@@ -194,7 +217,15 @@ def _get_strategy_pnl_sync(instrument: str, strategy_id: str):
     if not _engine:
         return {"error": "Engine not initialized"}
     try:
-        inst = instrument.upper()
+        inst = _require_active_instrument(instrument)
+        active_strategy = (_engine.strategies or {}).get(strategy_id)
+        if (active_strategy is None
+                or str(getattr(active_strategy, "instrument", "") or "").upper() != inst):
+            raise HTTPException(
+                status_code=404,
+                detail=(f"Strategy {strategy_id} for instrument {inst} not found "
+                        "in the active strategy runtime"),
+            )
         env = _env_for()
         if env is not None and getattr(env, "persistence", None) is not None:
             from dashboard.history_pnl import trade_history_pnl
@@ -219,6 +250,8 @@ def _get_strategy_pnl_sync(instrument: str, strategy_id: str):
             "position_count": len([p for p in positions if p.is_open]),
             "timestamp": time.time(),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         return {"error": str(e)}
 
@@ -252,7 +285,9 @@ def _get_instrument_equity_curve_sync(instrument: str):
     returns a shape the equity chart can render.
     """
     try:
-        inst = instrument.upper()
+        if not _engine:
+            return {"error": "Engine not initialized"}
+        inst = _require_active_instrument(instrument)
         points = []
         env = _env_for()
         if env is not None and getattr(env, "persistence", None) is not None:
@@ -317,6 +352,8 @@ def _get_instrument_equity_curve_sync(instrument: str):
             acc += pt["equity"]
             pt["equity"] = acc
         return {"instrument": inst, "equity_curve": points, "count": len(points)}
+    except HTTPException:
+        raise
     except Exception as e:
         return {"error": str(e)}
 

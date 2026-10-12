@@ -82,3 +82,69 @@ def test_mounted_live_detail_routes_do_not_mask_not_found_or_unavailable(
         payload = response.json()
         assert payload.get("error")
         assert payload.get("detail") == payload["error"]
+
+
+def test_unknown_instrument_panels_return_not_found_instead_of_empty_success(
+        monkeypatch):
+    from types import SimpleNamespace
+
+    from dashboard.routes import indicators, overview, pnl
+    from live.api import create_live_app
+
+    strategy = SimpleNamespace(instrument="GOLDM", strategy_type="supertrend")
+    engine = SimpleNamespace(strategies={"gold_01": strategy})
+    monkeypatch.setattr(indicators, "_engine", engine)
+    monkeypatch.setattr(overview, "_engine", engine)
+    monkeypatch.setattr(pnl, "_engine", engine)
+    monkeypatch.setattr(pnl, "_persistence", None)
+
+    client = TestClient(create_live_app())
+    for path in (
+            "/api/indicators/UNKNOWN",
+            "/api/overview/UNKNOWN",
+            "/api/pnl/UNKNOWN",
+            "/api/pnl/UNKNOWN/strategy/no-such-strategy",
+            "/api/equity-curve/UNKNOWN"):
+        response = client.get(path)
+        assert response.status_code == 404, (path, response.text)
+        assert "active strategy runtime" in response.json()["detail"]
+
+
+def test_missing_broker_evidence_ids_do_not_return_json_null(monkeypatch):
+    from dashboard.routes import broker_evidence
+    from live.api import create_live_app
+
+    class MissingEventStore:
+        def get(self, _event_id):
+            return None
+
+    monkeypatch.setattr(broker_evidence, "_audit_store", MissingEventStore)
+    monkeypatch.setattr(broker_evidence, "_alert_ledger", MissingEventStore)
+    client = TestClient(create_live_app())
+
+    for path in ("/api/broker-events/missing", "/api/alert-ledger/missing"):
+        response = client.get(path)
+        assert response.status_code == 404, (path, response.text)
+        assert response.json()["error"] == "event not found"
+
+
+def test_environment_health_reports_actual_master_gate_state(monkeypatch):
+    from types import SimpleNamespace
+
+    from dashboard.routes import env_switch
+
+    live = SimpleNamespace(
+        name="live", mode="LIVE", is_live=True, gate_state="OFF",
+        gate_enabled=False, broker=None,
+        position_manager=SimpleNamespace(open_positions=[]),
+    )
+    engine = SimpleNamespace(
+        _envs={"live": live}, config=SimpleNamespace(get=lambda *_a, **_k: True),
+        _running=True,
+    )
+    monkeypatch.setattr(env_switch, "_engine", engine)
+
+    health = env_switch._health_sync("live")
+
+    assert health["gate_enabled"] is False
+    assert health["master_gate"] is False

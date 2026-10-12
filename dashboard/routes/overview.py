@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any, Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from dashboard.envs import resolve as _resolve_env
 
@@ -256,6 +256,16 @@ def _get_instrument_overview_sync(instrument: str):
     try:
         e = _engine
         instrument_upper = instrument.upper()
+        active_instruments = {
+            str(getattr(strategy, "instrument", "") or "").upper()
+            for strategy in (e.strategies or {}).values()
+        }
+        if instrument_upper not in active_instruments:
+            raise HTTPException(
+                status_code=404,
+                detail=(f"Instrument {instrument_upper} not found in the "
+                        "active strategy runtime"),
+            )
         env = _env_for()
         pnl_history = None
         if env is not None and getattr(env, "persistence", None) is not None:
@@ -306,6 +316,8 @@ def _get_instrument_overview_sync(instrument: str):
             "strategies": strat_summaries,
             "timestamp": _ts(),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         return {"error": str(e), "timestamp": _ts()}
 

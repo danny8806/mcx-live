@@ -5,7 +5,7 @@ import asyncio
 import time
 from dataclasses import asdict, is_dataclass
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 router = APIRouter()
 _engine = None
@@ -54,9 +54,20 @@ def _get_instrument_indicators_sync(instrument: str):
     if _engine is None:
         return {"error": "Engine not initialized"}
     inst = instrument.upper()
+    strategies = _engine.strategies or {}
+    active_instruments = {
+        str(getattr(strategy, "instrument", "") or "").upper()
+        for strategy in strategies.values()
+        if getattr(strategy, "strategy_type", None) == "supertrend"
+    }
+    if inst not in active_instruments:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Instrument {inst} not found in the active strategy runtime",
+        )
     values = {
         f"{strategy_id}_supertrend": _serialize(strategy_id, strategy)
-        for strategy_id, strategy in (_engine.strategies or {}).items()
+        for strategy_id, strategy in strategies.items()
         if (getattr(strategy, "strategy_type", None) == "supertrend"
             and strategy.instrument.upper() == inst)
     }

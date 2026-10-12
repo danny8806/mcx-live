@@ -271,14 +271,17 @@ def _health_sync(env: str):
             stats = _bus.get_stats()
         except Exception:
             stats = {}
+    gate_state = str(
+        getattr(env_obj, "gate_state", None)
+        or ("ON" if getattr(env_obj, "gate_enabled", False) else "OFF")
+    ).strip().upper()
     return {
         "status": "ok",
         "environment": env_obj.name,
         "execution_mode": env_obj.mode,
         "is_live": bool(getattr(env_obj, "is_live", env_obj.name != "paper")),
         "gate_enabled": bool(getattr(env_obj, "gate_enabled", False)),
-        "master_gate": bool(_engine.config.get("live.live_trading_enabled", False)
-                            if _engine and _engine.config else False),
+        "master_gate": gate_state == "ON",
         "broker": type(broker).__name__ if broker is not None else None,
         "engine_running": bool(getattr(_engine, "_running", False)),
         "strategies": len(getattr(env_obj, "strategies", {}) or {}),
