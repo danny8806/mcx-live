@@ -3,9 +3,18 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
+from core.environments import validate_environment_config
 from dashboard.routes import risk, settings
 from execution.live.dhan_transport import DhanRestTransport
 from indicators.supertrend import SuperTrend
+
+
+def test_live_gate_off_is_valid_safe_startup_when_live_can_be_enabled_later():
+    validate_environment_config({
+        "system": {"environments": ["live"]},
+        "live": {"broker": "dhan", "gate": "OFF",
+                 "live_trading_enabled": True},
+    })
 
 
 def test_risk_api_does_not_fabricate_unconfigured_loss_caps(monkeypatch):

@@ -47,10 +47,10 @@ class EnvironmentKind(Enum):
     LIVE = "LIVE"
 
 
-# Master-gate states.  A config default may be OFF, ARMED or ON (ON is how a
-# live-enabling config opts in; it requires live_trading_enabled=true).  The
-# transitional/active states (CLOSE_ONLY, EMERGENCY_STOP, LOCKED) are reached
-# operationally through the gate state machine (Phase 9.14).
+# Master-gate states. A config default may be OFF, ARMED or ON. OFF is a safe
+# startup state even when live trading is available; the separate capability
+# flag allows the operator to turn it ON later. ON requires that capability.
+# Transitional states are reached through the runtime gate state machine.
 GATE_STATES = ("OFF", "ARMED", "ON", "CLOSE_ONLY", "EMERGENCY_STOP", "LOCKED")
 GATE_INITIAL = ("OFF", "ARMED", "ON")
 VALID_ENV_NAMES = ("paper", "live")
@@ -65,8 +65,8 @@ def validate_environment_config(config) -> None:
       1. names must be a non-empty subset of {"paper", "live"}.
       2. a LIVE environment requires a ``live`` config section.
       3. ``live.broker`` must be a known transport when live is enabled.
-      4. ``live.live_trading_enabled=True`` requires an initial gate of
-         ARMED or ON (OFF would contradict the explicit intent to trade).
+      4. ``live.gate=OFF`` remains a valid safe startup state even when live
+         trading is available through the dashboard.
       5. an initial gate of ON requires ``live_trading_enabled=True``.
       6. CLOSE_ONLY / EMERGENCY_STOP / LOCKED are not valid config defaults;
          they are operational states only.
@@ -112,10 +112,6 @@ def validate_environment_config(config) -> None:
             "(ON/CLOSE_ONLY/EMERGENCY_STOP/LOCKED are operational states)")
 
     enabled = bool(live.get("live_trading_enabled", False))
-    if enabled and gate == "OFF":
-        raise RuntimeError(
-            "environment config: live.live_trading_enabled=true but "
-            "live.gate=OFF (contradiction); initial gate must be ARMED or ON")
     if gate == "ON" and not enabled:
         raise RuntimeError(
             "environment config: live.gate=ON but live.live_trading_enabled "
