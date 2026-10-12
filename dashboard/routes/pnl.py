@@ -133,6 +133,8 @@ async def get_portfolio_pnl():
 
 @router.get("/api/{env}/pnl")
 async def get_portfolio_pnl_env(env: str):
+    if _env_for(env) is None:
+        raise HTTPException(status_code=404, detail=f"environment '{env}' not found")
     return await asyncio.to_thread(_get_portfolio_pnl_sync, env)
 
 def _get_instrument_pnl_sync(instrument: str):

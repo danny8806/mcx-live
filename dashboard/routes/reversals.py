@@ -9,7 +9,7 @@ fill is broker-confirmed.
 from __future__ import annotations
 import asyncio
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 router = APIRouter()
 _engine = None
 _bus = None
@@ -154,6 +154,8 @@ async def list_reversals(strategy: Optional[str] = None):
 
 @router.get("/api/{env}/reversals")
 async def list_reversals_env(env: str, strategy: Optional[str] = None):
+    if _env_for(env) is None:
+        raise HTTPException(status_code=404, detail=f"environment '{env}' not found")
     return await asyncio.to_thread(_list_reversals_sync, strategy, env)
 
 

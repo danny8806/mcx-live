@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Optional
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 router = APIRouter()
 _engine = None
 _bus = None
@@ -221,6 +221,8 @@ async def list_trades(strategy: Optional[str] = None, instrument: Optional[str] 
 @router.get("/api/{env}/trades")
 async def list_trades_env(env: str, strategy: Optional[str] = None,
                           instrument: Optional[str] = None):
+    if _env_for(env) is None:
+        raise HTTPException(status_code=404, detail=f"environment '{env}' not found")
     return await asyncio.to_thread(_list_trades_sync, strategy, instrument, env)
 
 def _get_trade_sync(trade_id: str):

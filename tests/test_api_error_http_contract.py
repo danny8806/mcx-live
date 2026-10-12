@@ -148,3 +148,50 @@ def test_environment_health_reports_actual_master_gate_state(monkeypatch):
 
     assert health["gate_enabled"] is False
     assert health["master_gate"] is False
+
+
+def test_mutating_route_readiness_and_unknown_target_contracts(monkeypatch):
+    from dashboard.routes import settings, strategies
+    from live.api import create_live_app
+
+    monkeypatch.setattr(settings, "_engine", None)
+    monkeypatch.setattr(settings, "_config_path", None)
+    monkeypatch.setattr(settings, "_resolved_config_path", None)
+    monkeypatch.setattr(strategies, "_engine", None)
+    client = TestClient(create_live_app())
+    cases = (
+        ("post", "/api/strategies/missing/control", {"action": "resume"}, 404),
+        ("post", "/api/live/strategies/missing/control", {"action": "resume"}, 404),
+        ("put", "/api/settings/live-gate", {"gate": "OFF"}, 503),
+        ("put", "/api/settings/strategies/missing", {"quantity": 1}, 503),
+        ("post", "/api/settings/refresh", None, 503),
+    )
+    for method, path, body, expected_status in cases:
+        response = getattr(client, method)(path, json=body) if body is not None else getattr(
+            client, method)(path)
+        assert response.status_code == expected_status, (path, response.text)
+        assert response.json().get("detail")
+
+
+def test_unknown_environment_pnl_reversals_and_trades_never_fall_back_or_leak(
+        monkeypatch):
+    from types import SimpleNamespace
+
+    from dashboard.routes import pnl, reversals, trades
+    from live.api import create_live_app
+
+    live = SimpleNamespace(name="live", mode="LIVE")
+    engine = SimpleNamespace(_envs={"live": live})
+    for module in (pnl, reversals, trades):
+        monkeypatch.setattr(module, "_engine", engine)
+    monkeypatch.setattr(pnl, "_persistence", object())
+    monkeypatch.setattr(reversals, "_persistence", object())
+    monkeypatch.setattr(trades, "_persistence", object())
+
+    client = TestClient(create_live_app())
+    for path in ("/api/no-such-env/pnl",
+                 "/api/no-such-env/reversals",
+                 "/api/no-such-env/trades"):
+        response = client.get(path)
+        assert response.status_code == 404, (path, response.text)
+        assert response.json()["detail"] == "environment 'no-such-env' not found"
