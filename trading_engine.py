@@ -820,7 +820,13 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
             try:
                 flat = bool(env.broker.instrument_flat(metal, sid))
                 orders_clear = bool(env.broker.instrument_orders_clear(metal, sid))
-            except Exception:
+            except Exception as exc:
+                self._rollover_service.alert_once(
+                    metal, "carry_reconciliation_unavailable",
+                    datetime.now(IST).date(),
+                    f"{metal}: carry entry confirmation could not read Dhan position/order state; "
+                    "entry remains blocked",
+                    error=str(exc), security_id=sid)
                 continue
             strategy = next((s for s in env.strategies.values()
                              if getattr(s, "instrument", None) == metal
@@ -830,18 +836,112 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
             owned = [p for p in env.position_manager.open_positions
                      if p.is_open and p.instrument == metal]
             if phase == "ENTRY_SUBMITTED":
-                if owned and not flat:
+                carry = rows[0]
+                signal_id = str(carry.get("entry_signal_id") or "")
+                entry_orders = [
+                    o for o in getattr(env.execution_engine, "_orders", {}).values()
+                    if str(getattr(o, "entry_signal_id", "") or "") == signal_id
+                ]
+                lifecycle_trade = None
+                try:
+                    runtime = env.runtimes.require(strategy.strategy_id)
+                    lifecycle_trade = runtime.lifecycle.resolve_trade_from_signal(
+                        signal_id)
+                except Exception as exc:
+                    log.warning("[Rollover] lifecycle lookup failed for carry signal %s: %s",
+                                signal_id, exc)
+                    pass
+                def _safe_quantity(raw) -> int:
+                    try:
+                        value = int(raw)
+                    except (TypeError, ValueError, OverflowError):
+                        return -1
+                    return value if value >= 0 else -1
+
+                expected_qty = _safe_quantity(
+                    carry.get("entry_expected_quantity")
+                    or (getattr(lifecycle_trade, "quantity", 0) if lifecycle_trade else 0)
+                    or carry.get("quantity") or 0)
+                expected_side = str(carry.get("entry_expected_side") or "").upper()
+                if not expected_side:
+                    order_side = next((str(getattr(o, "side", "") or "").upper()
+                                       for o in entry_orders
+                                       if str(getattr(o, "side", "") or "").upper()
+                                       in {"BUY", "SELL"}), "")
+                    expected_side = ({"BUY": "LONG", "SELL": "SHORT"}
+                                     .get(order_side, ""))
+                if not expected_side and lifecycle_trade is not None:
+                    expected_side = str(getattr(
+                        lifecycle_trade, "entry_side", "") or "").upper()
+                expected_strategy_id = str(carry.get("entry_strategy_id")
+                                           or (getattr(lifecycle_trade, "strategy_id", "")
+                                               if lifecycle_trade else "")
+                                           or getattr(strategy, "strategy_id", "") or "")
+                matching_positions = [
+                    p for p in owned
+                    if str(getattr(p, "entry_signal_id", "") or "") == signal_id
+                    and str(getattr(p, "strategy_id", "") or "") == expected_strategy_id
+                    and _safe_quantity(getattr(p, "quantity", 0)) == expected_qty
+                    and expected_side in {"LONG", "SHORT"}
+                    and bool(getattr(p, "is_long", False)) == (expected_side == "LONG")
+                ]
+                if matching_positions and not flat:
+                    position = matching_positions[0]
                     self._rollover_service.update_workflow(metal, phase="COMPLETE")
                     self._rollover_blocked.discard((env.name, metal))
                     self.publish_event("contract_rollover_carry_confirmed", {
                         "instrument": metal,
-                        "position_id": owned[0].position_id,
-                        "quantity": owned[0].quantity,
-                        "side": "LONG" if owned[0].is_long else "SHORT",
+                        "position_id": position.position_id,
+                        "quantity": position.quantity,
+                        "side": "LONG" if position.is_long else "SHORT",
+                        "signal_id": signal_id,
                         "execution_mode": env.mode,
                     }, env_name=env.name)
                 elif flat and orders_clear:
                     submitted_at = float(rows[0].get("entry_submitted_at") or 0.0)
+                    order_states = [
+                        str(getattr(getattr(o, "state", None), "value",
+                                    getattr(o, "state", "")) or "")
+                        .split(".")[-1].lower()
+                        for o in entry_orders
+                    ]
+                    terminal = {"rejected", "cancelled", "canceled", "expired"}
+                    lifecycle_status = str(getattr(
+                        lifecycle_trade, "status", "") or "").upper()
+                    durable_terminal = lifecycle_status in {"REJECTED", "CANCELLED"}
+                    if ((entry_orders and all(state in terminal for state in order_states))
+                            or durable_terminal):
+                        reason = next((str(getattr(o, "reason", "") or "")
+                                       for o in reversed(entry_orders)
+                                       if str(getattr(getattr(o, "state", None), "value",
+                                                       getattr(o, "state", "")) or "")
+                                       .split(".")[-1].lower() in terminal),
+                                      str(getattr(lifecycle_trade, "status", "")
+                                          or "carry entry reached a terminal broker state"))
+                        self._rollover_service.update_workflow(
+                            metal, phase="CARRY_FAILED", last_error=reason)
+                        self._rollover_service.alert_once(
+                            metal, "carry_entry_terminal", datetime.now(IST).date(),
+                            f"{metal}: carry entry is definitively terminal and Dhan confirms "
+                            "flat/no working order; rollover remains blocked for operator review",
+                            signal_id=signal_id, order_states=order_states,
+                            lifecycle_status=lifecycle_status,
+                            security_id=sid, reason=reason)
+                        continue
+                    if owned:
+                        self._rollover_service.alert_once(
+                            metal, "carry_position_mismatch", datetime.now(IST).date(),
+                            f"{metal}: Dhan/local position does not match the carry signal; "
+                            "rollover remains blocked",
+                            signal_id=signal_id, expected_side=expected_side,
+                            expected_quantity=expected_qty,
+                            local_positions=[{
+                                "position_id": getattr(p, "position_id", None),
+                                "strategy_id": getattr(p, "strategy_id", None),
+                                "entry_signal_id": getattr(p, "entry_signal_id", None),
+                                "side": "LONG" if getattr(p, "is_long", False) else "SHORT",
+                                "quantity": getattr(p, "quantity", None),
+                            } for p in owned], security_id=sid)
                     if submitted_at and time.time() - submitted_at > 20:
                         self._rollover_service.alert_once(
                             metal, "carry_entry_unconfirmed", datetime.now(IST).date(),
@@ -849,6 +949,20 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                             "automatic resubmission is withheld pending reconciliation",
                             signal_id=rows[0].get("entry_signal_id"),
                             security_id=sid)
+                elif not flat and not matching_positions:
+                    self._rollover_service.alert_once(
+                        metal, "carry_position_mismatch", datetime.now(IST).date(),
+                        f"{metal}: Dhan reports exposure but no position matches the carry signal; "
+                        "rollover remains blocked",
+                        signal_id=signal_id, expected_side=expected_side,
+                        expected_quantity=expected_qty,
+                        local_positions=[{
+                            "position_id": getattr(p, "position_id", None),
+                            "strategy_id": getattr(p, "strategy_id", None),
+                            "entry_signal_id": getattr(p, "entry_signal_id", None),
+                            "side": "LONG" if getattr(p, "is_long", False) else "SHORT",
+                            "quantity": getattr(p, "quantity", None),
+                        } for p in owned], security_id=sid)
                 continue
             if not flat or not orders_clear or owned:
                 continue
@@ -922,6 +1036,10 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                 timestamp=signal.timestamp)
             rows[0]["entry_signal_id"] = signal.signal_id
             rows[0]["entry_submitted_at"] = time.time()
+            rows[0]["entry_expected_side"] = side
+            rows[0]["entry_expected_quantity"] = qty
+            rows[0]["entry_strategy_id"] = strategy.strategy_id
+            rows[0]["entry_security_id"] = sid
             if not self._rollover_service.update_workflow(
                     metal, phase="ENTRY_SUBMITTED", carry_positions=rows,
                     last_error=None):

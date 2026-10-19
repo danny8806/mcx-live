@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from threading import RLock
 from types import SimpleNamespace
 
+import pytest
+
 from core.rollover import RolloverService
 from indicators.supertrend import SuperTrend
 from strategies.types import OrderState
@@ -123,7 +125,11 @@ def test_carry_direction_and_quantity_use_warmed_trend_and_actual_fill_size(tmp_
     assert submitted[0].side == expected_side
     assert submitted[0].quantity == 3
     assert submitted[0].metadata["is_rollover_carry_entry"] is True
-    assert engine._rollover_service.workflow("SILVERM")["phase"] == "ENTRY_SUBMITTED"
+    workflow = engine._rollover_service.workflow("SILVERM")
+    assert workflow["phase"] == "ENTRY_SUBMITTED"
+    assert workflow["carry_positions"][0]["entry_expected_side"] == expected_side
+    assert workflow["carry_positions"][0]["entry_expected_quantity"] == 3
+    assert workflow["carry_positions"][0]["entry_strategy_id"] == "silver_01"
 
     engine._try_rollover_carry_entries(env)
     assert len(submitted) == 1
@@ -151,6 +157,132 @@ def test_ambiguous_carry_submission_is_never_reposted(tmp_path):
     engine._try_rollover_carry_entries(env)
     assert service.workflow("SILVERM")["phase"] == "ENTRY_SUBMITTED"
     assert ("live", "SILVERM") in engine._rollover_blocked
+
+
+def _submitted_carry_engine(tmp_path, *, broker_flat, positions, order_state):
+    engine = TradingEngine.__new__(TradingEngine)
+    service = engine._rollover_service = _service(tmp_path)
+    engine.config = {"instruments": {"SILVERM": {"security_id": "900001"}}}
+    engine._rollover_blocked = {("live", "SILVERM")}
+    engine.publish_event = lambda *_args, **_kwargs: None
+    service.update_workflow(
+        "SILVERM", phase="ENTRY_SUBMITTED", roll_id="roll-1",
+        carry_positions=[{
+            "quantity": 3,
+            "side": "SHORT",  # original side is informational; new side is explicit below
+            "entry_signal_id": "roll-signal",
+            "entry_submitted_at": datetime.now(timezone.utc).timestamp() - 30,
+            "entry_expected_side": "SHORT",
+            "entry_expected_quantity": 3,
+            "entry_strategy_id": "silver_01",
+            "entry_security_id": "900001",
+        }])
+    order = SimpleNamespace(
+        entry_signal_id="roll-signal", state=order_state,
+        side="SELL", quantity=3, strategy_id="silver_01",
+        reason="simulated terminal rejection")
+    env = SimpleNamespace(
+        name="live", mode="LIVE", is_live=True, data_adapter=object(),
+        broker=_Broker(flat=broker_flat, clear=True),
+        strategies={"silver_01": SimpleNamespace(
+            instrument="SILVERM", strategy_type="supertrend",
+            strategy_id="silver_01")},
+        position_manager=SimpleNamespace(open_positions=positions),
+        execution_engine=SimpleNamespace(_orders={"carry-order": order}),
+    )
+    return engine, service, env
+
+
+def test_async_terminal_rejection_is_resolved_and_alerted(tmp_path):
+    engine, service, env = _submitted_carry_engine(
+        tmp_path, broker_flat=True, positions=[], order_state=OrderState.REJECTED)
+
+    engine._try_rollover_carry_entries(env)
+
+    workflow = service.workflow("SILVERM")
+    assert workflow["phase"] == "CARRY_FAILED"
+    assert "simulated terminal rejection" in workflow["last_error"]
+    assert ("live", "SILVERM") in engine._rollover_blocked
+
+
+def test_rejection_survives_restart_without_order_cache(tmp_path):
+    engine, service, env = _submitted_carry_engine(
+        tmp_path, broker_flat=True, positions=[], order_state=OrderState.REJECTED)
+    env.execution_engine._orders.clear()
+    env.runtimes = SimpleNamespace(require=lambda _sid: SimpleNamespace(
+        lifecycle=SimpleNamespace(resolve_trade_from_signal=lambda _signal: SimpleNamespace(
+            status="REJECTED", entry_side="SHORT", quantity=3,
+            strategy_id="silver_01"))))
+
+    engine._try_rollover_carry_entries(env)
+
+    assert service.workflow("SILVERM")["phase"] == "CARRY_FAILED"
+    assert "REJECTED" in service.workflow("SILVERM")["last_error"]
+
+
+def test_position_confirmation_can_recover_expected_values_from_lifecycle(tmp_path):
+    carried = SimpleNamespace(
+        is_open=True, instrument="SILVERM", is_long=False, quantity=3,
+        strategy_id="silver_01", entry_signal_id="roll-signal",
+        position_id="carry-position", trade_id="carry-trade")
+    engine, service, env = _submitted_carry_engine(
+        tmp_path, broker_flat=False, positions=[carried],
+        order_state=OrderState.FILLED)
+    row = service.workflow("SILVERM")["carry_positions"][0]
+    for key in ("entry_expected_side", "entry_expected_quantity", "entry_strategy_id"):
+        row.pop(key, None)
+    service.update_workflow("SILVERM", carry_positions=[row])
+    env.execution_engine._orders.clear()
+    env.runtimes = SimpleNamespace(require=lambda _sid: SimpleNamespace(
+        lifecycle=SimpleNamespace(resolve_trade_from_signal=lambda _signal: SimpleNamespace(
+            status="OPEN", entry_side="SHORT", quantity=3,
+            strategy_id="silver_01"))))
+
+    engine._try_rollover_carry_entries(env)
+
+    assert service.workflow("SILVERM")["phase"] == "COMPLETE"
+    assert ("live", "SILVERM") not in engine._rollover_blocked
+
+
+@pytest.mark.parametrize("position_changes", [
+    {"is_long": True},
+    {"quantity": 1},
+    {"quantity": "corrupt"},
+    {"strategy_id": "other_strategy"},
+    {"entry_signal_id": "unrelated-signal"},
+])
+def test_unrelated_position_cannot_confirm_carry_entry(tmp_path, position_changes):
+    attrs = {
+        "is_open": True, "instrument": "SILVERM", "is_long": False,
+        "quantity": 3, "strategy_id": "silver_01",
+        "entry_signal_id": "roll-signal", "position_id": "other-position",
+        "trade_id": "other-trade",
+    }
+    attrs.update(position_changes)
+    unrelated = SimpleNamespace(**attrs)
+    engine, service, env = _submitted_carry_engine(
+        tmp_path, broker_flat=False, positions=[unrelated],
+        order_state=OrderState.SUBMITTED)
+
+    engine._try_rollover_carry_entries(env)
+
+    assert service.workflow("SILVERM")["phase"] == "ENTRY_SUBMITTED"
+    assert ("live", "SILVERM") in engine._rollover_blocked
+
+
+def test_only_exact_carry_position_confirms_handoff(tmp_path):
+    carried = SimpleNamespace(
+        is_open=True, instrument="SILVERM", is_long=False, quantity=3,
+        strategy_id="silver_01", entry_signal_id="roll-signal",
+        position_id="carry-position", trade_id="carry-trade")
+    engine, service, env = _submitted_carry_engine(
+        tmp_path, broker_flat=False, positions=[carried],
+        order_state=OrderState.FILLED)
+
+    engine._try_rollover_carry_entries(env)
+
+    assert service.workflow("SILVERM")["phase"] == "COMPLETE"
+    assert ("live", "SILVERM") not in engine._rollover_blocked
 
 
 def test_final_session_close_is_journaled_before_single_exit_attempt():
