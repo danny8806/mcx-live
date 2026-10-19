@@ -100,11 +100,11 @@
       "strategy_type": "supertrend",
       "signal_timeframe": "15m",
       "supertrend": {
-        "atr_period": 36,
-        "multiplier": 4.9,
+        "atr_period": 76,
+        "multiplier": 3.7,
         "source": "low",
         "atr_method": "sma_tr",
-        "first_tr": "na"
+        "first_tr": "high_low"
       },
       "capital": 300000,
       "enabled": true,
@@ -218,7 +218,7 @@
     },
     "rollover": {
       "enabled": true,
-      "trigger_days_before_expiry": 2,
+      "trigger_days_before_expiry": 3,
       "block_entries_on_window": true,
       "cancel_resting_on_window": true,
       "force_close_on_last_session": true,

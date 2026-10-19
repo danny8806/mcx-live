@@ -28,11 +28,15 @@ class FakeSuperTrend:
         self.source_name = "hl2"
         self.atr_method = "sma_tr"
 
-    def configure(self, *, atr_period, multiplier, source, atr_method):
+    first_tr = "high_low"
+
+    def configure(self, *, atr_period, multiplier, source, atr_method,
+                  first_tr="high_low"):
         self.atr_period = atr_period
         self.multiplier = multiplier
         self.source_name = source
         self.atr_method = atr_method
+        self.first_tr = first_tr
 
     def snapshot(self):
         return {

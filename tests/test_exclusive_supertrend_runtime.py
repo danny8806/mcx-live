@@ -51,7 +51,7 @@ def test_exclusive_runtime_builds_only_the_two_15m_supertrend_strategies(tmp_pat
                 46, 3.9, "ohlc4", "sma_tr", "na")
     assert (silver_st.atr_period, silver_st.multiplier, silver_st.source_name,
             silver_st.atr_method, silver_st.first_tr) == (
-                36, 4.9, "low", "sma_tr", "na")
+                    76, 3.7, "low", "sma_tr", "high_low")
     assert not hasattr(engine.live.strategies["gold_02"], "fast_indicator")
     assert engine.live.strategies["gold_02"].subscriptions == ["GOLDM:15m"]
     assert engine.live.strategies["silver_01"].subscriptions == ["SILVERM:15m"]

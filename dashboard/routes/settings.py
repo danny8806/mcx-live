@@ -27,9 +27,10 @@ _GATE_FIELDS = {
 }
 _ALLOWED_FIELDS = _GATE_FIELDS | {"quantity", "supertrend"}
 _LIVE_GATES = {"ON", "OFF", "CLOSE_ONLY", "EMERGENCY_STOP", "LOCKED"}
-_SUPERTREND_FIELDS = {"atr_period", "multiplier", "source", "atr_method"}
+_SUPERTREND_FIELDS = {"atr_period", "multiplier", "source", "atr_method", "first_tr"}
 _SUPERTREND_SOURCES = {"open", "high", "low", "close", "hl2", "hlc3", "ohlc4"}
 _SUPERTREND_ATR_METHODS = {"sma_tr", "wilder"}
+_SUPERTREND_FIRST_TR = {"high_low", "na"}
 _MAX_LIVE_ORDER_QUANTITY = 100
 _MAX_SUPERTREND_ATR_PERIOD = 500
 
@@ -359,6 +360,11 @@ def _validate_update(body: dict) -> dict:
             if params["atr_method"] not in _SUPERTREND_ATR_METHODS:
                 raise HTTPException(status_code=422,
                                     detail=f"SuperTrend ATR method must be one of {sorted(_SUPERTREND_ATR_METHODS)}")
+        if "first_tr" in params:
+            params["first_tr"] = str(params["first_tr"]).lower()
+            if params["first_tr"] not in _SUPERTREND_FIRST_TR:
+                raise HTTPException(status_code=422,
+                                    detail=f"SuperTrend first TR must be one of {sorted(_SUPERTREND_FIRST_TR)}")
         update["supertrend"] = params
     if "quantity" in update:
         value = update["quantity"]
@@ -526,6 +532,8 @@ def _save_strategy_settings_sync(strategy_id: str, body: dict):
                 multiplier=current.get("multiplier", strategy.supertrend.multiplier),
                 source=current.get("source", strategy.supertrend.source_name),
                 atr_method=current.get("atr_method", strategy.supertrend.atr_method),
+                first_tr=current.get("first_tr", getattr(
+                    strategy.supertrend, "first_tr", "high_low")),
             )
             config_data = getattr(_engine.config, "_config", None)
             if isinstance(config_data, dict):

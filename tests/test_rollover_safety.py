@@ -51,6 +51,15 @@ def test_rollover_window_starts_two_trading_sessions_before_last_session():
         date(2026, 10, 7), date(2026, 10, 9))
 
 
+def test_current_default_rollover_window_is_three_trading_sessions():
+    service = RolloverService(
+        config={"enabled": True}, state_path="unused-rollover-test.json",
+        scrip_master=_Master([]))
+    assert service.trigger_days == 3
+    assert resolve_window(date(2026, 10, 9), trigger_days=3) == (
+        date(2026, 10, 6), date(2026, 10, 9))
+
+
 def test_rollover_uses_full_mcX_closures_but_not_partial_sessions(tmp_path):
     calendar_path = tmp_path / "mcx_calendar.json"
     calendar_path.write_text(json.dumps({

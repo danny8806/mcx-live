@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { useDataSelector } from "../store/DataProvider";
 
-type Params = { atr_period: number; multiplier: number; source: string; atr_method: string };
+type Params = { atr_period: number; multiplier: number; source: string; atr_method: string; first_tr: string };
+const SILVER_TOP1 = { atr_period: 76, multiplier: 3.7, source: "low", atr_method: "sma_tr", first_tr: "high_low" };
 type Draft = {
   quantity: number;
   live_gate: string;
@@ -13,7 +14,7 @@ type Draft = {
   supertrend: Params;
 };
 
-const defaults = (cfg: any, gate: any): Draft => ({
+const defaults = (id: string, cfg: any, gate: any): Draft => ({
   quantity: Number(cfg.quantity ?? 1),
   live_gate: String(gate.live_gate ?? "ON").toUpperCase(),
   entry_enabled: Boolean(gate.entry_enabled ?? true),
@@ -21,10 +22,11 @@ const defaults = (cfg: any, gate: any): Draft => ({
   reversal_enabled: Boolean(gate.reversal_enabled ?? true),
   close_only: Boolean(gate.close_only ?? false),
   supertrend: {
-    atr_period: Number(cfg.supertrend?.atr_period ?? 10),
-    multiplier: Number(cfg.supertrend?.multiplier ?? 3),
-    source: String(cfg.supertrend?.source ?? "hl2"),
+    atr_period: Number(cfg.supertrend?.atr_period ?? (id === "silver_01" ? 76 : 10)),
+    multiplier: Number(cfg.supertrend?.multiplier ?? (id === "silver_01" ? 3.7 : 3)),
+    source: String(cfg.supertrend?.source ?? (id === "silver_01" ? "low" : "hl2")),
     atr_method: String(cfg.supertrend?.atr_method ?? "sma_tr"),
+    first_tr: String(cfg.supertrend?.first_tr ?? (id === "silver_01" ? "high_low" : "na")),
   },
 });
 
@@ -41,7 +43,7 @@ export default function Settings() {
     const next: Record<string, Draft> = {};
     for (const [id, cfg] of Object.entries<any>(settings?.strategies ?? {})) {
       if (cfg.strategy_type !== "supertrend") continue;
-      next[id] = defaults(cfg, settings?.strategy_gates?.[id] ?? cfg);
+      next[id] = defaults(id, cfg, settings?.strategy_gates?.[id] ?? cfg);
     }
     setDrafts(next);
   }, [settings]);
@@ -113,11 +115,24 @@ export default function Settings() {
     <section className="settings-summary-card"><div className="settings-summary-heading"><span>Strategy profiles</span><small>Parameters apply to future candles; change only while flat</small></div>
       {profiles.length === 0 ? <div className="settings-empty">No SuperTrend profiles are exposed by the active runtime.</div> : <div className="settings-profile-grid">
         {profiles.map(([id, config]) => {
-          const draft = drafts[id] ?? defaults(config, settings.strategy_gates?.[id] ?? config);
+          const draft = drafts[id] ?? defaults(id, config, settings.strategy_gates?.[id] ?? config);
           const available = runtimeIds.has(id);
           const message = messages[id];
           const updateParams = (patch: Partial<Params>) => setDrafts((current) => ({ ...current, [id]: { ...draft, supertrend: { ...draft.supertrend, ...patch } } }));
           const update = (patch: Partial<Draft>) => setDrafts((current) => ({ ...current, [id]: { ...draft, ...patch } }));
+          const resetTop1 = async () => {
+            if (isLive && !window.confirm("Apply SilverM Top 1 defaults to future completed candles? The strategy must be flat with no pending orders.")) return;
+            setSaving(id);
+            setMessages((current) => ({ ...current, [id]: { ok: true, text: "Applying Top 1 defaults…" } }));
+            try {
+              await api.updateStrategySettings(id, { supertrend: { ...SILVER_TOP1 } });
+              setDrafts((current) => ({ ...current, [id]: { ...draft, supertrend: { ...SILVER_TOP1 } } }));
+              setMessages((current) => ({ ...current, [id]: { ok: true, text: "Top 1 defaults applied for subsequent candles." } }));
+              refresh("settings"); refresh("strategies");
+            } catch (error: any) {
+              setMessages((current) => ({ ...current, [id]: { ok: false, text: error?.message || "Could not apply Top 1 defaults." } }));
+            } finally { setSaving(null); }
+          };
           const updateGateMode = (mode: string) => {
             const modes: Record<string, Pick<Draft, "entry_enabled" | "exit_enabled" | "reversal_enabled" | "close_only">> = {
               ON: { entry_enabled: true, exit_enabled: true, reversal_enabled: true, close_only: false },
@@ -136,6 +151,7 @@ export default function Settings() {
               <label>ATR multiplier<input type="number" min={0.1} step={0.1} disabled={!available || saving !== null} value={draft.supertrend.multiplier} onChange={(event) => updateParams({ multiplier: Number(event.target.value) })}/></label>
               <label>Price source<select disabled={!available || saving !== null} value={draft.supertrend.source} onChange={(event) => updateParams({ source: event.target.value })}>{["open", "high", "low", "close", "hl2", "hlc3", "ohlc4"].map((source) => <option key={source}>{source}</option>)}</select></label>
               <label>ATR calculation<select disabled={!available || saving !== null} value={draft.supertrend.atr_method} onChange={(event) => updateParams({ atr_method: event.target.value })}><option value="sma_tr">SMA of True Range</option><option value="wilder">Wilder ATR</option></select></label>
+              <label>First True Range<select disabled={!available || saving !== null} value={draft.supertrend.first_tr} onChange={(event) => updateParams({ first_tr: event.target.value })}><option value="high_low">High − Low</option><option value="na">Unavailable on first bar</option></select></label>
               <label>Strategy gate mode<select disabled={!available || saving !== null} value={draft.live_gate} onChange={(event) => updateGateMode(event.target.value)}><option value="ON">ON · gate open</option><option value="OFF">OFF · entry gate closed</option><option value="CLOSE_ONLY">CLOSE ONLY · no new entries</option><option value="EMERGENCY_STOP">EMERGENCY STOP · block entries</option><option value="LOCKED">LOCKED · block all strategy actions</option></select><small>Mode selects safe defaults; individual switches below can be adjusted.</small></label>
             </div>
             <div className="settings-gate-controls" aria-label={`${config.instrument} strategy gate switches`}>
@@ -147,7 +163,7 @@ export default function Settings() {
               <small>On this SuperTrend strategy, an opposite flip is both the position exit and reversal event. Disabling reversal processing can therefore prevent that exit. Open positions cannot be saved with exits disabled or the strategy LOCKED. The global master gate OFF blocks all broker orders, including exits.</small>
             </div>
             <div className="settings-fixed-execution"><b>Fixed execution</b><span>Market after completed 15m signal candle</span><span>Opposite flip: exit, confirm flat, then enter</span><span>No separate SL or target</span></div>
-            <footer><span role="status" className={message ? message.ok ? "text-good" : "text-bad" : "settings-hint"}>{message?.text ?? "Changes take effect on subsequent strategy processing."}</span><button className="primary-button" disabled={!available || saving !== null} onClick={() => void save(id)}>{saving === id ? "Saving…" : "Save profile"}</button></footer>
+            <footer><span role="status" className={message ? message.ok ? "text-good" : "text-bad" : "settings-hint"}>{message?.text ?? "Changes take effect on subsequent strategy processing."}</span>{id === "silver_01" && <button type="button" disabled={!available || saving !== null} onClick={resetTop1}>Reset to Top 1 defaults</button>}<button className="primary-button" disabled={!available || saving !== null} onClick={() => void save(id)}>{saving === id ? "Saving…" : "Save profile"}</button></footer>
           </article>;
         })}
       </div>}

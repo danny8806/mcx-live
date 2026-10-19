@@ -224,7 +224,8 @@ class LivePositionFlowMixin:
             log.warning("[Telegram] reversal completion alert failed for %s: %s",
                         reversal.get("reversal_id"), e)
     def emergency_exit_all(self, env_name: str = "live",
-                           instrument: Optional[str] = None) -> dict:
+                           instrument: Optional[str] = None,
+                           exit_reason: str = "operator_emergency_exit") -> dict:
         """Submit lifecycle-owned emergency exits through the LIVE gateway."""
         env = self._env_for(env_name)
         if not env.is_live or env.execution_engine is None:
@@ -270,7 +271,7 @@ class LivePositionFlowMixin:
                 stop_price=0.0, quantity=pos.quantity,
                 metadata={"exit": True, "strategy_type": "supertrend",
                           "market_on_signal_close": True,
-                          "exit_reason": "operator_emergency_exit",
+                          "exit_reason": str(exit_reason or "operator_emergency_exit"),
                           "trigger_state": "FIRED",
                           "trigger_source": "operator_action",
                           "operator_action": True})

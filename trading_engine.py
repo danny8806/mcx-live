@@ -190,6 +190,11 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
         self._rollover_blocked: set[tuple[str, str]] = set()
         self._rollover_applied: dict[str, dict] = {}
         self._rollover_watchdogs: set[str] = set()
+        # Candidate indicators are isolated from the active contract until a
+        # broker-confirmed flat handoff. Durable metadata lives in rollover
+        # state; this cache is only a disposable warmup acceleration.
+        self._rollover_candidates: dict[tuple[str, str], dict] = {}
+        self._rollover_candidate_retry_at: dict[tuple[str, str], float] = {}
         # Resting-order cancels are issued at most once per (env, metal, day).
         self._rollover_canceled_daily: set[tuple[str, str, str]] = set()
         _roll_cfg = (self.config.get("live") or {}).get("rollover") or {}
@@ -475,7 +480,493 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                 return True
         return False
 
+    def _prepare_rollover_candidate(self, env: Environment, metal: str,
+                                    current_symbol: str, current_sid: str,
+                                    today) -> Optional[dict]:
+        """Resolve and warm the next contract without touching active state.
+
+        The candidate has an isolated WebSocket alias and a private
+        SuperTrend instance. It cannot emit strategy signals before promotion.
+        A retry throttle bounds Dhan REST load while the rollover window is
+        open. Every failed or incomplete warmup leaves the active contract
+        untouched and the entry gate closed.
+        """
+        key = (env.name, metal)
+        candidates = getattr(self, "_rollover_candidates", None)
+        if candidates is None:
+            candidates = self._rollover_candidates = {}
+        retry_times = getattr(self, "_rollover_candidate_retry_at", None)
+        if retry_times is None:
+            retry_times = self._rollover_candidate_retry_at = {}
+        cached = candidates.get(key)
+        retry_at = retry_times.get(key, 0.0)
+        if cached and time.monotonic() < retry_at:
+            return cached
+        if time.monotonic() < retry_at:
+            return None
+
+        service = self._rollover_service
+        try:
+            current = service.scrip.find_symbol(metal, current_symbol)
+            if current is None or str(current.security_id) != str(current_sid):
+                service._refresh_contract_master()
+                current = service.scrip.find_symbol(metal, current_symbol)
+            nxt = (service.scrip.next_contract(metal, current, as_of=today)
+                   if current is not None else None)
+            if nxt is None:
+                raise RuntimeError("next contract could not be verified in Dhan scrip master")
+
+            strategy = next((s for s in env.strategies.values()
+                             if getattr(s, "instrument", None) == metal
+                             and getattr(s, "strategy_type", None) == "supertrend"), None)
+            adapter = getattr(env, "data_adapter", None)
+            if strategy is None or adapter is None:
+                raise RuntimeError("active strategy or LIVE Dhan data adapter unavailable")
+            source_cfg = dict((self.config.get("instruments", {}) or {}).get(metal) or {})
+            candidate_cfg = {
+                **source_cfg,
+                "symbol": nxt.config_symbol(),
+                "security_id": str(nxt.security_id),
+                "exchange_segment": source_cfg.get("exchange_segment", "MCX_COMM"),
+                "instrument": source_cfg.get("instrument", "FUTCOM"),
+                "lot_size": int(nxt.lot_size or source_cfg.get("lot_size", 1)),
+                "tick_size": float(nxt.tick_size or source_cfg.get("tick_size", 1.0)),
+            }
+            alias = f"{metal}__ROLLOVER_{nxt.security_id}"
+            registered = getattr(adapter, "_instruments", {}).get(alias)
+            if registered is not None and str(registered.security_id) != str(nxt.security_id):
+                adapter.discard_rollover_candidate(alias)
+                registered = None
+            if registered is None:
+                adapter.register_rollover_candidate(alias, candidate_cfg)
+
+            if not self._rollover_service.update_workflow(
+                metal, phase="CANDIDATE_WARMING",
+                candidate={"alias": alias, **nxt.to_dict(), "ready": False},
+                last_error=None):
+                raise RuntimeError("candidate warmup intent could not be persisted")
+
+            from indicators.supertrend import SuperTrend
+            indicator = SuperTrend(
+                strategy.supertrend.atr_period,
+                strategy.supertrend.multiplier,
+                strategy.supertrend.source_name,
+                strategy.supertrend.atr_method,
+                first_tr=strategy.supertrend.first_tr,
+            )
+            from data.dhan.candle_validation import filter_completed
+            from core.timeframe_engine import Bar
+            import pandas as pd
+            now_ist = datetime.now(IST)
+            fetch_days = int((self.config.get("warmup", {}) or {}).get(
+                "fetch_calendar_days", 14))
+            raw = adapter.fetch_historical_candles(
+                alias, "15", (now_ist - timedelta(days=fetch_days)).date(),
+                now_ist.date())
+            if not raw:
+                raise RuntimeError("Dhan returned no candidate-contract candles")
+            frame = pd.DataFrame(raw, columns=[
+                "timestamp", "open", "high", "low", "close", "volume"])
+            frame["datetime"] = pd.to_datetime(
+                frame["timestamp"], unit="s", utc=True
+            ).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+            days = sorted(frame["datetime"].dt.date.unique())
+            keep_days = int((self.config.get("warmup", {}) or {}).get(
+                "last_trading_days", 5))
+            if keep_days > 0:
+                frame = frame[frame["datetime"].dt.date.isin(set(days[-keep_days:]))]
+            rows = frame.sort_values("timestamp").values.tolist()
+            accepted, rejected = filter_completed(
+                rows, "15", int(time.time()),
+                source_cfg.get("session_open", "09:00"),
+                source_cfg.get("session_close", "23:30"))
+            period = int(strategy.supertrend.atr_period)
+            if len(accepted) < period + 2:
+                raise RuntimeError(
+                    f"candidate warmup has {len(accepted)} completed bars; "
+                    f"requires at least {period + 2}")
+            for row in accepted:
+                ts = float(row[0])
+                indicator.update(float(row[1]), float(row[2]), float(row[3]),
+                                 float(row[4]), ts + 15 * 60)
+            value = indicator.value
+            if value is None or value.atr is None or value.trend not in (-1, 1):
+                raise RuntimeError("candidate SuperTrend warmup is incomplete")
+            last = accepted[-1]
+            staged = {
+                "alias": alias,
+                "contract": nxt.to_dict(),
+                "instrument_config": candidate_cfg,
+                "indicator": indicator,
+                "last_bar": {
+                    "timestamp": float(last[0]), "open": float(last[1]),
+                    "high": float(last[2]), "low": float(last[3]),
+                    "close": float(last[4]), "volume": int(last[5] or 0),
+                    "trend": int(value.trend), "atr": float(value.atr),
+                    "upper": float(value.upper), "lower": float(value.lower),
+                },
+            }
+            if not self._rollover_service.update_workflow(
+                metal, phase="CANDIDATE_READY",
+                candidate={
+                    **nxt.to_dict(), "alias": alias, "ready": True,
+                    "last_completed_candle_end": float(last[0]) + 900,
+                    "trend": int(value.trend), "atr_period": period,
+                    "multiplier": float(strategy.supertrend.multiplier),
+                    "source": strategy.supertrend.source_name,
+                    "atr_method": strategy.supertrend.atr_method,
+                    "first_tr": strategy.supertrend.first_tr,
+                    "completed_bar_count": len(accepted),
+                }, last_error=None):
+                raise RuntimeError("candidate warmup result could not be persisted")
+            # Cache only after the durable readiness marker succeeds. If the
+            # write failed, no caller may treat this in-memory object as safe
+            # for closing the old contract or promoting the new one.
+            candidates[key] = staged
+            retry_times[key] = time.monotonic() + 45.0
+            self.publish_event("contract_rollover_candidate_warmed", {
+                "instrument": metal, "candidate": nxt.to_dict(),
+                "completed_bars": len(accepted), "rejected_bars": len(rejected),
+                "trend": int(value.trend), "last_candle": staged["last_bar"],
+                "execution_mode": env.mode,
+            }, env_name=env.name)
+            return staged
+        except Exception as exc:
+            retry_times[key] = time.monotonic() + 45.0
+            self._rollover_service.update_workflow(
+                metal, phase="CANDIDATE_ERROR", last_error=str(exc))
+            self._rollover_service.alert_once(
+                metal, "candidate_warmup_failed", today,
+                f"{metal}: candidate contract could not be fully warmed; "
+                "rollover will remain blocked and retry",
+                error=str(exc))
+            log.warning("[Rollover] candidate warmup failed for %s: %s", metal, exc)
+            return None
+
+    def _activate_rollover_candidate(self, env: Environment, metal: str,
+                                     *, carry: bool) -> bool:
+        """Promote the warmed candidate only after exact broker-flat checks."""
+        key = (env.name, metal)
+        staged = getattr(self, "_rollover_candidates", {}).get(key)
+        if staged is None:
+            self._rollover_service.alert_once(
+                metal, "candidate_lost", datetime.now(IST).date(),
+                f"{metal}: warmed rollover candidate is missing; promotion withheld")
+            return False
+        broker = getattr(env, "broker", None)
+        config = staged["instrument_config"]
+        old_cfg = (self.config.get("instruments", {}) or {}).get(metal) or {}
+        old_cfg_snapshot = dict(old_cfg)
+        old_sid = str(old_cfg.get("security_id") or "")
+        old_symbol = old_cfg.get("symbol")
+        try:
+            if not callable(getattr(broker, "instrument_flat", None)) or not broker.instrument_flat(metal, old_sid):
+                return False
+            if not callable(getattr(broker, "instrument_orders_clear", None)) or not broker.instrument_orders_clear(metal, old_sid):
+                return False
+        except Exception as exc:
+            self._rollover_service.alert_once(
+                metal, "promotion_reconciliation_failed", datetime.now(IST).date(),
+                f"{metal}: Dhan could not verify old-contract flatness; "
+                "candidate promotion is withheld", error=str(exc))
+            return False
+
+        local_open = [p for p in env.position_manager.open_positions
+                      if p.is_open and p.instrument == metal]
+        if local_open:
+            return False
+        strategy = next((s for s in env.strategies.values()
+                         if getattr(s, "instrument", None) == metal
+                         and getattr(s, "strategy_type", None) == "supertrend"), None)
+        if strategy is None or strategy.position_side is not None:
+            return False
+        expected_params = (self._rollover_service.workflow(metal)
+                           .get("candidate") or {})
+        if any((expected_params.get("atr_period") is not None
+                and int(expected_params["atr_period"]) != strategy.supertrend.atr_period,
+                expected_params.get("multiplier") is not None
+                and float(expected_params["multiplier"]) != strategy.supertrend.multiplier,
+                expected_params.get("source") is not None
+                and expected_params["source"] != strategy.supertrend.source_name,
+                expected_params.get("atr_method") is not None
+                and expected_params["atr_method"] != strategy.supertrend.atr_method,
+                expected_params.get("first_tr") is not None
+                and expected_params["first_tr"] != strategy.supertrend.first_tr)):
+            self._rollover_candidates.pop(key, None)
+            self._rollover_candidate_retry_at.pop(key, None)
+            self._rollover_service.alert_once(
+                metal, "candidate_parameters_changed", datetime.now(IST).date(),
+                f"{metal}: SuperTrend settings changed during warmup; candidate must be rebuilt")
+            return False
+        adapter = getattr(env, "data_adapter", None)
+        try:
+            with self._lock:
+                live_cfg = (self.config.get("instruments", {}) or {}).get(metal)
+                if not isinstance(live_cfg, dict):
+                    return False
+                broker.update_instrument_contract(metal, config)
+                try:
+                    adapter.promote_rollover_candidate(staged["alias"], metal)
+                except Exception:
+                    broker.update_instrument_contract(metal, old_cfg_snapshot)
+                    raise
+                live_cfg.clear()
+                live_cfg.update(config)
+                if env.candle_fetcher is not None:
+                    env.candle_fetcher.instruments[metal] = live_cfg
+                if env.candle_router is not None:
+                    env.candle_router._instruments[metal] = live_cfg
+                strategy.security_id = str(config["security_id"])
+                strategy.supertrend = staged["indicator"]
+                strategy.state = StrategyState.FLAT
+                strategy.position_side = None
+                strategy.current_position_id = None
+                strategy.current_trade_id = None
+                strategy.position_quantity = None
+        except Exception as exc:
+            self._rollover_service.update_workflow(
+                metal, phase="PROMOTION_ERROR", last_error=str(exc))
+            self._rollover_service.alert_once(
+                metal, "promotion_failed", datetime.now(IST).date(),
+                f"{metal}: candidate promotion failed after old-contract flat "
+                "confirmation; entry remains blocked", error=str(exc))
+            return False
+
+        carry_rows = self._rollover_service.workflow(metal).get("carry_positions", [])
+        phase = "CARRY_ENTRY_READY" if carry and carry_rows else "ACTIVE"
+        if not self._rollover_service.update_workflow(
+                metal, phase=phase, last_error=None):
+            self._rollover_blocked.add((env.name, metal))
+            self._rollover_service.alert_once(
+                metal, "handoff_state_persist_failed", datetime.now(IST).date(),
+                f"{metal}: the next-contract handoff state could not be saved; "
+                "carry entry remains blocked")
+            return False
+        getattr(self, "_rollover_candidates", {}).pop(key, None)
+        getattr(self, "_rollover_candidate_retry_at", {}).pop(key, None)
+        self._rollover_applied[metal] = {
+            "from_symbol": old_symbol,
+            "to_symbol": config.get("symbol"),
+            "from_security_id": old_sid,
+            "to_security_id": config.get("security_id"),
+            "switched_on": datetime.now(IST).date().isoformat(),
+            "in_process": True,
+        }
+        if not carry:
+            self._rollover_blocked.discard((env.name, metal))
+        self.publish_event("contract_rollover_promoted", {
+            "instrument": metal, "from_symbol": old_symbol,
+            "from_security_id": old_sid, "to_symbol": config.get("symbol"),
+            "to_security_id": config.get("security_id"),
+            "carry_entry_pending": bool(carry and carry_rows),
+            "execution_mode": env.mode,
+        }, env_name=env.name)
+        return True
+
+    def _recover_rollover_handoff(self, env: Environment, metal: str,
+                                  current_sid: str) -> None:
+        """Resume a crash between persisting the override and promotion/carry."""
+        wf = self._rollover_service.workflow(metal)
+        rows = wf.get("carry_positions") or []
+        candidate = wf.get("candidate") or {}
+        old_sid = str(rows[0].get("old_security_id") or "") if rows else ""
+        if (not rows or not old_sid or old_sid == str(current_sid)
+                or str(candidate.get("security_id") or "") != str(current_sid)
+                or str(wf.get("phase") or "").upper() in {
+                    "COMPLETE", "CARRY_FAILED", "CARRY_BLOCKED",
+                    "CARRY_ENTRY_READY", "ENTRY_SUBMITTED"}):
+            return
+        broker = getattr(env, "broker", None)
+        try:
+            old_flat = bool(broker.instrument_flat(metal, old_sid))
+            old_orders_clear = bool(broker.instrument_orders_clear(metal, old_sid))
+        except Exception as exc:
+            self._rollover_service.alert_once(
+                metal, "handoff_recovery_unverified", datetime.now(IST).date(),
+                f"{metal}: post-restart handoff could not verify the old contract; entries remain blocked",
+                error=str(exc), old_security_id=old_sid)
+            return
+        if (not old_flat or not old_orders_clear
+                or any(p.is_open and p.instrument == metal
+                       for p in env.position_manager.open_positions)):
+            self._rollover_service.alert_once(
+                metal, "handoff_recovery_old_exposure", datetime.now(IST).date(),
+                f"{metal}: old-contract exposure/orders remain after restart; "
+                "carry entry is withheld", old_security_id=old_sid)
+            return
+        self._rollover_service.update_workflow(
+            metal, phase="CARRY_ENTRY_READY", last_error=None)
+        self._rollover_blocked.add((env.name, metal))
+        self.publish_event("contract_rollover_handoff_recovered", {
+            "instrument": metal, "old_security_id": old_sid,
+            "new_security_id": str(current_sid), "carry_positions": rows,
+            "execution_mode": env.mode,
+        }, env_name=env.name)
+
+    def _try_rollover_carry_entries(self, env: Environment) -> None:
+        """Submit one carry entry through the ordinary durable signal path."""
+        if not env.is_live or not env.data_adapter:
+            return
+        for metal in (self.config.get("instruments", {}) or {}):
+            wf = self._rollover_service.workflow(metal)
+            phase = str(wf.get("phase") or "").upper()
+            rows = wf.get("carry_positions") or []
+            if not rows or phase not in {"CARRY_ENTRY_READY", "ENTRY_SUBMITTED"}:
+                continue
+            # Confirm any prior submission against Dhan/local position state;
+            # never retry an ambiguous POST after a process restart.
+            candidate_cfg = (self.config.get("instruments", {}) or {}).get(metal) or {}
+            sid = str(candidate_cfg.get("security_id") or "")
+            try:
+                flat = bool(env.broker.instrument_flat(metal, sid))
+                orders_clear = bool(env.broker.instrument_orders_clear(metal, sid))
+            except Exception:
+                continue
+            strategy = next((s for s in env.strategies.values()
+                             if getattr(s, "instrument", None) == metal
+                             and getattr(s, "strategy_type", None) == "supertrend"), None)
+            if strategy is None:
+                continue
+            owned = [p for p in env.position_manager.open_positions
+                     if p.is_open and p.instrument == metal]
+            if phase == "ENTRY_SUBMITTED":
+                if owned and not flat:
+                    self._rollover_service.update_workflow(metal, phase="COMPLETE")
+                    self._rollover_blocked.discard((env.name, metal))
+                    self.publish_event("contract_rollover_carry_confirmed", {
+                        "instrument": metal,
+                        "position_id": owned[0].position_id,
+                        "quantity": owned[0].quantity,
+                        "side": "LONG" if owned[0].is_long else "SHORT",
+                        "execution_mode": env.mode,
+                    }, env_name=env.name)
+                elif flat and orders_clear:
+                    submitted_at = float(rows[0].get("entry_submitted_at") or 0.0)
+                    if submitted_at and time.time() - submitted_at > 20:
+                        self._rollover_service.alert_once(
+                            metal, "carry_entry_unconfirmed", datetime.now(IST).date(),
+                            f"{metal}: carry entry was submitted but Dhan still shows no position or working order; "
+                            "automatic resubmission is withheld pending reconciliation",
+                            signal_id=rows[0].get("entry_signal_id"),
+                            security_id=sid)
+                continue
+            if not flat or not orders_clear or owned:
+                continue
+            if (not env.gate_enabled or not self._gate_for(
+                    next((sid_ for sid_, s in env.strategies.items()
+                          if s is strategy), "")).entries_allowed):
+                continue
+            if not env.market_status.is_trading_allowed:
+                continue
+            if getattr(env.safe_mode, "is_active", False):
+                continue
+            health = getattr(self, "market_data_health", None)
+            if health is not None and not health.is_healthy(metal):
+                continue
+            value = strategy.supertrend.value
+            if value is None or value.atr is None or value.trend not in (-1, 1):
+                continue
+            ltp = env.data_adapter.get_live_ltp(metal)
+            if ltp is None or float(ltp) <= 0:
+                continue
+            qty = int(rows[0].get("quantity") or 0)
+            lot_size = int(candidate_cfg.get("lot_size") or 1)
+            if qty <= 0 or lot_size <= 0 or qty % lot_size:
+                self._rollover_service.update_workflow(
+                    metal, phase="CARRY_BLOCKED",
+                    last_error=f"carried quantity {qty} is invalid for next lot size {lot_size}")
+                self._rollover_service.alert_once(
+                    metal, "carry_quantity_invalid", datetime.now(IST).date(),
+                    f"{metal}: carried quantity is incompatible with next-contract lot size; staying flat",
+                    quantity=qty, lot_size=lot_size)
+                continue
+            trend = int(value.trend)
+            side = "LONG" if trend == 1 else "SHORT"
+            latest_ts = float(strategy.supertrend.snapshot().get("last_candle_end_ts") or 0)
+            bar = strategy.supertrend._bars[-1] if getattr(strategy.supertrend, "_bars", None) else None
+            if bar is None:
+                continue
+            _end, opn, high, low, close = bar
+            from strategies.types import freeze_signal_context
+            signal = Signal(
+                signal_type=SignalType.LONG if trend == 1 else SignalType.SHORT,
+                instrument=metal, strategy_id=strategy.strategy_id,
+                timestamp=max(0.0, latest_ts - 900),
+                trigger_price=float(ltp), stop_price=0.0, quantity=qty,
+                side=side,
+                metadata={
+                    "strategy_type": "supertrend", "strategy_timeframe": "15m",
+                    "signal_source": "contract_rollover_carry",
+                    "signal_candle_start": max(0.0, latest_ts - 900),
+                    "signal_candle_open": float(opn),
+                    "signal_candle_high": float(high),
+                    "signal_candle_low": float(low),
+                    "signal_candle_close": float(close),
+                    "supertrend_trend": trend,
+                    "supertrend_atr": float(value.atr),
+                    "market_on_signal_close": True,
+                    "no_separate_stop": True,
+                    "triggered": True, "trigger_state": "FIRED",
+                    "trigger_source": "verified_next_expiry_supertrend_direction",
+                    "is_rollover_carry_entry": True,
+                    "rollover_id": wf.get("roll_id"),
+                })
+            signal.signal_id = str(rows[0].get("entry_signal_id") or
+                                   uuid.uuid5(uuid.NAMESPACE_URL,
+                                              f"{wf.get('roll_id')}:{metal}:{sid}"))
+            freeze_signal_context(
+                signal, open_=float(opn), high=float(high), low=float(low),
+                close=float(close), volume=0,
+                indicator_values={"supertrend_trend": trend,
+                                  "supertrend_atr": float(value.atr)},
+                timestamp=signal.timestamp)
+            rows[0]["entry_signal_id"] = signal.signal_id
+            rows[0]["entry_submitted_at"] = time.time()
+            if not self._rollover_service.update_workflow(
+                    metal, phase="ENTRY_SUBMITTED", carry_positions=rows,
+                    last_error=None):
+                continue
+            # Release the rollover entry block only for the normal order path;
+            # keep the engine-wide lock to exclude a simultaneous candle flip.
+            with self._lock:
+                self._rollover_blocked.discard((env.name, metal))
+                self._process_signal(signal, env.name)
+                self._rollover_blocked.add((env.name, metal))
+            orders = [o for o in getattr(env.execution_engine, "_orders", {}).values()
+                      if getattr(o, "entry_signal_id", None) == signal.signal_id]
+            if not orders:
+                self._rollover_service.update_workflow(
+                    metal, phase="CARRY_FAILED",
+                    last_error="normal live execution path created no order")
+                self._rollover_service.alert_once(
+                    metal, "carry_entry_not_created", datetime.now(IST).date(),
+                    f"{metal}: rollover carry entry did not create an order; no duplicate will be attempted",
+                    signal_id=signal.signal_id, security_id=sid)
+            elif all(str(getattr(getattr(o, "state", None), "value", "")).lower()
+                              in {"rejected", "cancelled", "canceled", "expired"}
+                              for o in orders):
+                self._rollover_service.update_workflow(
+                    metal, phase="CARRY_FAILED",
+                    last_error=str(getattr(orders[-1], "reason", "entry rejected")))
+                self._rollover_service.alert_once(
+                    metal, "carry_entry_rejected", datetime.now(IST).date(),
+                    f"{metal}: Dhan/entry path rejected the rollover carry entry; "
+                    "no automatic duplicate order will be sent",
+                    signal_id=signal.signal_id, reason=getattr(orders[-1], "reason", None))
+
     def _rollover_tick(self, env_name: Optional[str] = None) -> None:
+        """Serialize watchdog ticks so broker actions cannot be duplicated."""
+        lock = getattr(self, "_rollover_tick_lock", None)
+        if lock is None:
+            lock = self._rollover_tick_lock = threading.Lock()
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            self._rollover_tick_locked(env_name)
+        finally:
+            lock.release()
+
+    def _rollover_tick_locked(self, env_name: Optional[str] = None) -> None:
         """Evaluate + act on the contract rollover for every metal."""
         env = self._env_for(env_name)
         if not env.is_live:
@@ -492,8 +983,20 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
             sid = str(inst.get("security_id", "") or "")
             if not symbol or not sid:
                 continue
+            self._recover_rollover_handoff(env, metal, sid)
             needs_broker_check = self._rollover_service.requires_broker_confirmation(
                 metal, symbol, sid, today)
+            staged = None
+            candidate_ready = True
+            if needs_broker_check:
+                # Close the entry race before scrip-master / candle REST calls.
+                # An in-flight signal either finishes first and is then
+                # cancelled/reconciled, or observes the rollover block.
+                with getattr(self, "_lock", threading.RLock()):
+                    self._rollover_blocked.add((env.name, metal))
+                staged = self._prepare_rollover_candidate(
+                    env, metal, symbol, sid, today)
+                candidate_ready = staged is not None
             # Avoid repeated position/order REST requests throughout the
             # contract month. These broker checks are required only after the
             # configured rollover window begins.
@@ -530,8 +1033,19 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                         security_id=sid)
             actions = self._rollover_service.evaluate(
                 metal, symbol, sid, today, has_positions,
-                resting_orders_clear=orders_clear)
-            if "block_entries" in actions:
+                resting_orders_clear=orders_clear,
+                # Do not persist or apply a contract change until its data is
+                # warmed. Carrying a live position additionally requires that
+                # same staged indicator before the old contract can be closed.
+                candidate_ready=candidate_ready)
+            workflow_phase = str(self._rollover_service.workflow(metal).get(
+                "phase") or "").upper()
+            carry_must_remain_blocked = workflow_phase in {
+                "EXIT_REQUESTED", "OLD_EXIT_SUBMITTED", "PROMOTION_WAIT",
+                "PROMOTION_ERROR", "CARRY_ENTRY_READY", "ENTRY_SUBMITTED",
+                "CARRY_FAILED", "CARRY_BLOCKED",
+            }
+            if "block_entries" in actions or carry_must_remain_blocked:
                 self._rollover_blocked.add((env.name, metal))
             else:
                 self._rollover_blocked.discard((env.name, metal))
@@ -551,23 +1065,104 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                         }, env_name=env.name)
                     except Exception as e:
                         log.warning("[Rollover] cancel resting failed: %s", e)
-            if "force_close" in actions and broker is not None:
-                try:
-                    result = self.emergency_exit_all(env.name, instrument=metal)
-                    self.publish_event("contract_rollover_force_close", {
-                        "instrument": metal, "result": result,
-                    }, env_name=env.name)
-                    if (not result.get("closed") and not result.get("errors")):
+            # If the durable contract override was saved but in-process
+            # promotion failed, retry promotion on later watchdog passes.
+            # Without this branch evaluate() sees switched_on and returns only
+            # block_entries, leaving the engine permanently on the old SID.
+            override = (self._rollover_service.overrides().get(metal) or {})
+            target_sid = str(override.get("active_security_id") or "")
+            staged_sid = str((staged or {}).get("contract", {}).get("security_id") or "")
+            if (target_sid and target_sid != sid and candidate_ready
+                    and staged_sid == target_sid):
+                local_open = any(
+                    p.is_open and p.instrument == metal
+                    for p in env.position_manager.open_positions)
+                if not has_positions and orders_clear and not local_open:
+                    if not self._activate_rollover_candidate(
+                            env, metal,
+                            carry=bool(self._rollover_service.workflow(metal)
+                                       .get("carry_positions"))):
+                        self._rollover_blocked.add((env.name, metal))
+                        self._rollover_service.update_workflow(
+                            metal, phase="PROMOTION_WAIT",
+                            last_error="persisted contract override awaits runtime promotion")
+                    continue
+            if (needs_broker_check and has_positions
+                    and orders_clear
+                    and (candidate_ready or "force_close" in actions)):
+                # Persist exact position ownership/quantity before the first
+                # close POST. A restart can therefore distinguish this planned
+                # transfer from a normal flat rollover.
+                owned = [p for p in env.position_manager.open_positions
+                         if p.is_open and p.instrument == metal]
+                if len(owned) != 1:
+                    self._rollover_service.alert_once(
+                        metal, "carry_position_ambiguous", today,
+                        f"{metal}: expected one locally owned position before rollover; "
+                        "automatic close/carry is withheld",
+                        local_position_count=len(owned), security_id=sid)
+                else:
+                    pos = owned[0]
+                    workflow = self._rollover_service.workflow(metal)
+                    carry = workflow.get("carry_positions") or [{
+                        "position_id": pos.position_id,
+                        "trade_id": pos.trade_id,
+                        "strategy_id": pos.strategy_id,
+                        "instrument": metal,
+                        "old_security_id": sid,
+                        "side": "LONG" if pos.is_long else "SHORT",
+                        "quantity": int(pos.quantity),
+                        "average_entry": float(pos.average_entry),
+                    }]
+                    phase = str(workflow.get("phase") or "").upper()
+                    if phase not in {"EXIT_REQUESTED", "OLD_EXIT_SUBMITTED"}:
+                        if not self._rollover_service.update_workflow(
+                                metal, phase="EXIT_REQUESTED",
+                                roll_id=workflow.get("roll_id") or str(uuid.uuid4()),
+                                candidate={
+                                    **(workflow.get("candidate") or {}),
+                                    "trend_at_prepare": (
+                                        staged["last_bar"]["trend"]
+                                        if staged is not None else None),
+                                }, carry_positions=carry, last_error=None):
+                            self._rollover_service.alert_once(
+                                metal, "carry_journal_failed", today,
+                                f"{metal}: rollover position intent could not be saved; "
+                                "old position close withheld",
+                                position_id=pos.position_id)
+                            continue
+                    try:
+                        result = self.emergency_exit_all(
+                            env.name, instrument=metal,
+                            exit_reason="contract_rollover")
+                        self.publish_event("contract_rollover_position_exit", {
+                            "instrument": metal, "result": result,
+                            "position_id": pos.position_id,
+                            "quantity": int(pos.quantity),
+                            "security_id": sid,
+                        }, env_name=env.name)
+                    except Exception as exc:
+                        self._rollover_service.update_workflow(
+                            metal, phase="EXIT_ERROR", last_error=str(exc))
                         self._rollover_service.alert_once(
-                            metal, "force_close_no_owned_position",
-                            today,
-                            f"{metal}: Dhan is not flat but the engine has no "
-                            "locally tracked position to close; manual broker "
-                            "reconciliation is required",
-                            security_id=sid)
-                except Exception as e:
-                    log.warning("[Rollover] force-close failed: %s", e)
+                            metal, "carry_exit_failed", today,
+                            f"{metal}: old-contract exit submission failed; "
+                            "position remains under normal reconciliation",
+                            position_id=pos.position_id, error=str(exc))
             if "persist_switch" in actions:
+                workflow = self._rollover_service.workflow(metal)
+                has_carry = bool(workflow.get("carry_positions"))
+                if needs_broker_check and candidate_ready:
+                    promoted = self._activate_rollover_candidate(
+                        env, metal, carry=has_carry)
+                    if not promoted:
+                        self._rollover_blocked.add((env.name, metal))
+                        self._rollover_service.update_workflow(
+                            metal, phase="PROMOTION_WAIT",
+                            last_error="broker flat/order-clear or runtime promotion not yet confirmed")
+                        continue
+                else:
+                    self._rollover_blocked.add((env.name, metal))
                 self.publish_event("contract_rollover_switched", {
                     "instrument": metal,
                     **self._rollover_service.overrides().get(metal, {}),
@@ -2705,3 +3300,12 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                         ms.set_engine_status(EngineStatus.TRADING)
                     except Exception:
                         pass
+        # Carry entries are a one-shot, journaled operation and are submitted
+        # only after the new contract has a fresh LTP and ordinary LIVE gates
+        # have reached TRADING. This also resumes a prepared handoff after boot.
+        for env in getattr(self, "_envs", {}).values():
+            try:
+                self._try_rollover_carry_entries(env)
+            except Exception as exc:
+                log.warning("[Rollover] carry-entry check failed (%s): %s",
+                            getattr(env, "name", "?"), exc)

@@ -32,11 +32,10 @@ def create_silver_15m(strategy_id: str = "silver_01", instrument: str = "SILVERM
         quantity=kwargs.get("quantity", 1),
         capital=kwargs.get("capital", 300_000.0),
         multiplier=kwargs.get("multiplier", 5.0),
-        atr_period=params.get("atr_period", kwargs.get("atr_period", 36)),
-        atr_multiplier=params.get("multiplier", kwargs.get("atr_multiplier", 4.9)),
+        atr_period=params.get("atr_period", kwargs.get("atr_period", 76)),
+        atr_multiplier=params.get("multiplier", kwargs.get("atr_multiplier", 3.7)),
         source=params.get("source", kwargs.get("source", "low")),
         atr_method=params.get("atr_method", kwargs.get("atr_method", "sma_tr")),
-        # Pine v4 `tr` (the series variable, unlike tr(true)) is `na` on the
-        # first chart bar because there is no prior close.
-        first_tr=params.get("first_tr", "na"),
+        # Top-1 Pine v6 profile uses ta.tr(true), whose first value is H-L.
+        first_tr=params.get("first_tr", "high_low"),
     )

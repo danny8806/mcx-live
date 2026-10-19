@@ -113,6 +113,14 @@ def _engine(tmp_path, monkeypatch, *, positions=None, orders=None):
 def test_fresh_end_to_end_missing_expiry_rolls_only_after_broker_clear(
         tmp_path, monkeypatch):
     engine, http = _engine(tmp_path, monkeypatch)
+    engine._prepare_rollover_candidate = lambda env, metal, symbol, sid, today: {
+        "ready": True,
+    }
+    engine._rollover_service.update_workflow(
+        "GOLDM", phase="CANDIDATE_READY",
+        candidate={"security_id": "571445", "config_symbol": "MCX:GOLDM202611",
+                   "ready": True})
+    engine._activate_rollover_candidate = lambda env, metal, carry: True
 
     engine._rollover_tick("live")
 
@@ -173,5 +181,10 @@ def test_fresh_end_to_end_broker_lookup_failure_keeps_state_and_retries(
     # Recover broker endpoints; the next independent watchdog invocation
     # must resolve and persist the next series without restarting the process.
     http._get = lambda path: []
+    engine._rollover_candidate_retry_at[("live", "GOLDM")] = 0
+    engine._prepare_rollover_candidate = lambda env, metal, symbol, sid, today: {
+        "ready": True,
+    }
+    engine._activate_rollover_candidate = lambda env, metal, carry: True
     engine._rollover_tick("live")
     assert engine._rollover_service.overrides()["GOLDM"]["active_security_id"] == "571445"

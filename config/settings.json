@@ -86,7 +86,7 @@
       "instrument": "SILVERM",
       "strategy_type": "supertrend",
       "signal_timeframe": "15m",
-      "supertrend": {"atr_period": 36, "multiplier": 4.9, "source": "low", "atr_method": "sma_tr", "first_tr": "na"},
+      "supertrend": {"atr_period": 76, "multiplier": 3.7, "source": "low", "atr_method": "sma_tr", "first_tr": "high_low"},
       "quantity": 1,
       "capital": 300000,
       "enabled": true,

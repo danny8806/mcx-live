@@ -8,18 +8,17 @@ next engine boot applies so trading continues in the next series.
 
 Policy (operator-chosen)
 ------------------------
-* ROLLOVER WINDOW opens at ``last_session - trigger_days`` trading days
-  (default 2).  From then on new entries in the EXPIRING series are blocked
-  (resting entries are cancelled at window open) and the metal waits to go
-  flat — the open trade exits on the current strategy's opposite signal.
-* Once flat inside the window the system resolves the next series from the
-  Dhan scrip master (symbol + security_id + expiry) and PERSISTS the override;
-  the contract is switched at the next engine boot (full re-warmup in the new
-  series happens before the engine goes READY).  The metal stays entry-blocked
-  for the rest of the current session.
-* If still holding at the START of the last trading session
-  (``last_session``), the engine force-closes the expiring series with MARKET
-  closes (the fallback the operator chose so nothing rides into expiry).
+* The rollover window starts ``trigger_days`` trading days before the last
+  trading session (default 3). New entries in the expiring series are blocked
+  and resting orders are cancelled.
+* The engine warms and verifies the next series before closing a local
+  position. Once Dhan confirms the old contract is flat and all its orders are
+  terminal, the engine promotes the staged series and submits one carry entry
+  using the newly warmed SuperTrend direction and the old filled quantity.
+* If the final-session close is required before candidate warmup succeeds, the
+  old position is still journaled before the close. The contract switch and
+  carry entry remain blocked until the candidate is ready and broker state is
+  confirmed.
 * If the next series cannot be resolved, entries stay blocked and alerts fire
   — the engine never guesses a security id.
 
@@ -200,7 +199,7 @@ class RolloverService:
     ):
         cfg = config or {}
         self.enabled = bool(cfg.get("enabled", False))
-        self.trigger_days = int(cfg.get("trigger_days_before_expiry", 2) or 2)
+        self.trigger_days = int(cfg.get("trigger_days_before_expiry", 3) or 3)
         self.block_on_window = bool(cfg.get("block_entries_on_window", True))
         self.cancel_on_window = bool(cfg.get("cancel_resting_on_window", True))
         self.force_close_on_last = bool(cfg.get("force_close_on_last_session", True))
@@ -378,9 +377,9 @@ class RolloverService:
         self._alert_once(
             rec, "switched", today,
             f"{metal}: flat — rolling {current_symbol} -> {nxt.config_symbol()} "
-            f"(sid {current_security_id} -> {nxt.security_id}); trading resumes "
-            "in the new series at the next engine boot. Entries stay blocked "
-            "until then.",
+            f"(sid {current_security_id} -> {nxt.security_id}); the engine will "
+            "promote the warmed contract and keep entries blocked until its "
+            "broker state and carry workflow are verified.",
             next_symbol=nxt.config_symbol(), next_security_id=nxt.security_id)
         return True
 
@@ -413,6 +412,10 @@ class RolloverService:
         """Persist workflow state before broker actions; never ignore failure."""
         with self._lock:
             rec = self.record(metal)
+            previous = (rec.workflow_phase, rec.roll_id,
+                        dict(rec.candidate or {}),
+                        [dict(row) for row in rec.carry_positions],
+                        rec.last_error)
             if phase is not None:
                 rec.workflow_phase = str(phase)
             if roll_id is not None:
@@ -422,7 +425,11 @@ class RolloverService:
             if carry_positions is not None:
                 rec.carry_positions = [dict(row) for row in carry_positions]
             rec.last_error = last_error
-            return self._save()
+            if self._save():
+                return True
+            (rec.workflow_phase, rec.roll_id, rec.candidate,
+             rec.carry_positions, rec.last_error) = previous
+            return False
 
     # ── alert helpers ──────────────────────────────────────────────────
 
@@ -455,7 +462,8 @@ class RolloverService:
 
     def evaluate(self, metal: str, current_symbol: str, current_security_id: str,
                  today: date, has_positions: bool,
-                 resting_orders_clear: bool = False) -> list[str]:
+                 resting_orders_clear: bool = False,
+                 candidate_ready: bool = True) -> list[str]:
         """Decide the actions the engine must take for one metal.
 
         Returns a list of action tokens:
@@ -528,6 +536,12 @@ class RolloverService:
                     security_id=current_security_id)
                 return actions
             if self.cancel_on_window and not resting_orders_clear:
+                return actions
+            if not candidate_ready:
+                self._alert_once(
+                    rec, "candidate_not_ready", today,
+                    f"{metal}: next contract is not warmed and verified; "
+                    "contract switch is withheld")
                 return actions
             nxt = min(candidates, key=lambda contract: contract.expiry)
             if self._persist_switch(
@@ -612,6 +626,12 @@ class RolloverService:
             # flight. The caller must verify all old-contract orders terminal
             # with the broker before asking the decider to persist a switch.
             if self.cancel_on_window and not resting_orders_clear:
+                return actions
+            if not candidate_ready:
+                self._alert_once(
+                    rec, "candidate_not_ready", today,
+                    f"{metal}: next contract is not warmed and verified; "
+                    "contract switch is withheld")
                 return actions
             # Flat within the window -> attempt the switch to the next series.
             if rec.switched_on is not None and rec.switched_on != today.isoformat():
