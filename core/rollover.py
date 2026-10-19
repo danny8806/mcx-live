@@ -408,10 +408,14 @@ class RolloverService:
                         roll_id: Optional[str] = None,
                         candidate: Optional[dict] = None,
                         carry_positions: Optional[list[dict]] = None,
-                        last_error: Optional[str] = None) -> bool:
+                        last_error: Optional[str] = None,
+                        expected_phase: Optional[str] = None) -> bool:
         """Persist workflow state before broker actions; never ignore failure."""
         with self._lock:
             rec = self.record(metal)
+            if (expected_phase is not None
+                    and rec.workflow_phase.upper() != str(expected_phase).upper()):
+                return False
             previous = (rec.workflow_phase, rec.roll_id,
                         dict(rec.candidate or {}),
                         [dict(row) for row in rec.carry_positions],

@@ -885,7 +885,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                     and expected_side in {"LONG", "SHORT"}
                     and bool(getattr(p, "is_long", False)) == (expected_side == "LONG")
                 ]
-                if matching_positions and not flat:
+                if matching_positions and not flat and orders_clear:
                     position = matching_positions[0]
                     self._rollover_service.update_workflow(metal, phase="COMPLETE")
                     self._rollover_blocked.discard((env.name, metal))
@@ -897,6 +897,13 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                         "signal_id": signal_id,
                         "execution_mode": env.mode,
                     }, env_name=env.name)
+                elif matching_positions and not flat and not orders_clear:
+                    self._rollover_service.alert_once(
+                        metal, "carry_position_order_still_working",
+                        datetime.now(IST).date(),
+                        f"{metal}: the carry position matches, but Dhan still reports a working order; "
+                        "rollover remains blocked until the order is terminal",
+                        signal_id=signal_id, security_id=sid)
                 elif flat and orders_clear:
                     submitted_at = float(rows[0].get("entry_submitted_at") or 0.0)
                     order_states = [
@@ -1042,7 +1049,7 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
             rows[0]["entry_security_id"] = sid
             if not self._rollover_service.update_workflow(
                     metal, phase="ENTRY_SUBMITTED", carry_positions=rows,
-                    last_error=None):
+                    last_error=None, expected_phase="CARRY_ENTRY_READY"):
                 continue
             # Release the rollover entry block only for the normal order path;
             # keep the engine-wide lock to exclude a simultaneous candle flip.
