@@ -328,25 +328,30 @@ class LiveExecutionEngine:
             order.updated_at = self._now()
             return order
         except Exception as e:
-            # Broker-side placement rejection (DH-905/DH-906 input errors, RMS
-            # funds) and transport failures land here.  Preserve the real
-            # message so the book/UI show the actual reason; the generic
-            # sentinel is only used when the exception carries no usable detail.
-            order.state = OrderState.REJECTED
-            # Pure adapter argument validation happens before its HTTP POST.
-            # Other exceptions can occur after the request crossed the client
-            # boundary, so preserve uncertainty instead of claiming not sent.
-            order.submission_outcome = (
-                "NOT_SENT" if isinstance(e, ValueError)
-                else "OUTCOME_UNKNOWN")
+            # Unexpected adapter/transport exceptions land here. Explicit
+            # Dhan rejections arrive as structured result dictionaries; an
+            # exception alone does not prove that a write was rejected.
+            # ValueError is the adapter's pre-send validation contract. Every
+            # other exception may happen after a request crossed the network
+            # boundary. Keep that outcome nonterminal because OrderManager
+            # releases dedup on REJECTED, which could permit a duplicate POST.
+            if isinstance(e, ValueError):
+                order.state = OrderState.REJECTED
+                order.submission_outcome = "NOT_SENT"
+            else:
+                order.state = OrderState.SUBMITTED
+                order.submission_outcome = "OUTCOME_UNKNOWN"
+                order.filled_quantity = 0
             order.reason = str(e) or "LIVE_BROKER_UNAVAILABLE"
             order.updated_at = self._now()
             return order
 
         if not result:
-            order.state = OrderState.REJECTED
+            # No response is not evidence that the broker rejected the write.
+            order.state = OrderState.SUBMITTED
             order.submission_outcome = "OUTCOME_UNKNOWN"
             order.reason = "LIVE_ORDER_NO_STATUS"
+            order.filled_quantity = 0
             order.updated_at = self._now()
             return order
 

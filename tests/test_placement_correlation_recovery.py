@@ -510,14 +510,18 @@ def test_engine_parks_unresolved_placement_as_submitted():
 
 
 def test_engine_still_rejects_a_definitive_broker_rejection():
-    """The fix must not weaken genuine broker rejections."""
-    from core.lifecycle import OrderRole
+    """A structured broker rejection is terminal; ambiguous exceptions are not."""
     from execution.live.engine import LiveExecutionEngine
     from execution.models import Order, OrderState
 
     class RejectingBroker:
-        def place_market_order(self, **kw):
-            raise RuntimeError("RMS: insufficient funds")
+        def place_market_order(self, **_kw):
+            return {
+                "broker_order_id": "B-RMS-REJECT",
+                "status": "rejected",
+                "raw_status": "REJECTED",
+                "reason": "RMS: insufficient funds",
+            }
 
     eng = LiveExecutionEngine.__new__(LiveExecutionEngine)
     eng._lock = __import__("threading").RLock()
@@ -535,8 +539,8 @@ def test_engine_still_rejects_a_definitive_broker_rejection():
     order.correlation_id = "CORR2"
     out = eng.submit_order(order)
     assert out.state == OrderState.REJECTED
-    assert out.submission_outcome == "OUTCOME_UNKNOWN"
-    assert "insufficient funds" in (out.reason or "")
+    assert out.submission_outcome == "BROKER_RESPONSE_RECEIVED"
+    assert out.reason == "RMS: insufficient funds"
 
 
 @pytest.mark.parametrize(
