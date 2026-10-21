@@ -691,6 +691,39 @@ class SignalFlowMixin:
                     signal, env, "entry_order_not_created")
                 self._reset_strategy_state(signal.strategy_id, env_name=env.name)
             return
+        if getattr(order, "pre_submit_persistence_failed", False):
+            # The intent was not durable, so OrderManager deliberately never
+            # called the broker. Remove the memory-only object and settle the
+            # associated trigger/trade with a visible no-send event.
+            execution_engine = getattr(env, "execution_engine", None)
+            orders = getattr(execution_engine, "_orders", None)
+            if isinstance(orders, dict):
+                orders.pop(order.order_id, None)
+            reason = str(order.reason or "ORDER_INTENT_PERSIST_FAILED")
+            self._retire_fired_live_pending(signal, env, reason)
+            if is_exit and position is not None:
+                self._preserve_position_after_exit_block(
+                    signal, env, cancel_reversal=True)
+            else:
+                try:
+                    lifecycle.reject_unfilled_entry(
+                        trade.trade_id, reason=reason, order_id=order.order_id,
+                        status="REJECTED")
+                except Exception as exc:
+                    log.error("[Engine] failed to settle unpersisted order %s: %s",
+                              order.order_id, exc)
+                self._reset_strategy_state(signal.strategy_id, env_name=env.name)
+            self.publish_event("order_persistence_blocked", {
+                "signal_id": signal.signal_id,
+                "order_id": order.order_id,
+                "trade_id": getattr(order, "trade_id", None),
+                "strategy_id": signal.strategy_id,
+                "instrument": signal.instrument,
+                "reason": reason,
+                "broker_called": False,
+                "execution_mode": env.mode,
+            }, env_name=env.name)
+            return
         if is_exit and position is not None and order.state.value in (
                 "submitted", "acknowledged", "partially_filled", "filled"):
             position.exit_started = True

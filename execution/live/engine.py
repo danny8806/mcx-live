@@ -19,6 +19,7 @@ import json
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from execution.broker_router import BrokerEventRouter
@@ -42,6 +43,22 @@ def _broker_state_reason(prefix: str, status: dict) -> str:
     base = f"{prefix}: {status.get('raw_status', '')}"
     detail = status.get("reason") or ""
     return f"{base} ({detail})" if detail else base
+
+
+def _timestamp_epoch(value) -> Optional[float]:
+    """Parse persisted numeric or ISO timestamps used for cache reconciliation."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 class LiveExecutionEngine:
@@ -691,6 +708,11 @@ class LiveExecutionEngine:
                     "gross_value": f.gross_value,
                     "entry_signal_id": f.entry_signal_id,
                     "trade_id": f.trade_id,
+                    "broker_fill_id": getattr(f, "broker_fill_id", None),
+                    "broker_order_id": getattr(f, "broker_order_id", None),
+                    "broker_trade_id": getattr(f, "broker_trade_id", None),
+                    "cumulative_filled_quantity": getattr(
+                        f, "cumulative_filled_quantity", None),
                 }
                 for f in self._fills
             ],
@@ -711,6 +733,7 @@ class LiveExecutionEngine:
                 pass
         self._fills.clear()
         self._orders.clear()
+        self._broker_fill_map.clear()
         for f_data in data.get("fills", []):
             fill = Fill(
                 fill_id=f_data["fill_id"],
@@ -728,7 +751,15 @@ class LiveExecutionEngine:
                 position_id=f_data.get("position_id"),
                 position_generation=f_data.get("position_generation"),
             )
+            for attr in ("broker_fill_id", "broker_order_id", "broker_trade_id",
+                         "cumulative_filled_quantity"):
+                value = f_data.get(attr)
+                if value is not None:
+                    setattr(fill, attr, value)
             self._fills.append(fill)
+            broker_fill_id = str(getattr(fill, "broker_fill_id", "") or "")
+            if broker_fill_id:
+                self._broker_fill_map[broker_fill_id] = fill.fill_id
         for o_data in data.get("orders", []):
             order = Order(
                 order_id=o_data["order_id"],
@@ -776,13 +807,13 @@ class LiveExecutionEngine:
             self._orders[order.order_id] = order
 
     def restore_orders_from_persistence(self, rows: list[dict]) -> int:
-        """Hydrate missing live order objects from canonical DB rows.
+        """Reconcile live order objects against canonical DB rows.
 
         The JSON execution snapshot is a fast restart cache, not the authority.
-        If it was missed or truncated, broker mappings can still be restored
-        while their internal order objects are absent; status polls would then
-        be silently ignored. Restore only nonterminal orders and never replace
-        an order already present in the snapshot.
+        Restore missing working orders and replace a duplicate snapshot object
+        only when the durable row is at least as recent. This prevents an old
+        snapshot from resurrecting a filled/rejected order as working while
+        retaining newer in-memory state when its DB write failed.
         """
         active = {"created", "submitted", "acknowledged", "partially_filled"}
         restored = 0
@@ -791,12 +822,34 @@ class LiveExecutionEngine:
             for row in rows or []:
                 oid = str(row.get("order_id") or "")
                 state_raw = str(row.get("state") or "").lower()
-                if not oid or oid in self._orders or state_raw not in active:
+                if not oid:
                     continue
                 if str(row.get("execution_mode") or "LIVE").upper() != "LIVE":
                     continue
+                existing = self._orders.get(oid)
+                if existing is None and state_raw not in active:
+                    continue
+                if existing is not None:
+                    db_updated = _timestamp_epoch(row.get("updated_at"))
+                    memory_updated = _timestamp_epoch(
+                        getattr(existing, "updated_at", None))
+                    db_filled = int(row.get("filled_quantity") or 0)
+                    memory_filled = int(
+                        getattr(existing, "filled_quantity", 0) or 0)
+                    db_state = ("canceled" if state_raw == "expired"
+                                else state_raw)
+                    memory_state = str(getattr(
+                        getattr(existing, "state", ""), "value",
+                        getattr(existing, "state", ""))).lower()
+                    if (db_updated is None
+                            or db_filled < memory_filled
+                            or (memory_state == "filled" and db_state != "filled")
+                            or (memory_updated is not None
+                                and db_updated < memory_updated)):
+                        continue
                 try:
-                    state = OrderState(state_raw)
+                    state = (OrderState.CANCELED if state_raw == "expired"
+                             else OrderState(state_raw))
                     order = Order(
                         order_id=oid,
                         strategy_id=str(row.get("strategy_id") or ""),
@@ -859,9 +912,32 @@ class LiveExecutionEngine:
                             trade_id=str(row.get("trade_id") or ""),
                             strategy_id=order.strategy_id,
                             instrument=order.instrument)
+                    # Count both recovery of a missing book entry and repair
+                    # of a stale snapshot entry for actionable diagnostics.
                     restored += 1
                 except (TypeError, ValueError, KeyError) as exc:
                     # A malformed row must be reported and skipped; it must
                     # not prevent other broker orders from being recovered.
                     continue
+        return restored
+
+    def restore_broker_fill_ids_from_persistence(self, rows: list[dict]) -> int:
+        """Restore broker-fill idempotency keys before the first status poll.
+
+        The execution snapshot is bounded, and older snapshots did not include
+        broker fill IDs. The durable fill ledger is therefore the source for
+        dedup keys after restart.
+        """
+        restored = 0
+        with self._lock:
+            for row in rows or []:
+                if str(row.get("execution_mode") or "LIVE").upper() != "LIVE":
+                    continue
+                broker_fill_id = str(row.get("broker_fill_id") or "")
+                fill_id = str(row.get("fill_id") or "")
+                if not broker_fill_id or not fill_id:
+                    continue
+                if broker_fill_id not in self._broker_fill_map:
+                    self._broker_fill_map[broker_fill_id] = fill_id
+                    restored += 1
         return restored

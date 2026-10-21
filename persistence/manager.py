@@ -388,7 +388,10 @@ class PersistenceManager:
     def save_order(self, order: dict) -> None:
         """Save order to database."""
         with self._tx() as conn:
-            conn.execute("""
+            self._save_order_conn(conn, order)
+
+    def _save_order_conn(self, conn: sqlite3.Connection, order: dict) -> None:
+        conn.execute("""
                 INSERT INTO orders (
                     order_id, strategy_id, instrument, side,
                     quantity, order_type, price, state,
@@ -405,8 +408,15 @@ class PersistenceManager:
                     rejection_retry_count, submission_attempts
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
-                    state=excluded.state, filled_quantity=excluded.filled_quantity,
-                    average_fill_price=excluded.average_fill_price,
+                    state=excluded.state,
+                    filled_quantity=MAX(COALESCE(orders.filled_quantity, 0),
+                                        COALESCE(excluded.filled_quantity, 0)),
+                    average_fill_price=CASE
+                        WHEN COALESCE(excluded.filled_quantity, 0) >
+                             COALESCE(orders.filled_quantity, 0)
+                          OR COALESCE(orders.filled_quantity, 0) = 0
+                        THEN excluded.average_fill_price
+                        ELSE orders.average_fill_price END,
                         updated_at=excluded.updated_at,
                         broker_order_id=COALESCE(excluded.broker_order_id,
                                                  orders.broker_order_id),
@@ -448,6 +458,19 @@ class PersistenceManager:
                             excluded.rejection_retry_count),
                         submission_attempts=COALESCE(excluded.submission_attempts,
                                                      orders.submission_attempts)
+                    WHERE orders.updated_at IS NULL
+                       OR (excluded.updated_at IS NOT NULL
+                           AND julianday(excluded.updated_at) IS NOT NULL
+                           AND (julianday(orders.updated_at) IS NULL
+                                OR julianday(excluded.updated_at) >
+                                   julianday(orders.updated_at)
+                                OR (julianday(excluded.updated_at) =
+                                    julianday(orders.updated_at)
+                                    AND (COALESCE(excluded.filled_quantity, 0) >
+                                         COALESCE(orders.filled_quantity, 0)
+                                         OR excluded.state = orders.state
+                                         OR (lower(excluded.state) = 'filled'
+                                             AND lower(orders.state) != 'filled')))))
                     """, (
                 order.get("order_id"),
                 order.get("strategy_id"),
@@ -488,12 +511,15 @@ class PersistenceManager:
                 int(order.get("rejection_retry_count", 0) or 0),
                 (json.dumps(order.get("submission_attempts"), separators=(",", ":"))
                  if order.get("submission_attempts") is not None else None),
-            ))
+        ))
 
     def save_fill(self, fill: dict) -> None:
         """Save fill to database."""
         with self._tx() as conn:
-            conn.execute("""
+            self._save_fill_conn(conn, fill)
+
+    def _save_fill_conn(self, conn: sqlite3.Connection, fill: dict) -> None:
+        conn.execute("""
                 INSERT INTO fills (
                     fill_id, order_id, strategy_id, instrument,
                     side, quantity, price, timestamp, trade_id, entry_signal_id,
@@ -539,7 +565,13 @@ class PersistenceManager:
                 fill.get("position_id"),
                 fill.get("lifecycle_id") or fill.get("trade_id"),
                 fill.get("position_generation"),
-            ))
+        ))
+
+    def save_order_and_fill(self, order: dict, fill: dict) -> None:
+        """Atomically persist a broker-confirmed order update and its fill."""
+        with self._tx() as conn:
+            self._save_order_conn(conn, order)
+            self._save_fill_conn(conn, fill)
 
     def save_signal(self, signal_data: dict) -> None:
         """Save signal to the signals table for audit trail (UPSERT).

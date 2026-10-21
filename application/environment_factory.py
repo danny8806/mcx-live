@@ -889,7 +889,16 @@ class EnvironmentFactoryMixin:
                         "engine stands READY over un-restored open state; "
                         "broker-authoritative position reconciliation is required",
                         env.name, sid)
-            order_manager = OrderManager(execution_engine=env.execution_engine)
+            before_submit = None
+            if env.is_live:
+                def before_live_order_submit(order, signal, _env=env):
+                    if _env.persistence is None:
+                        raise RuntimeError("LIVE persistence is unavailable")
+                    self._persist_order(order, signal, env_name=_env.name)
+                before_submit = before_live_order_submit
+            order_manager = OrderManager(
+                execution_engine=env.execution_engine,
+                before_submit=before_submit)
             position_manager = PositionManager()
             runtime = StrategyRuntime(
                 strategy_id=sid,

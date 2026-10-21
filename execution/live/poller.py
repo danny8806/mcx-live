@@ -215,8 +215,14 @@ class LiveBrokerPoller:
             "reconciles_run": 0, "tradebook_polls": 0,
             "fills_created": 0, "fills_routed": 0,
             "order_persist_errors": 0,
+            "fill_persist_pending": 0,
             "pending_terminalized": 0,
         }
+        # Keep broker fills queued until both their order-state and fill rows
+        # are durable. apply_broker_statuses deduplicates repeated broker
+        # events in memory, so a failed write must be retried independently of
+        # receiving another event.
+        self._fill_persist_retry: dict[str, object] = {}
         self._last_broker_positions: list[dict] = []
         self._last_position_report: list[dict] = []
         self._last_account: dict = {}
@@ -365,6 +371,7 @@ class LiveBrokerPoller:
         Returns the list of newly routed fills.
         """
         self._stats["orders_polled"] += 1
+        self._retry_fill_persistence()
         broker = getattr(self.env, "broker", None)
         engine = getattr(self.env, "execution_engine", None)
         router = getattr(self.env, "broker_router", None)
@@ -424,7 +431,8 @@ class LiveBrokerPoller:
                     applied.append(fill)
                 fills_to_persist.append(fill)
         for fill in fills_to_persist:
-            self._upgrade_dbs_order_row(fill)
+            self._fill_persist_retry[str(fill.fill_id)] = fill
+        self._retry_fill_persistence()
         # Phase 6 — persist any order whose state flipped to REJECTED, CANCELLED
         # or EXPIRED during apply_broker_statuses (no fill is produced for
         # those, so _upgrade_dbs_order_row is never reached). This keeps local
@@ -652,19 +660,26 @@ class LiveBrokerPoller:
         if self._handle_fill is not None:
             self._handle_fill(fill, signal_id, is_exit=is_exit)
 
-    def _upgrade_dbs_order_row(self, fill) -> None:
+    def _retry_fill_persistence(self) -> None:
+        """Retry persistence even when the broker repeats an already-seen fill."""
+        for fill_id, fill in list(self._fill_persist_retry.items()):
+            if self._upgrade_dbs_order_row(fill):
+                self._fill_persist_retry.pop(fill_id, None)
+        self._stats["fill_persist_pending"] = len(self._fill_persist_retry)
+
+    def _upgrade_dbs_order_row(self, fill) -> bool:
         """Flip the persisted order row SUBMITTED -> FILLED once the broker
         status confirms the fill (fixes live DB order rows stuck 'submitted').
         Phase 6 — also writes broker_order_id and broker_fill_id into the DB."""
         persistence = getattr(self.env, "persistence", None)
         engine = getattr(self.env, "execution_engine", None)
         if persistence is None or engine is None:
-            return
+            return False
         order = engine.get_order(fill.order_id)
         if order is None:
-            return
+            return False
         try:
-            persistence.save_order({
+            order_row = {
                 "order_id": order.order_id,
                 "strategy_id": order.strategy_id,
                 "instrument": order.instrument,
@@ -690,8 +705,8 @@ class LiveBrokerPoller:
                 "trade_id": order.trade_id,
                 "broker_order_id": getattr(fill, "broker_order_id", None)
                     or getattr(order, "_broker_order_id", None),
-            })
-            persistence.save_fill({
+            }
+            fill_row = {
                 "fill_id": fill.fill_id,
                 "order_id": fill.order_id,
                 "strategy_id": fill.strategy_id,
@@ -714,11 +729,22 @@ class LiveBrokerPoller:
                     or getattr(order, "lifecycle_id", None)
                     or getattr(order, "trade_id", None),
                 "position_generation": getattr(fill, "position_generation", None),
-            })
+            }
+            save_atomic = getattr(persistence, "save_order_and_fill", None)
+            if callable(save_atomic):
+                save_atomic(order_row, fill_row)
+            else:
+                # Compatibility for narrow persistence adapters used by tests
+                # or integrations. Production PersistenceManager commits both
+                # rows in one transaction.
+                persistence.save_order(order_row)
+                persistence.save_fill(fill_row)
+            return True
         except Exception as e:
             self._stats["order_persist_errors"] += 1
             log.error("[LivePoller:%s] order row upgrade failed for %s: %s",
                       self.env.name, order.order_id, e)
+            return False
 
     def _terminalize_pending_entries(self, orders, statuses) -> int:
         """F2 — move durable pending rows to RESOLVED when the broker ended the

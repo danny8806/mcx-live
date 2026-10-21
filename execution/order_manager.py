@@ -23,8 +23,13 @@ class OrderManager:
     def __init__(
         self,
         execution_engine: Any,
+        before_submit: Optional[Any] = None,
     ):
         self.execution_engine = execution_engine
+        # LIVE runtimes persist the intent before crossing the broker POST
+        # boundary. This keeps accepted Dhan orders recoverable if the process
+        # exits before the post-response state update is saved.
+        self.before_submit = before_submit
 
         self._pending_signals: dict[str, Any] = {}
         # Keep the order paired with each dedup key.  Signal candle timestamps
@@ -95,6 +100,23 @@ class OrderManager:
             )
             self._pending_signal_orders[key] = order
             self._active_orders[order.order_id] = order
+
+            if self.before_submit is not None:
+                try:
+                    self.before_submit(order, signal)
+                except Exception as exc:
+                    # Persistence failure is a local no-send outcome. Never
+                    # call the broker with an order whose durable intent could
+                    # not be written first.
+                    order.state = OrderState.REJECTED
+                    order.submission_outcome = "NOT_SENT"
+                    order.reason = f"ORDER_INTENT_PERSIST_FAILED:{exc}"
+                    order.pre_submit_persistence_failed = True
+                    order.updated_at = time.time()
+                    self._pending_signals.pop(key, None)
+                    self._pending_signal_orders.pop(key, None)
+                    self._active_orders.pop(order.order_id, None)
+                    return order
 
             # Execute
             order = self.execution_engine.submit_order(order)

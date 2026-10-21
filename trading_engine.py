@@ -3054,6 +3054,19 @@ class TradingEngine(SignalFlowMixin, FillFlowMixin, LivePositionFlowMixin, Posit
                 except Exception as e:
                     log.error("[Engine] %s durable order restore failed: %s",
                               env_name, e)
+            restore_fill_ids = getattr(
+                env.execution_engine,
+                "restore_broker_fill_ids_from_persistence", None)
+            get_fills = getattr(env.persistence, "get_fills", None)
+            if callable(restore_fill_ids) and callable(get_fills):
+                try:
+                    count = restore_fill_ids(get_fills())
+                    if count:
+                        log.info("[Engine] restored %d broker fill dedup key(s) "
+                                 "from canonical DB", count)
+                except Exception as e:
+                    log.error("[Engine] %s durable broker-fill restore failed: %s",
+                              env_name, e)
         # Per-strategy operator gates survive restart via the saved snapshot.
         gates_state = saved_state.get("strategy_gates")
         if gates_state:
