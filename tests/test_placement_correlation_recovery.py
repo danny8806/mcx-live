@@ -213,7 +213,9 @@ def test_exactly_one_adoption_for_a_duplicate_lookup():
 # ── 3. the public correlation resolver used by the poller ──────────────────
 
 def test_resolver_reports_a_broker_order():
-    http = Http(lookup_body={"orderId": "B80", "orderStatus": "NEW"})
+    http = Http(lookup_body={"orderId": "B80", "orderStatus": "NEW",
+                             "securityId": "1", "transactionType": "BUY",
+                             "quantity": 10})
     rec = _transport(http).order_by_correlation_id("CORR2")
     assert rec["broker_order_id"] == "B80"
 
@@ -293,7 +295,8 @@ def test_poller_correlation_resolver_retries_transient_404_then_adopts_order():
             if self.lookup_count == 1:
                 raise DhanNotFound("correlation index lag")
             return [{"orderId": "B-POLLER-RECOVERED",
-                     "orderStatus": "PENDING", "quantity": 1}]
+                     "orderStatus": "PENDING", "securityId": "1",
+                     "transactionType": "BUY", "quantity": 1}]
 
     http = DelayedIndexHttp()
     result = _transport(http).order_by_correlation_id("CORR-POLLER")
@@ -473,6 +476,9 @@ def test_accepted_post_with_delayed_correlation_visibility_is_not_duplicated():
             self.accepted.append({
                 "orderId": f"B-ACCEPTED-{len(self.accepted) + 1}",
                 "orderStatus": "PENDING",
+                "securityId": "1",
+                "transactionType": "BUY",
+                "quantity": 10,
             })
             raise TimeoutError("response lost after Dhan accepted the order")
 

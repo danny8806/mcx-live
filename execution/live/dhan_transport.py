@@ -744,20 +744,54 @@ class DhanRestTransport(LiveBrokerClient):
                     "reason": f"unknown broker order status {raw_status!r}"}
         with self._lock:
             rec = self._orders.get(oid)
-        if rec is not None:
-            return dict(rec)
-        return {
+            if rec is not None:
+                return dict(rec)
+
+        # A delayed poller recovery has to seed the transport's active order
+        # book, not merely return the id. order_statuses() is the canonical
+        # path that decodes cumulative fills; without this record it would
+        # have no broker id to poll after the correlation lookup succeeds.
+        security_id = str(body.get("securityId") or body.get("security_id") or "")
+        instrument = next((name for name, cfg in self.instruments.items()
+                           if security_id and str(cfg.get("security_id") or "")
+                           == security_id), None)
+        side = str(body.get("transactionType")
+                   or body.get("transaction_type") or "").upper()
+        try:
+            quantity = int(body.get("quantity") or 0)
+        except (TypeError, ValueError):
+            quantity = 0
+        if instrument is None or side not in ("BUY", "SELL") or quantity <= 0:
+            return {"status": "unresolved", "correlation_id": cid,
+                    "reason": "correlated broker order lacks a mapped instrument, side, or quantity"}
+
+        reason = (body.get("omsErrorDescription")
+                  or body.get("errorMessage") or None)
+        adopted = {
             "broker_order_id": oid,
             "status": _normalize_status(raw_status),
-            "raw_status": str(raw_status).upper(),
-            "reason": (body.get("omsErrorDescription")
-                       or body.get("errorMessage") or None),
+            "raw_status": raw_status,
+            "reason": reason,
+            "side": side,
+            "quantity": quantity,
+            "instrument": instrument,
+            "price": None,
+            "requested_order_type": str(body.get("orderType")
+                                         or body.get("order_type") or "MARKET").upper(),
+            "requested_price": body.get("price"),
+            "requested_trigger_price": body.get("triggerPrice")
+                                       or body.get("trigger_price"),
             "correlation_id": cid,
-            "quantity": body.get("quantity"),
-            "tradedQuantity": body.get("tradedQuantity"),
-            "averageTradedPrice": body.get("averageTradedPrice"),
             "timestamp": self._clock(),
+            # Leave broker quantity unaccounted. The next ordinary order poll
+            # reads the authoritative cumulative fill and emits its delta once.
+            "filled_quantity": 0,
+            "average_fill_price": 0.0,
+            "last_accounted_qty": 0,
         }
+        with self._lock:
+            rec = self._orders.setdefault(oid, adopted)
+            return dict(rec)
 
     def _http_delete(self, path: str) -> dict:
         deleter = getattr(self._http, "_delete", None)

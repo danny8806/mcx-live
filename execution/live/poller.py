@@ -915,14 +915,95 @@ class LiveBrokerPoller:
             return False
         broker_id = rec.get("broker_order_id")
         if broker_id:
-            # The order DID reach the exchange and we only just learned its id.
-            # Link it (save_pending_order upserts and keeps the existing status)
-            # so the normal by-id self-heal and fill reconciliation can take over.
+            # The order DID reach Dhan. Restore the full in-memory ownership
+            # path before saving the correlation row: broker status application
+            # and the fill router both require broker_order_id -> order_id.
+            engine = getattr(self.env, "execution_engine", None)
+            if engine is None:
+                return False
+            broker_id = str(broker_id)
+            orders = getattr(engine, "_orders", {})
+            matched = [o for o in orders.values()
+                       if str(getattr(o, "correlation_id", "") or "") == str(corr)]
+            if not matched:
+                # A cold recovery can have the durable order row but no order
+                # in the engine snapshot. Restore only the exact correlation
+                # match; never infer ownership from instrument or direction.
+                get_orders = getattr(persistence, "get_orders", None)
+                restore_orders = getattr(engine, "restore_orders_from_persistence", None)
+                if callable(get_orders) and callable(restore_orders):
+                    try:
+                        persisted = [r for r in get_orders() or []
+                                     if str(r.get("correlation_id") or "") == str(corr)
+                                     and str(r.get("execution_mode") or "LIVE").upper() == "LIVE"]
+                    except Exception as exc:
+                        log.error("[LivePoller:%s] order row lookup for correlation %s failed: %s",
+                                  self.env.name, corr, exc)
+                        return False
+                    if len(persisted) == 1:
+                        recovered_row = dict(persisted[0])
+                        recovered_row["broker_order_id"] = broker_id
+                        try:
+                            restore_orders([recovered_row])
+                        except Exception as exc:
+                            log.error("[LivePoller:%s] restoring correlated order %s failed: %s",
+                                      self.env.name, corr, exc)
+                            return False
+                        orders = getattr(engine, "_orders", {})
+                        matched = [o for o in orders.values()
+                                   if str(getattr(o, "correlation_id", "") or "") == str(corr)]
+            if len(matched) != 1:
+                log.error("[LivePoller:%s] found Dhan order %s for correlation %s, "
+                          "but local ownership is missing or ambiguous; intent remains reserved",
+                          self.env.name, broker_id, corr)
+                return False
+            order = matched[0]
+            router = (getattr(self.env, "broker_router", None)
+                      or getattr(engine, "broker_router", None))
+            if router is None:
+                log.error("[LivePoller:%s] cannot route recovered broker order %s; "
+                          "intent remains reserved", self.env.name, broker_id)
+                return False
+            internal_id = str(getattr(order, "order_id", "") or "")
+            current_broker_id = str(getattr(order, "_broker_order_id", "") or "")
+            if current_broker_id and current_broker_id != broker_id:
+                log.error("[LivePoller:%s] correlation %s resolved to %s but order %s "
+                          "already owns broker id %s; intent remains reserved",
+                          self.env.name, corr, broker_id, internal_id, current_broker_id)
+                return False
+            engine_lock = getattr(engine, "_lock", None)
+            with (engine_lock if engine_lock is not None else nullcontext()):
+                # Recheck under the same engine lock used by fill application;
+                # a simultaneous WebSocket recovery must not remap this broker
+                # id to a different local order between the check and insert.
+                existing_mapping = router.resolve(broker_id)
+                if (existing_mapping is not None
+                        and str(existing_mapping.order_id) != internal_id):
+                    log.error("[LivePoller:%s] broker order %s already maps to %s, not %s; "
+                              "recovered intent remains reserved", self.env.name,
+                              broker_id, existing_mapping.order_id, internal_id)
+                    return False
+                if existing_mapping is None:
+                    router.register_from_kwargs(
+                        broker_order_id=broker_id,
+                        order_id=internal_id,
+                        trade_id=str(getattr(order, "trade_id", "") or ""),
+                        strategy_id=str(getattr(order, "strategy_id", "") or ""),
+                        instrument=str(getattr(order, "instrument", "") or ""),
+                    )
+                order._broker_order_id = broker_id
+                order.submission_outcome = "BROKER_ORDER_RECOVERED"
+                order.updated_at = time.time()
+            self._persist_order_state(order)
+
+            # Link the durable pending row so later restart/status recovery also
+            # knows the broker id. The fill can be applied on the next poll
+            # because the engine/router mapping above is now installed.
             pend_id = row.get("pending_order_id") or row.get("signal_id")
             try:
                 update = dict(row)
                 update["pending_order_id"] = pend_id
-                update["broker_order_id"] = str(broker_id)
+                update["broker_order_id"] = broker_id
                 update["correlation_id"] = corr
                 persistence.save_pending_order(update)
             except Exception as e:
