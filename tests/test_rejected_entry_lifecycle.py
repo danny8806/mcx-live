@@ -44,7 +44,7 @@ def test_reconciliation_still_rejects_zero_entry_price_for_open_trade():
     assert any("entry_price" in error for error in result.errors)
 
 
-def test_poller_not_found_heals_order_trade_pending_row_and_strategy():
+def test_poller_correlation_not_found_keeps_ambiguous_order_reserved():
     from types import SimpleNamespace
     from execution.live.poller import LiveBrokerPoller
 
@@ -89,16 +89,19 @@ def test_poller_not_found_heals_order_trade_pending_row_and_strategy():
     poller._stats = {"pending_terminalized": 0, "order_persist_errors": 0}
     poller._errors = {}
 
-    assert poller._self_heal_by_correlation(
+    assert not poller._self_heal_by_correlation(
         {"signal_id": "S-LOST", "pending_order_id": "P-LOST",
          "correlation_id": "CORR-LOST", "strategy_id": "gold_02"},
         ("rejected", "cancelled", "canceled", "expired"),
     )
-    assert str(getattr(order.state, "value", order.state)).lower() == "rejected"
-    assert trade.status == TradeStatus.REJECTED.value
-    assert persistence.terminalized
-    assert persistence.orders[-1]["state"] == "rejected"
-    assert reset == ["gold_02"]
+    # A timed-out POST may have been accepted even while Dhan's correlation
+    # index returns 404. Keep every local owner pending and do not free the
+    # strategy/instrument for a second submission.
+    assert str(getattr(order.state, "value", order.state)).lower() == "submitted"
+    assert trade.status == TradeStatus.PENDING.value
+    assert persistence.terminalized == []
+    assert persistence.orders == []
+    assert reset == []
 
 
 def test_poller_later_broker_rejection_settles_pending_trade():

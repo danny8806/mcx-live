@@ -320,19 +320,16 @@ def test_resolver_coerces_empty_list_to_unresolved_not_not_found():
     assert len(http.gets) == 3
 
 
-def test_repeated_correlation_http_404_is_bounded_confirmed_absence():
+def test_repeated_correlation_http_404_after_timeout_never_reposts():
     class NotFound(RuntimeError):
         status = 404
 
     http = Http(post_exc=TimeoutError("response lost"),
                 lookup_exc=NotFound("no such correlation"))
-    with pytest.raises(RuntimeError, match="confirmed no order") as exc:
+    with pytest.raises(OrderPlacementUnresolved, match="no duplicate POST"):
         _place(_transport(http))
-    assert not isinstance(exc.value, OrderPlacementUnresolved)
-    # Each placement attempt requires the full bounded lookup sequence to
-    # return 404 before another POST is eligible.
-    assert len(http.posts) == 3
-    assert len(http.gets) == 9
+    assert len(http.posts) == 1
+    assert len(http.gets) == 3
 
 
 def test_transient_correlation_404_then_found_does_not_repost():
@@ -356,7 +353,7 @@ def test_transient_correlation_404_then_found_does_not_repost():
     assert len(http.gets) == 2
 
 
-def test_confirmed_absence_retries_post_and_sends_the_intent_to_dhan():
+def test_timeout_with_three_404s_stays_unresolved_without_second_post():
     class RetryHttp(Http):
         def __init__(self):
             super().__init__(lookup_exc=DhanNotFound("no order"))
@@ -370,17 +367,14 @@ def test_confirmed_absence_retries_post_and_sends_the_intent_to_dhan():
             return {"orderId": "B-RETRY", "orderStatus": "PENDING"}
 
     http = RetryHttp()
-    result = _place(_transport(http), correlation_id="CORR-RETRY")
+    with pytest.raises(OrderPlacementUnresolved):
+        _place(_transport(http), correlation_id="CORR-RETRY")
 
-    assert result["broker_order_id"] == "B-RETRY"
-    assert result["status"] == "submitted"
-    assert len(http.posts) == 2
+    assert len(http.posts) == 1
     assert len(http.gets) == 3
-    assert {payload["correlationId"] for _, payload in http.posts} == {
-        "CORR-RETRY"}
 
 
-def test_retries_after_each_confirmed_absence_but_stops_when_order_lands():
+def test_ambiguous_reversal_attempt_does_not_repeat_after_404s():
     class RetryHttp(Http):
         def __init__(self):
             super().__init__(lookup_exc=DhanNotFound("no order"))
@@ -394,14 +388,14 @@ def test_retries_after_each_confirmed_absence_but_stops_when_order_lands():
             return {"orderId": "B-THIRD", "orderStatus": "PENDING"}
 
     http = RetryHttp()
-    result = _place(_transport(http), correlation_id="CORR-THIRD")
+    with pytest.raises(OrderPlacementUnresolved):
+        _place(_transport(http), correlation_id="CORR-THIRD")
 
-    assert result["broker_order_id"] == "B-THIRD"
-    assert len(http.posts) == 3
-    assert len(http.gets) == 6
+    assert len(http.posts) == 1
+    assert len(http.gets) == 3
 
 
-def test_market_fallback_submission_uses_same_safe_delivery_retry():
+def test_market_fallback_ambiguous_result_never_blindly_reposts():
     class RetryHttp(Http):
         def __init__(self):
             super().__init__(lookup_exc=DhanNotFound("no order"))
@@ -415,16 +409,15 @@ def test_market_fallback_submission_uses_same_safe_delivery_retry():
             return {"orderId": "B-MARKET", "orderStatus": "PENDING"}
 
     http = RetryHttp()
-    result = _transport(http).place_market_order(
-        side="SELL", quantity=1, instrument="GOLDM", order_type="MARKET",
-        correlation_id="CORR-MARKET")
+    with pytest.raises(OrderPlacementUnresolved):
+        _transport(http).place_market_order(
+            side="SELL", quantity=1, instrument="GOLDM", order_type="MARKET",
+            correlation_id="CORR-MARKET")
 
-    assert result["broker_order_id"] == "B-MARKET"
-    assert len(http.posts) == 2
+    assert len(http.posts) == 1
     assert len(http.gets) == 3
-    assert all(payload["orderType"] == "MARKET" for _, payload in http.posts)
-    assert all(payload["price"] == payload["triggerPrice"] == ""
-               for _, payload in http.posts)
+    assert http.posts[0][1]["orderType"] == "MARKET"
+    assert http.posts[0][1]["price"] == http.posts[0][1]["triggerPrice"] == ""
 
 
 def test_market_amo_uses_documented_empty_price_fields():
@@ -442,7 +435,7 @@ def test_market_amo_uses_documented_empty_price_fields():
     assert payload["amoTime"] == "OPEN"
 
 
-def test_market_amo_options_survive_confirmed_absence_retry():
+def test_market_amo_ambiguous_result_does_not_duplicate_submission():
     class RetryHttp(Http):
         def __init__(self):
             super().__init__(lookup_exc=DhanNotFound("no order"))
@@ -456,18 +449,50 @@ def test_market_amo_options_survive_confirmed_absence_retry():
             return {"orderId": "B-AMO-RETRY", "orderStatus": "PENDING"}
 
     http = RetryHttp()
-    result = _transport(http).place_market_order(
-        side="BUY", quantity=1, instrument="GOLDM", order_type="MARKET",
-        correlation_id="CORR-AMO-RETRY", after_market_order=True,
-        amo_time="OPEN_30")
+    with pytest.raises(OrderPlacementUnresolved):
+        _transport(http).place_market_order(
+            side="BUY", quantity=1, instrument="GOLDM", order_type="MARKET",
+            correlation_id="CORR-AMO-RETRY", after_market_order=True,
+            amo_time="OPEN_30")
 
-    assert result["broker_order_id"] == "B-AMO-RETRY"
-    assert len(http.posts) == 2
+    assert len(http.posts) == 1
     assert len(http.gets) == 3
-    assert all(payload["afterMarketOrder"] is True
-               for _, payload in http.posts)
-    assert all(payload["amoTime"] == "OPEN_30"
-               for _, payload in http.posts)
+    assert http.posts[0][1]["afterMarketOrder"] is True
+    assert http.posts[0][1]["amoTime"] == "OPEN_30"
+
+
+def test_accepted_post_with_delayed_correlation_visibility_is_not_duplicated():
+    class AcceptedButDelayedIndex(Http):
+        def __init__(self):
+            super().__init__()
+            self.accepted = []
+            self.lookup_count = 0
+
+        def _post(self, path, payload, retry_network=False):
+            self.posts.append((path, dict(payload)))
+            self.accepted.append({
+                "orderId": f"B-ACCEPTED-{len(self.accepted) + 1}",
+                "orderStatus": "PENDING",
+            })
+            raise TimeoutError("response lost after Dhan accepted the order")
+
+        def _get(self, path):
+            self.gets.append(path)
+            self.lookup_count += 1
+            if self.lookup_count <= 3:
+                raise DhanNotFound("correlation index is delayed")
+            return self.accepted[0]
+
+    http = AcceptedButDelayedIndex()
+    transport = _transport(http)
+    with pytest.raises(OrderPlacementUnresolved):
+        _place(transport, correlation_id="CORR-LATE-INDEX")
+
+    # One actual broker acceptance and one POST, despite three immediate 404s.
+    assert len(http.accepted) == len(http.posts) == 1
+    recovered = transport.order_by_correlation_id("CORR-LATE-INDEX")
+    assert recovered["broker_order_id"] == "B-ACCEPTED-1"
+    assert len(http.posts) == 1
 
 
 def test_resolver_without_a_correlation_id_is_unresolved_not_not_found():

@@ -295,6 +295,27 @@ class LiveExecutionEngine:
             # while the first order still appeared CREATED and POST twice.
             if order.state != OrderState.CREATED:
                 raise ValueError(f"Cannot submit order in state {order.state}")
+            # One live working order may own an instrument at a time. This is
+            # an atomic reservation, not just a signal-key check: a concurrent
+            # new signal with a different id/role must not pass while another
+            # entry/exit is still working. Reversal entry is allowed after the
+            # exit becomes terminal and the caller has independently confirmed
+            # Dhan flatness.
+            working_states = {
+                OrderState.SUBMITTED,
+                OrderState.ACKNOWLEDGED,
+                OrderState.PARTIALLY_FILLED,
+            }
+            for prior in self._orders.values():
+                if (prior is not order
+                        and prior.instrument == order.instrument
+                        and prior.state in working_states):
+                    order.state = OrderState.REJECTED
+                    order.reason = (
+                        f"INSTRUMENT_ORDER_ALREADY_WORKING:{prior.order_id}:"
+                        f"{getattr(prior.state, 'value', prior.state)}")
+                    order.updated_at = self._now()
+                    return order
             for prior in self._orders.values():
                 prior_key = self._execution_key(prior)
                 if (prior is not order and prior_key == key

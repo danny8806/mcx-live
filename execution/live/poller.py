@@ -879,9 +879,12 @@ class LiveBrokerPoller:
         lookup failed, i.e. the broker outcome was genuinely UNKNOWN. The
         correlation id is the only handle we have.
 
-        A *failed* lookup is NOT a rejection: the row is left ENTRY_SENT so the
-        next cycle tries again, because the order may be live at the exchange.
-        Only an authoritative "no such order" terminalizes the row.
+        A failed lookup or a correlation 404 is NOT proof that a timed-out
+        placement was rejected. The row stays ENTRY_SENT and blocks a second
+        submission until a broker order is found or a definitive order status
+        is observed. Dhan does not document correlation lookup as an
+        idempotency/absence guarantee, so releasing the intent after 404 could
+        duplicate an accepted order whose lookup index is delayed.
         """
         persistence = getattr(self.env, "persistence", None)
         broker = getattr(self.env, "broker", None)
@@ -902,11 +905,13 @@ class LiveBrokerPoller:
                       self.env.name, corr, e)
             return False
         status = str(rec.get("status") or "").lower()
-        if status == "unresolved":
-            # Broker did not answer. Keep the row pending; never assume flat.
+        if status in ("unresolved", "not_found"):
+            # A lost POST response leaves the outcome ambiguous. In particular,
+            # a correlation 404 may precede index visibility; never release the
+            # durable intent or permit a retry based only on that response.
             log.warning("[LivePoller:%s] pending order %s still UNRESOLVED at "
-                        "broker (correlation=%s)", self.env.name,
-                        row.get("pending_order_id"), corr)
+                        "broker (lookup=%s, correlation=%s)", self.env.name,
+                        row.get("pending_order_id"), status, corr)
             return False
         broker_id = rec.get("broker_order_id")
         if broker_id:
@@ -928,58 +933,8 @@ class LiveBrokerPoller:
                         "%s via correlation %s", self.env.name, broker_id,
                         row.get("pending_order_id"), corr)
             return False
-        if status not in terminal and status not in ("not_found",):
+        if status not in terminal:
             return False
-        # For a lost POST response, a definitive correlation miss means the
-        # order never entered Dhan's book. Heal every local owner of that
-        # attempt, otherwise the persisted order/trade and strategy remain
-        # SUBMITTED/PENDING forever even though the pending row is resolved.
-        if status == "not_found":
-            signal_id = str(row.get("signal_id") or row.get("pending_order_id") or "")
-            reason = f"broker_confirmed_not_found: correlation={corr}"
-            engine = getattr(self.env, "execution_engine", None)
-            orders = getattr(engine, "_orders", {}) if engine is not None else {}
-            matched = [o for o in orders.values()
-                       if str(getattr(o, "correlation_id", "") or "") == str(corr)]
-            for order in matched:
-                if int(getattr(order, "filled_quantity", 0) or 0) > 0:
-                    continue
-                state = getattr(order, "state", None)
-                state_value = str(getattr(state, "value", state)).lower()
-                if state_value not in ("rejected", "cancelled", "canceled", "expired"):
-                    try:
-                        from execution.models import OrderState
-                        order.state = OrderState.REJECTED
-                    except Exception:
-                        order.state = "rejected"
-                order.reason = reason
-                order.updated_at = time.time()
-                self._persist_order_state(order)
-            runtimes = getattr(self.env, "runtimes", None)
-            runtime = runtimes.get(row.get("strategy_id")) if runtimes is not None else None
-            lifecycle = getattr(runtime, "lifecycle", None)
-            trade_settled = False
-            if lifecycle is not None and signal_id:
-                trade = lifecycle.resolve_trade_from_signal(signal_id)
-                if trade is not None:
-                    trade_settled = lifecycle.reject_unfilled_entry(
-                        trade.trade_id, reason=reason,
-                        order_id=(matched[0].order_id if matched else ""),
-                        status="REJECTED")
-            strategy = getattr(self.env, "strategies", {}).get(row.get("strategy_id"))
-            pending = getattr(strategy, "pending_entry", None)
-            pending_signal_id = getattr(getattr(pending, "signal", None), "signal_id", None)
-            matching_pending = bool(pending_signal_id and str(pending_signal_id) == signal_id)
-            has_position = bool(getattr(strategy, "position_side", None))
-            if (self._reset_strategy_fn is not None and not has_position
-                    and (trade_settled or matching_pending)):
-                try:
-                    _reset_strategy_if_owned(
-                        self._reset_strategy_fn, row.get("strategy_id"),
-                        signal_id=signal_id)
-                except Exception as exc:
-                    log.error("[LivePoller:%s] reset after not-found failed: %s",
-                              self.env.name, exc)
         try:
             if persistence.terminalize_pending_order(
                     row.get("signal_id") or row.get("pending_order_id"),

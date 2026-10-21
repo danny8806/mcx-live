@@ -187,7 +187,10 @@ def test_two_workers_cannot_submit_the_same_logical_order_leg():
     assert broker.post_attempts == 1
     assert first.state == OrderState.SUBMITTED
     assert second.state == OrderState.REJECTED
-    assert second.reason.startswith("DUPLICATE_EXECUTION_KEY:")
+    assert second.reason.startswith((
+        "INSTRUMENT_ORDER_ALREADY_WORKING:",
+        "DUPLICATE_EXECUTION_KEY:",
+    ))
 
 
 def test_concurrent_repoll_of_same_broker_fill_creates_one_local_fill():

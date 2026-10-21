@@ -122,11 +122,10 @@ def _raw_status_rank(raw_status: object) -> int:
         return 1
     return 0
 
-# A lost POST response is retried only after Dhan's correlation endpoint has
-# authoritatively confirmed that no order exists. Ambiguous lookups never
-# reach this retry path. The bound prevents a broker outage from holding the
-# strategy tick indefinitely or generating an unbounded stream of requests.
-_MAX_CONFIRMED_ABSENCE_RETRIES = 2
+# Correlation resolution after an ambiguous POST is lookup-only: it never
+# authorizes a second POST because Dhan does not document that endpoint as an
+# idempotency guarantee. Separate broker-confirmed rejection retries are
+# bounded below.
 _MAX_CORRELATION_LOOKUP_RETRIES = 2
 _MAX_DEFINITIVE_REJECTION_RETRIES = 3
 MAX_LIVE_ORDER_QUANTITY = 100
@@ -259,7 +258,6 @@ class DhanRestTransport(LiveBrokerClient):
                            order_type: str = "MARKET", price: Optional[float] = None,
                            trigger_price: Optional[float] = None,
                            correlation_id: Optional[str] = None,
-                           _confirmed_absence_retries: int = 0,
                            _rejection_retries: int = 0,
                            _attempt_history: Optional[list] = None,
                            after_market_order: bool = False,
@@ -411,12 +409,11 @@ class DhanRestTransport(LiveBrokerClient):
                 return self._retry_definitive_rejection(
                     rejected, side_u, quantity, instrument, order_type_u,
                     limit_price, trigger, correlation_id,
-                    _confirmed_absence_retries, _rejection_retries,
+                    _rejection_retries,
                     _attempt_history, after_market_order, amo_time_u)
             return self._resolve_unknown_placement(
                 correlation_id, side_u, quantity, instrument,
                 order_type_u, limit_price, trigger, exc,
-                confirmed_absence_retries=_confirmed_absence_retries,
                 after_market_order=after_market_order, amo_time=amo_time_u)
         self._audit(_AUDIT_ACTION.get(order_type_u, "PLACE_ORDER"),
                     "/orders", "POST", payload, response=resp, http_status=200,
@@ -426,7 +423,6 @@ class DhanRestTransport(LiveBrokerClient):
                 correlation_id, side_u, quantity, instrument,
                 order_type_u, limit_price, trigger,
                 RuntimeError(f"Dhan returned malformed placement body: {resp!r}"),
-                confirmed_absence_retries=_confirmed_absence_retries,
                 after_market_order=after_market_order, amo_time=amo_time_u)
         resp = _coerce_status_body(resp)
         broker_order_id = resp.get("orderId") or resp.get("order_id")
@@ -465,7 +461,7 @@ class DhanRestTransport(LiveBrokerClient):
                 return self._retry_definitive_rejection(
                     terminal, side_u, quantity, instrument, order_type_u,
                     limit_price, trigger, correlation_id,
-                    _confirmed_absence_retries, _rejection_retries,
+                    _rejection_retries,
                     _attempt_history, after_market_order, amo_time_u)
             return self._placement_attempt_metadata(
                 terminal, _rejection_retries + 1, _rejection_retries,
@@ -478,7 +474,6 @@ class DhanRestTransport(LiveBrokerClient):
                 correlation_id, side_u, quantity, instrument,
                 order_type_u, limit_price, trigger,
                 RuntimeError(f"Dhan placement response has no order id: {resp}"),
-                confirmed_absence_retries=_confirmed_absence_retries,
                 after_market_order=after_market_order, amo_time=amo_time_u)
         with self._lock:
             existing = self._orders.get(str(broker_order_id))
@@ -511,7 +506,7 @@ class DhanRestTransport(LiveBrokerClient):
                 return self._retry_definitive_rejection(
                     prior, side_u, quantity, instrument, order_type_u,
                     limit_price, trigger, correlation_id,
-                    _confirmed_absence_retries, _rejection_retries,
+                    _rejection_retries,
                     _attempt_history, after_market_order, amo_time_u)
             return self._placement_attempt_metadata(
                 prior, _rejection_retries + 1, _rejection_retries,
@@ -526,7 +521,7 @@ class DhanRestTransport(LiveBrokerClient):
                 return self._retry_definitive_rejection(
                     terminal, side_u, quantity, instrument, order_type_u,
                     limit_price, trigger, correlation_id,
-                    _confirmed_absence_retries, _rejection_retries,
+                    _rejection_retries,
                     _attempt_history, after_market_order, amo_time_u)
             return self._placement_attempt_metadata(
                 terminal, _rejection_retries + 1, _rejection_retries,
@@ -547,8 +542,7 @@ class DhanRestTransport(LiveBrokerClient):
     def _retry_definitive_rejection(
             self, rejected: dict, side_u: str, quantity: int,
             instrument: str, order_type_u: str, limit_price: float,
-            trigger: float, correlation_id: str,
-            confirmed_absence_retries: int, rejection_retries: int,
+            trigger: float, correlation_id: str, rejection_retries: int,
             history: list, after_market_order: bool = False,
             amo_time: str = "OPEN") -> dict:
         """Retry only a broker-confirmed rejection, at most three times.
@@ -576,7 +570,6 @@ class DhanRestTransport(LiveBrokerClient):
             price=None if order_type_u == "MARKET" else limit_price,
             trigger_price=None if order_type_u == "MARKET" else trigger,
             correlation_id=next_correlation_id,
-            _confirmed_absence_retries=confirmed_absence_retries,
             _rejection_retries=retry_number,
             _attempt_history=history,
             after_market_order=after_market_order,
@@ -586,7 +579,6 @@ class DhanRestTransport(LiveBrokerClient):
     def _resolve_unknown_placement(self, correlation_id, side_u, quantity,
                                    instrument, order_type_u, limit_price,
                                    trigger, origin: BaseException,
-                                   confirmed_absence_retries: int = 0,
                                    after_market_order: bool = False,
                                    amo_time: str = "OPEN") -> dict:
         """Recover a placement whose broker outcome is unknown.
@@ -598,10 +590,10 @@ class DhanRestTransport(LiveBrokerClient):
         * an existing broker order -> adopted into the transport book exactly
           once (``note="resolved_via_correlation_lookup"``), so downstream
           reconciliation sees a single economic order;
-        * authoritative no-order response -> retry the same intent with the
-          same correlation id, bounded to two retries. The same id lets a late
-          first response be resolved as one economic order; ambiguous lookups
-          never retry.
+        * repeated not-found responses after an ambiguous POST -> remain
+          unresolved. Dhan documents correlation IDs for lookup, but does not
+          promise that they make POST idempotent or that its lookup index is
+          immediately consistent. Reposting could create a duplicate.
         """
         lookup_body = None
         lookup_error = None
@@ -641,8 +633,6 @@ class DhanRestTransport(LiveBrokerClient):
             if attempt < _MAX_CORRELATION_LOOKUP_RETRIES:
                 time.sleep(0.1 * (2 ** attempt))
 
-        confirmed_absence = all_lookups_confirmed_absent
-
         oid = ((lookup_body or {}).get("orderId")
                or (lookup_body or {}).get("order_id"))
         if oid:
@@ -676,34 +666,19 @@ class DhanRestTransport(LiveBrokerClient):
                 self._orders[oid] = rec
                 return dict(rec, status=_placement_state(rec.get("status")),
                             note="resolved_via_correlation_lookup")
-        if not confirmed_absence:
-            # A failed lookup is UNRESOLVED, never "rejected". Raising the
-            # generic error here used to let the engine mark the order
-            # REJECTED while the exchange may hold a live order, leaving the
-            # local book flat against real broker exposure.
-            raise OrderPlacementUnresolved(
-                f"place_order outcome UNRESOLVED after "
-                f"{_MAX_CORRELATION_LOOKUP_RETRIES + 1} correlation lookups "
-                f"({correlation_id}); the order may have reached Dhan: "
-                f"{lookup_error or origin}")
-        if confirmed_absence_retries < _MAX_CONFIRMED_ABSENCE_RETRIES:
-            # A successful lookup with no matching broker order (including
-            # Dhan's explicit external-order 404) proves this attempt did not
-            # land. Retry only this confirmed-absence case. Reuse the
-            # correlation id so an unexpectedly late first result can still
-            # be resolved without minting another logical order identity.
-            delay = 0.1 * (2 ** confirmed_absence_retries)
-            time.sleep(delay)
-            return self.place_market_order(
-                side=side_u, quantity=quantity, instrument=instrument,
-                order_type=order_type_u, price=limit_price,
-                trigger_price=trigger, correlation_id=correlation_id,
-                _confirmed_absence_retries=confirmed_absence_retries + 1,
-                after_market_order=after_market_order, amo_time=amo_time)
-        raise RuntimeError(
-            f"place_order not delivered after "
-            f"{_MAX_CONFIRMED_ABSENCE_RETRIES + 1} attempts; Dhan confirmed no "
-            f"order for correlation {correlation_id}: {origin}")
+        # A sequence of HTTP 404 responses is not a documented idempotency
+        # guarantee. Dhan may have accepted the POST while its correlation
+        # index is still catching up. Keep the original durable intent
+        # unresolved and let the poller continue resolving broker truth; a
+        # second POST could create a second live order.
+        absence_note = (
+            f"Dhan returned {_MAX_CORRELATION_LOOKUP_RETRIES + 1} "
+            "correlation 404s, but this does not prove a second POST is safe"
+            if all_lookups_confirmed_absent else
+            f"correlation lookup unresolved: {lookup_error or origin}")
+        raise OrderPlacementUnresolved(
+            f"place_order outcome UNRESOLVED ({correlation_id}); no duplicate "
+            f"POST was sent; {absence_note}; original outcome: {origin}")
 
     # ── Phase 5 wire primitives ─────────────────────────────────────────
 
