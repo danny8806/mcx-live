@@ -1548,12 +1548,12 @@ class DhanRestTransport(LiveBrokerClient):
             body = _coerce_status_body(body)
             if not body:
                 raise ValueError(f"Dhan order status response empty for {broker_order_id}")
-                raw_status = str(body.get("orderStatus") or "").strip().upper()
-                if raw_status not in {
-                    "PENDING", "TRANSIT", "NEW", "OPEN", "PART_TRADED",
-                    "TRADED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED",
-                }:
-                    raise ValueError(f"unknown or missing Dhan order status: {raw_status!r}")
+            raw_status = str(body.get("orderStatus") or "").strip().upper()
+            if raw_status not in {
+                "PENDING", "TRANSIT", "NEW", "OPEN", "PART_TRADED",
+                "TRADED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED",
+            }:
+                raise ValueError(f"unknown or missing Dhan order status: {raw_status!r}")
             rec = {
                 "broker_order_id": broker_order_id,
                 "status": _normalize_status(raw_status),
